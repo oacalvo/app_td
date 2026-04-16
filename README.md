@@ -27,6 +27,8 @@ Install the Python dependencies:
 pip install -r requirements.txt
 ```
 
+Recommended Python version: `3.10+`
+
 Launch the GUI and choose a FITS cube from the startup dialog:
 
 ```bash
@@ -64,6 +66,16 @@ The `requirements.txt` file contains:
 - `PyWavelets`
 
 The GUI uses `tkinter`, which is part of the Python standard library on many installations and is therefore not listed in `requirements.txt`.
+
+## 🔎 Smoke Check
+
+After installing dependencies, you can run a small non-GUI check:
+
+```bash
+python -m unittest discover -s tests
+```
+
+This verifies the session startup helpers and the restart logic for sessions whose FITS cube was moved or replaced.
 
 ## 🌤️ Launching the app
 

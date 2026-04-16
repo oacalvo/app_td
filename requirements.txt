@@ -1,5 +1,5 @@
-numpy
-scipy
-astropy
-matplotlib
-PyWavelets
+numpy>=1.23
+scipy>=1.10
+astropy>=5.0
+matplotlib>=3.7
+PyWavelets>=1.4
