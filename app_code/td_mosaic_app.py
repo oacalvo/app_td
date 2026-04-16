@@ -122,6 +122,11 @@ except ImportError:
     )
 
 MAX_FEATURE_AXIS_CUTS = 600
+MAX_EXPERIMENT_CUTS = 1600
+EXPERIMENT_IMPORTANT_CONFIDENCE_MIN = 0.55
+EXPERIMENT_NOVEL_PERIOD_FRAC = 0.20
+EXPERIMENT_NOVEL_TIME_FRAMES = 3
+EXPERIMENT_NEIGHBOR_RADIUS = 1
 LAYOUT_PRESETS = {
     "1x1": (1, 1),
     "2x1": (2, 1),
@@ -154,22 +159,72 @@ DEFAULT_CREST_TRACKING = {
 DEFAULT_WAVELET_FILTER = {
     "p_min": 10.0,
     "p_max": 100.0,
-    "power_ratio_thresh": 2.4,
-    "segment_power_frac": 0.35,
-    "min_points_segment": 25,
-    "min_amp_arcsec": 0.055,
-    "max_jump_pix": 1.5,
-    "min_points_cut_seg": 8,
-    "rms_amp_ratio_max": 0.7,
+    "power_ratio_thresh": 1.75,
+    "segment_power_frac": 0.22,
+    "min_points_segment": 12,
+    "min_amp_arcsec": 0.03,
+    "max_jump_pix": 2.5,
+    "min_points_cut_seg": 6,
+    "rms_amp_ratio_max": 1.1,
     "km_per_arcsec": 725.27,
     "density_kg_m3": float("nan"),
     "phase_speed_km_s": float("nan"),
     "min_prominence": 0.0,
-    "min_snr": 1.0,
+    "min_snr": 0.0,
     "continuity_weight": 1.5,
     "time_weight": 2.0,
     "quality_weight": 0.35,
     "error_weight": 0.15,
+}
+
+WAVELET_EVENT_TABLE_COLUMNS = (
+    "id",
+    "status",
+    "origin",
+    "thread",
+    "seg",
+    "wseg",
+    "mode",
+    "period",
+    "freq",
+    "amp_arc",
+    "amp_km",
+    "vel",
+    "accel",
+    "energy",
+    "dur",
+    "ratio",
+    "score",
+    "pts",
+    "lock",
+    "links",
+    "flags",
+    "reason",
+)
+
+WAVELET_EVENT_TABLE_HEADINGS = {
+    "id": ("ID", 50),
+    "status": ("Status", 110),
+    "origin": ("Origin", 90),
+    "thread": ("Thr", 50),
+    "seg": ("Seg", 50),
+    "wseg": ("Wseg", 55),
+    "mode": ("Mode", 55),
+    "period": ("P [s]", 70),
+    "freq": ("f [mHz]", 70),
+    "amp_arc": ("A ['']", 70),
+    "amp_km": ("A [km]", 75),
+    "vel": ("v [km/s]", 80),
+    "accel": ("a [km/s2]", 85),
+    "energy": ("E/m [J/kg]", 100),
+    "dur": ("dur [s]", 70),
+    "ratio": ("ratio", 60),
+    "score": ("Conf", 62),
+    "pts": ("fit/int", 72),
+    "lock": ("Lock", 55),
+    "links": ("Links", 55),
+    "flags": ("QA", 130),
+    "reason": ("Reason", 240),
 }
 
 WAVELET_EDITABLE_TRACKING_KEYS = (
@@ -181,7 +236,7 @@ WAVELET_EDITABLE_TRACKING_KEYS = (
     "error_weight",
 )
 
-SESSION_VERSION = 5
+SESSION_VERSION = 6
 DEFAULT_AUTOSAVE_EVERY = 10
 WAVELET_QA_EDGE_FRACTION = 0.1
 WAVELET_QA_RESIDUAL_WARN_FRAC = 0.85
@@ -727,6 +782,9 @@ class TDMosaicApp:
         self.next_stack_browser_id = 1
         self.stack_browser_refresh_job: Any = None
         self.stack_browser_refresh_in_progress = False
+        self.experiments: dict[int, dict[str, Any]] = {}
+        self.next_experiment_id = 1
+        self.active_experiment_id: int | None = None
         self.background_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.background_jobs: dict[str, dict[str, Any]] = {}
         self.next_background_job_id = 1
@@ -744,6 +802,20 @@ class TDMosaicApp:
         self.export_write_fits_var = tk.BooleanVar(value=True)
         self.export_write_png_var = tk.BooleanVar(value=True)
         self.export_split_dirs_var = tk.BooleanVar(value=True)
+        self.experiment_name_var = tk.StringVar(value="")
+        self.experiment_displacement_step_var = tk.StringVar(value="8.0")
+        self.experiment_displacement_limit_var = tk.StringVar(value="40.0")
+        self.experiment_angle_min_var = tk.StringVar(value="-90.0")
+        self.experiment_angle_max_var = tk.StringVar(value="90.0")
+        self.experiment_angle_step_var = tk.StringVar(value="5.0")
+        self.experiment_save_td_fits_var = tk.BooleanVar(value=True)
+        self.experiment_save_cell_json_var = tk.BooleanVar(value=True)
+        self.experiment_save_important_images_var = tk.BooleanVar(value=True)
+        self.experiment_view_mode_var = tk.StringVar(value="displacement")
+        self.experiment_progress_global_var = tk.StringVar(value="Idle.")
+        self.experiment_progress_outer_var = tk.StringVar(value="Displacements: 0/0")
+        self.experiment_progress_inner_var = tk.StringVar(value="Angles: 0/0")
+        self.experiment_progress_stage_var = tk.StringVar(value="Stage: idle")
         self.autosave_path = (
             Path(__file__).resolve().parent.parent
             / f"{self.cube_path.stem}_td_session_autosave.json"
@@ -847,6 +919,118 @@ class TDMosaicApp:
             "notes": "",
             "order_mode": "manual",
         }
+
+    def _make_default_experiment_state(
+        self,
+        experiment_id: int,
+        name: str,
+        *,
+        base_cut_id: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "experiment_id": int(experiment_id),
+            "name": str(name),
+            "base_cut_id": int(base_cut_id) if base_cut_id is not None else None,
+            "base_cut_name": "",
+            "base_frame_idx": int(self.t_visual_var.get()),
+            "base_angle_deg": float("nan"),
+            "base_length_px": float("nan"),
+            "displacement_step": float("nan"),
+            "displacement_limit": float("nan"),
+            "offset_values": [],
+            "angle_min": float("nan"),
+            "angle_max": float("nan"),
+            "angle_step": float("nan"),
+            "angle_values": [],
+            "cut_ids": [],
+            "cells": [],
+            "displacement_stack_ids": [],
+            "rotation_stack_ids": [],
+            "view_mode": "displacement",
+            "status": "created",
+            "created_at": self._timestamp_now(),
+            "updated_at": self._timestamp_now(),
+            "completed_at": None,
+            "export_root": "",
+            "status_path": "",
+            "manifest_path": "",
+            "last_run_summary": "",
+            "save_options": {
+                "save_td_fits": True,
+                "save_cell_json": True,
+                "save_important_images": True,
+            },
+            "important_zone_rules": {
+                "confidence_min": EXPERIMENT_IMPORTANT_CONFIDENCE_MIN,
+            },
+        }
+
+    def _experiment_cells(self, experiment: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if experiment is None:
+            return []
+        rows: list[dict[str, Any]] = []
+        for cell in experiment.get("cells") or []:
+            if not isinstance(cell, dict):
+                continue
+            try:
+                cut_id = int(cell.get("cut_id"))
+            except Exception:
+                continue
+            if cut_id not in self.cuts:
+                continue
+            row = dict(cell)
+            row["cut_id"] = cut_id
+            row["offset_idx"] = int(row.get("offset_idx", 0))
+            row["angle_idx"] = int(row.get("angle_idx", 0))
+            row["offset_value"] = float(row.get("offset_value", 0.0))
+            row["angle_deg"] = float(row.get("angle_deg", 0.0))
+            rows.append(row)
+        return rows
+
+    def _selected_experiment(self) -> dict[str, Any] | None:
+        if self.active_experiment_id is None:
+            return None
+        return self.experiments.get(self.active_experiment_id)
+
+    def _experiment_cut_lookup(
+        self, experiment: dict[str, Any] | None
+    ) -> dict[int, dict[str, Any]]:
+        lookup: dict[int, dict[str, Any]] = {}
+        for cell in self._experiment_cells(experiment):
+            lookup[int(cell["cut_id"])] = cell
+        return lookup
+
+    def _experiment_memberships_for_cut(self, cut_id: int) -> list[dict[str, Any]]:
+        memberships: list[dict[str, Any]] = []
+        for experiment in sorted(
+            self.experiments.values(),
+            key=lambda item: int(item.get("experiment_id", 0)),
+        ):
+            for cell in self._experiment_cells(experiment):
+                if int(cell["cut_id"]) != int(cut_id):
+                    continue
+                memberships.append(
+                    {
+                        "experiment_id": int(experiment["experiment_id"]),
+                        "experiment_name": str(experiment.get("name") or ""),
+                        "offset_idx": int(cell.get("offset_idx", 0)),
+                        "offset_value": float(cell.get("offset_value", 0.0)),
+                        "angle_idx": int(cell.get("angle_idx", 0)),
+                        "angle_deg": float(cell.get("angle_deg", 0.0)),
+                        "cell_id": str(cell.get("cell_id") or ""),
+                    }
+                )
+        return memberships
+
+    def _experiment_label(self, experiment: dict[str, Any]) -> str:
+        cells = len(self._experiment_cells(experiment))
+        offsets = len(experiment.get("offset_values") or [])
+        angles = len(experiment.get("angle_values") or [])
+        status = str(experiment.get("status") or "created")
+        return (
+            f"{int(experiment['experiment_id']):02d} | {str(experiment.get('name') or 'Study')} "
+            f"| {offsets}x{angles} | cells={cells} | {status}"
+        )
 
     def _cut_analysis(self, cut_id: int) -> dict[str, Any]:
         state = self.cut_analysis_state.get(cut_id)
@@ -1330,16 +1514,12 @@ class TDMosaicApp:
         cut_id: int,
         event: dict[str, Any],
         meta: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
+        ) -> list[dict[str, Any]]:
         if cut_id not in self.cuts:
             return []
         if meta is None:
             _td, meta = self._cut_td(cut_id)
-        if meta is None:
-            return []
-        distances = np.asarray(meta.get("distances", []), dtype=np.float64)
-        if distances.size == 0:
-            return []
+        distances = np.asarray((meta or {}).get("distances", []), dtype=np.float64)
         dist_index = np.arange(distances.size, dtype=np.float64)
         analysis = event.get("analysis") or {}
         series_specs = (
@@ -1355,6 +1535,17 @@ class TDMosaicApp:
             ),
         )
         rows: list[dict[str, Any]] = []
+        fallback_max_y = 0.0
+        for _series_name, _t_values, y_values in series_specs:
+            if y_values.size:
+                finite_y = y_values[np.isfinite(y_values)]
+                if finite_y.size:
+                    fallback_max_y = max(fallback_max_y, float(np.nanmax(finite_y)))
+        if distances.size == 0:
+            sample_count = max(int(math.ceil(fallback_max_y)) + 1, 2)
+            length_px = max(float(cut_length(self.cuts[cut_id])), 1.0)
+            distances = np.linspace(0.0, length_px, sample_count, dtype=np.float64)
+            dist_index = np.arange(distances.size, dtype=np.float64)
         max_dist_index = float(dist_index[-1]) if dist_index.size else 0.0
         for series_name, t_values, y_values in series_specs:
             if t_values.size == 0 or y_values.size != t_values.size:
@@ -3816,6 +4007,9 @@ class TDMosaicApp:
             "next_stack_id": int(self.next_stack_id),
             "active_stack_id": self.active_stack_id,
             "stacks": self._json_safe(list(self.stacks.values())),
+            "next_experiment_id": int(self.next_experiment_id),
+            "active_experiment_id": self.active_experiment_id,
+            "experiments": self._json_safe(list(self.experiments.values())),
             "cut_analysis_state": self._json_safe(
                 {
                     str(cut_id): self._session_analysis_state_payload(
@@ -4190,6 +4384,90 @@ class TDMosaicApp:
             self.active_stack_id = next(iter(self.stacks.keys()), None)
         self.selected_stack_cut_id = None
 
+        self.experiments = {}
+        for experiment_payload in payload.get("experiments", []):
+            if not isinstance(experiment_payload, dict):
+                continue
+            experiment_id = int(experiment_payload.get("experiment_id", self.next_experiment_id))
+            experiment_state = self._make_default_experiment_state(
+                experiment_id,
+                str(experiment_payload.get("name", f"Study {experiment_id}")),
+                base_cut_id=experiment_payload.get("base_cut_id"),
+            )
+            experiment_state.update(self._json_safe(experiment_payload))
+            experiment_state["experiment_id"] = experiment_id
+            experiment_state["name"] = str(experiment_state.get("name") or f"Study {experiment_id}")
+            experiment_state["base_cut_id"] = (
+                int(experiment_state["base_cut_id"])
+                if experiment_state.get("base_cut_id") in self.cuts
+                else None
+            )
+            experiment_state["cut_ids"] = [
+                int(cut_id)
+                for cut_id in (experiment_state.get("cut_ids") or [])
+                if int(cut_id) in self.cuts
+            ]
+            normalized_cells: list[dict[str, Any]] = []
+            for raw_cell in experiment_state.get("cells") or []:
+                if not isinstance(raw_cell, dict):
+                    continue
+                try:
+                    cut_id = int(raw_cell.get("cut_id"))
+                except Exception:
+                    continue
+                if cut_id not in self.cuts:
+                    continue
+                normalized_cell = dict(raw_cell)
+                normalized_cell["cut_id"] = cut_id
+                normalized_cell["offset_idx"] = int(normalized_cell.get("offset_idx", 0))
+                normalized_cell["angle_idx"] = int(normalized_cell.get("angle_idx", 0))
+                normalized_cell["offset_value"] = float(normalized_cell.get("offset_value", 0.0))
+                normalized_cell["angle_deg"] = float(normalized_cell.get("angle_deg", 0.0))
+                normalized_cells.append(normalized_cell)
+            experiment_state["cells"] = normalized_cells
+            experiment_state["displacement_stack_ids"] = [
+                int(stack_id)
+                for stack_id in (experiment_state.get("displacement_stack_ids") or [])
+                if int(stack_id) in self.stacks
+            ]
+            experiment_state["rotation_stack_ids"] = [
+                int(stack_id)
+                for stack_id in (experiment_state.get("rotation_stack_ids") or [])
+                if int(stack_id) in self.stacks
+            ]
+            experiment_state["offset_values"] = [
+                float(value) for value in (experiment_state.get("offset_values") or [])
+            ]
+            experiment_state["angle_values"] = [
+                float(value) for value in (experiment_state.get("angle_values") or [])
+            ]
+            save_options = {
+                **dict(self._make_default_experiment_state(experiment_id, "")["save_options"]),
+                **dict(experiment_state.get("save_options") or {}),
+            }
+            experiment_state["save_options"] = {
+                "save_td_fits": bool(save_options.get("save_td_fits", True)),
+                "save_cell_json": bool(save_options.get("save_cell_json", True)),
+                "save_important_images": bool(save_options.get("save_important_images", True)),
+            }
+            experiment_state["important_zone_rules"] = {
+                **dict(self._make_default_experiment_state(experiment_id, "")["important_zone_rules"]),
+                **dict(experiment_state.get("important_zone_rules") or {}),
+            }
+            self.experiments[experiment_id] = experiment_state
+        self.next_experiment_id = max(
+            int(payload.get("next_experiment_id", 1)),
+            max(self.experiments.keys(), default=0) + 1,
+        )
+        self.active_experiment_id = payload.get("active_experiment_id")
+        if self.active_experiment_id is not None:
+            try:
+                self.active_experiment_id = int(self.active_experiment_id)
+            except Exception:
+                self.active_experiment_id = None
+        if self.active_experiment_id not in self.experiments:
+            self.active_experiment_id = next(iter(sorted(self.experiments.keys())), None)
+
         self.active_panel_id = clamp_int(
             int(payload.get("active_panel_id", self.active_panel_id)),
             1,
@@ -4278,6 +4556,12 @@ class TDMosaicApp:
                 return job_id, job
         return None, None
 
+    def _background_experiment_job(self) -> tuple[str | None, dict[str, Any] | None]:
+        for job_id, job in self.background_jobs.items():
+            if job.get("kind") == "experiment":
+                return job_id, job
+        return None, None
+
     def _cancel_all_background_jobs(self) -> None:
         for job in self.background_jobs.values():
             cancel_event = job.get("cancel_event")
@@ -4307,12 +4591,25 @@ class TDMosaicApp:
             job["current"] = int(message.get("current", job.get("current", 0)))
             job["total"] = max(int(message.get("total", job.get("total", 1))), 1)
             job["message"] = str(message.get("message", ""))
-            if job.get("kind") == "wavelet":
+            if job.get("kind") == "experiment":
+                job["outer_current"] = int(message.get("outer_current", job.get("outer_current", 0)))
+                job["outer_total"] = max(int(message.get("outer_total", job.get("outer_total", 1))), 1)
+                job["inner_current"] = int(message.get("inner_current", job.get("inner_current", 0)))
+                job["inner_total"] = max(int(message.get("inner_total", job.get("inner_total", 1))), 1)
+                self._update_experiment_job_widgets()
+                if job["message"]:
+                    self._set_status(job["message"])
+            elif job.get("kind") == "wavelet":
                 self._update_wavelet_job_widgets(int(job.get("panel_id", 0)))
                 if job["message"]:
                     self._set_status(job["message"])
             elif job.get("kind") == "batch":
                 self._set_status(job["message"])
+            return
+
+        if message_type == "cell_done" and job.get("kind") == "experiment":
+            self._apply_background_experiment_cell_result(message)
+            self._update_experiment_job_widgets()
             return
 
         if message_type == "done":
@@ -4337,6 +4634,14 @@ class TDMosaicApp:
                     str(message.get("summary", "")),
                 )
                 self.background_jobs.pop(job_id, None)
+            elif job.get("kind") == "experiment":
+                experiment_id = int(message.get("experiment_id", 0) or 0)
+                self.background_jobs.pop(job_id, None)
+                self._finalize_experiment_outputs(
+                    experiment_id,
+                    summary=str(message.get("summary", "")),
+                )
+                self._update_experiment_job_widgets()
             return
 
         if message_type == "cancelled":
@@ -4348,6 +4653,17 @@ class TDMosaicApp:
                 self._set_status(f"Wavelet background job cancelled for {panel_name}.")
             elif job.get("kind") == "batch":
                 self._set_status("Batch pipeline cancelled.")
+            elif job.get("kind") == "experiment":
+                experiment_id = int(job.get("experiment_id", 0) or 0)
+                experiment = self.experiments.get(experiment_id)
+                if experiment is not None:
+                    experiment["status"] = "cancelled"
+                    experiment["updated_at"] = self._timestamp_now()
+                    experiment["last_run_summary"] = "Run cancelled."
+                self._update_experiment_job_widgets()
+                self._record_session_change()
+                self.refresh_all()
+                self._set_status("Exhaustive study cancelled.")
             return
 
         if message_type == "error":
@@ -4365,6 +4681,17 @@ class TDMosaicApp:
                 self._set_status(f"Wavelet filter failed for {panel_name}.")
             elif job.get("kind") == "batch":
                 self._set_status(f"Batch pipeline failed: {error_text}")
+            elif job.get("kind") == "experiment":
+                experiment_id = int(job.get("experiment_id", 0) or 0)
+                experiment = self.experiments.get(experiment_id)
+                if experiment is not None:
+                    experiment["status"] = "failed"
+                    experiment["updated_at"] = self._timestamp_now()
+                    experiment["last_run_summary"] = error_text
+                self._update_experiment_job_widgets()
+                self._record_session_change()
+                self.refresh_all()
+                self._set_status(f"Exhaustive study failed: {error_text}")
 
     def _update_wavelet_job_widgets(self, panel_id: int) -> None:
         existing = self.td_windows.get(panel_id)
@@ -4396,6 +4723,50 @@ class TDMosaicApp:
             progress.configure(mode="determinate", maximum=total, value=min(current, total))
         if progress_var is not None:
             progress_var.set(str(job.get("message", "Running wavelet filter...")))
+
+    def _update_experiment_job_widgets(self) -> None:
+        if not hasattr(self, "experiment_global_progress"):
+            return
+        _job_id, job = self._background_experiment_job()
+        if job is None:
+            self.experiment_global_progress.configure(mode="determinate", maximum=1.0, value=0.0)
+            self.experiment_outer_progress.configure(mode="determinate", maximum=1.0, value=0.0)
+            self.experiment_inner_progress.configure(mode="determinate", maximum=1.0, value=0.0)
+            self._refresh_experiment_list()
+            return
+        current = float(job.get("current", 0))
+        total = max(float(job.get("total", 1)), 1.0)
+        outer_current = float(job.get("outer_current", 0))
+        outer_total = max(float(job.get("outer_total", 1)), 1.0)
+        inner_current = float(job.get("inner_current", 0))
+        inner_total = max(float(job.get("inner_total", 1)), 1.0)
+        self.experiment_global_progress.configure(
+            mode="determinate",
+            maximum=total,
+            value=min(current, total),
+        )
+        self.experiment_outer_progress.configure(
+            mode="determinate",
+            maximum=outer_total,
+            value=min(outer_current, outer_total),
+        )
+        self.experiment_inner_progress.configure(
+            mode="determinate",
+            maximum=inner_total,
+            value=min(inner_current, inner_total),
+        )
+        self.experiment_progress_global_var.set(
+            str(job.get("message") or f"Cells: {int(current)}/{int(total)}")
+        )
+        self.experiment_progress_outer_var.set(
+            f"Displacements: {int(outer_current)}/{int(outer_total)}"
+        )
+        self.experiment_progress_inner_var.set(
+            f"Angles: {int(inner_current)}/{int(inner_total)}"
+        )
+        self.experiment_progress_stage_var.set(
+            f"Stage: {str(job.get('stage') or 'running')}"
+        )
 
     def _wavelet_worker(
         self,
@@ -5083,6 +5454,1009 @@ class TDMosaicApp:
         self.refresh_td_views()
         self._set_status(summary or "Batch pipeline completed.")
 
+    def _run_selected_experiment(self) -> None:
+        _existing_job_id, existing_job = self._background_experiment_job()
+        if existing_job is not None:
+            self._set_status("Wait for the current exhaustive study to finish first.")
+            self._update_experiment_job_widgets()
+            return
+        for job in self.background_jobs.values():
+            if job.get("kind") in {"batch", "wavelet"}:
+                self._set_status("Wait for the current batch/wavelet job to finish first.")
+                return
+
+        experiment = self._selected_experiment()
+        if experiment is None:
+            self._set_status("Select a study first.")
+            return
+
+        self._sync_all_panel_analysis_state_from_windows()
+        root_dir = self._experiment_output_root(experiment)
+        cells = self._experiment_cells(experiment)
+        if not cells:
+            self._set_status("The selected study has no valid cells.")
+            return
+
+        offset_values = [float(value) for value in (experiment.get("offset_values") or [])]
+        angle_values = [float(value) for value in (experiment.get("angle_values") or [])]
+        cell_specs: list[dict[str, Any]] = []
+        for cell in cells:
+            cut_id = int(cell["cut_id"])
+            cut = self.cuts.get(cut_id)
+            if cut is None:
+                continue
+            params = self._cut_td_params(cut_id)
+            state = self._cut_analysis_snapshot(cut_id)
+            crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
+                state.get("crest_params"), state.get("wavelet_params")
+            )
+            cell_specs.append(
+                {
+                    "cell_id": str(cell["cell_id"]),
+                    "cut_id": int(cut_id),
+                    "cut_name": str(cut.name),
+                    "p0": [float(cut.p0[0]), float(cut.p0[1])],
+                    "p1": [float(cut.p1[0]), float(cut.p1[1])],
+                    "t_ini": int(params["t_ini"]),
+                    "t_fin": int(params["t_fin"]),
+                    "stride": int(params["stride"]),
+                    "width": int(params["width"]),
+                    "weighting": str(params["weighting"]),
+                    "crest_params": dict(crest_params),
+                    "wavelet_params": dict(wavelet_params),
+                    "offset_idx": int(cell.get("offset_idx", 0)),
+                    "offset_value": float(cell.get("offset_value", 0.0)),
+                    "angle_idx": int(cell.get("angle_idx", 0)),
+                    "angle_deg": float(cell.get("angle_deg", 0.0)),
+                    "cell_dir": str(root_dir / "cells" / str(cell["cell_id"])),
+                }
+            )
+
+        if not cell_specs:
+            self._set_status("The selected study has no runnable cells.")
+            return
+
+        experiment["status"] = "running"
+        experiment["updated_at"] = self._timestamp_now()
+        experiment["last_run_summary"] = "Queued exhaustive run."
+        job_id, job = self._new_background_job(
+            kind="experiment",
+            panel_name=str(experiment.get("name") or f"Study {experiment['experiment_id']}"),
+        )
+        job["experiment_id"] = int(experiment["experiment_id"])
+        job["current"] = 0
+        job["total"] = max(len(cell_specs), 1)
+        job["outer_current"] = 0
+        job["outer_total"] = max(len(offset_values), 1)
+        job["inner_current"] = 0
+        job["inner_total"] = max(len(angle_values), 1)
+        job["message"] = f"{experiment['name']}: queued exhaustive run."
+        thread = threading.Thread(
+            target=self._experiment_worker,
+            args=(
+                job_id,
+                int(experiment["experiment_id"]),
+                str(experiment["name"]),
+                str(root_dir),
+                self._clone_wavelet_payload(cell_specs),
+                {
+                    "save_td_fits": bool(experiment.get("save_options", {}).get("save_td_fits", True)),
+                    "save_cell_json": bool(experiment.get("save_options", {}).get("save_cell_json", True)),
+                },
+                job["cancel_event"],
+            ),
+            daemon=True,
+        )
+        job["thread"] = thread
+        thread.start()
+        self._update_experiment_job_widgets()
+        self._refresh_experiment_list()
+        self._set_status(f"Running exhaustive study for {experiment['name']}...")
+
+    def _cancel_running_experiment(self) -> None:
+        _job_id, job = self._background_experiment_job()
+        if job is None:
+            self._set_status("No exhaustive study is running.")
+            return
+        cancel_event = job.get("cancel_event")
+        if cancel_event is not None:
+            cancel_event.set()
+        self._set_status(
+            f"Cancelling exhaustive study {job.get('panel_name', '')}..."
+        )
+
+    def _experiment_worker(
+        self,
+        job_id: str,
+        experiment_id: int,
+        experiment_name: str,
+        export_root: str,
+        cell_specs: list[dict[str, Any]],
+        save_options: dict[str, bool],
+        cancel_event: threading.Event,
+    ) -> None:
+        nuwt_api, nuwt_error = load_local_nuwt_api()
+        if nuwt_api is None:
+            self.background_queue.put(
+                {"type": "error", "job_id": job_id, "error": str(nuwt_error)}
+            )
+            return
+
+        wavelet_api, wavelet_error = load_local_wavelet_filter_api()
+        if wavelet_api is None:
+            self.background_queue.put(
+                {"type": "error", "job_id": job_id, "error": str(wavelet_error)}
+            )
+            return
+
+        root_dir = Path(export_root).expanduser().resolve()
+        root_dir.mkdir(parents=True, exist_ok=True)
+        status_path = root_dir / "status.json"
+        manifest_path = root_dir / "manifest.json"
+        run_log_path = root_dir / "run_log.txt"
+        offset_total = max(
+            1,
+            max((int(spec.get("offset_idx", 0)) for spec in cell_specs), default=-1) + 1,
+        )
+        angle_total = max(
+            1,
+            max((int(spec.get("angle_idx", 0)) for spec in cell_specs), default=-1) + 1,
+        )
+
+        def _write_json(path: Path, payload: dict[str, Any]) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(self._json_safe(payload), handle, indent=2)
+
+        def _append_log(line: str) -> None:
+            run_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(run_log_path, "a", encoding="utf-8") as handle:
+                handle.write(line.rstrip() + "\n")
+
+        try:
+            _write_json(
+                manifest_path,
+                {
+                    "experiment_id": int(experiment_id),
+                    "name": str(experiment_name),
+                    "created_at": self._timestamp_now(),
+                    "cell_count": int(len(cell_specs)),
+                    "offset_count": int(offset_total),
+                    "angle_count": int(angle_total),
+                    "save_options": dict(save_options),
+                },
+            )
+            total = max(len(cell_specs), 1)
+            for index, spec in enumerate(cell_specs, start=1):
+                if cancel_event.is_set():
+                    _write_json(
+                        status_path,
+                        {
+                            "experiment_id": int(experiment_id),
+                            "status": "cancelled",
+                            "updated_at": self._timestamp_now(),
+                            "current": int(index - 1),
+                            "total": int(total),
+                        },
+                    )
+                    self.background_queue.put({"type": "cancelled", "job_id": job_id})
+                    return
+
+                outer_current = int(spec.get("offset_idx", 0)) + 1
+                inner_current = int(spec.get("angle_idx", 0)) + 1
+                cell_dir = Path(str(spec.get("cell_dir") or root_dir / "cells")).expanduser().resolve()
+                cell_dir.mkdir(parents=True, exist_ok=True)
+                cut = Cut(
+                    cut_id=int(spec["cut_id"]),
+                    name=str(spec["cut_name"]),
+                    color="tab:blue",
+                    p0=(float(spec["p0"][0]), float(spec["p0"][1])),
+                    p1=(float(spec["p1"][0]), float(spec["p1"][1])),
+                )
+                self.background_queue.put(
+                    {
+                        "type": "progress",
+                        "job_id": job_id,
+                        "stage": "TD",
+                        "current": index - 1,
+                        "total": total,
+                        "outer_current": outer_current,
+                        "outer_total": offset_total,
+                        "inner_current": inner_current,
+                        "inner_total": angle_total,
+                        "message": (
+                            f"{experiment_name}: TD {index}/{total} "
+                            f"(d={float(spec['offset_value']):+.1f}px, "
+                            f"a={float(spec['angle_deg']):+.1f}deg)"
+                        ),
+                    }
+                )
+                td, meta = compute_td(
+                    self.cube,
+                    cut,
+                    int(spec["t_ini"]),
+                    int(spec["t_fin"]),
+                    int(spec["stride"]),
+                    int(spec["width"]),
+                    str(spec["weighting"]),
+                )
+                if bool(save_options.get("save_td_fits", True)):
+                    header = fits.Header()
+                    header["EXPTYPE"] = ("EXH_TD", "Exhaustive study TD map")
+                    header["CUTID"] = (int(spec["cut_id"]), "Generated cut id")
+                    header["CUTNAME"] = (str(spec["cut_name"]), "Generated cut label")
+                    header["OFFIDX"] = (int(spec["offset_idx"]), "Offset index")
+                    header["OFFVAL"] = (float(spec["offset_value"]), "Offset value [px]")
+                    header["ANGIDX"] = (int(spec["angle_idx"]), "Angle index")
+                    header["ANGVAL"] = (float(spec["angle_deg"]), "Angle value [deg]")
+                    header["TINI"] = (int(spec["t_ini"]), "Initial time index")
+                    header["TFIN"] = (int(spec["t_fin"]), "Final time index")
+                    header["STRIDE"] = (int(spec["stride"]), "Time stride")
+                    header["WIDTH"] = (int(spec["width"]), "Sampling width")
+                    header["WEIGHT"] = (str(spec["weighting"]), "Sampling weighting")
+                    fits.PrimaryHDU(data=np.asarray(td, dtype=np.float32), header=header).writeto(
+                        cell_dir / "td.fits", overwrite=True
+                    )
+
+                self.background_queue.put(
+                    {
+                        "type": "progress",
+                        "job_id": job_id,
+                        "stage": "NUWT",
+                        "current": index - 1,
+                        "total": total,
+                        "outer_current": outer_current,
+                        "outer_total": offset_total,
+                        "inner_current": inner_current,
+                        "inner_total": angle_total,
+                        "message": f"{experiment_name}: NUWT {index}/{total}",
+                    }
+                )
+                td_nuwt = np.asarray(td, dtype=np.float64).T
+                finite = np.isfinite(td_nuwt)
+                if not np.any(finite):
+                    raise ValueError(f"{spec['cut_name']} has no finite TD values.")
+                fill_value = float(np.nanmin(td_nuwt[finite]))
+                if not np.all(finite):
+                    td_nuwt = np.where(finite, td_nuwt, fill_value)
+
+                crest_params = dict(spec["crest_params"])
+                located = nuwt_api["locate_things"](
+                    td_nuwt,
+                    invert=bool(crest_params["invert"]),
+                    grad=float(crest_params["grad"]),
+                    res=float(crest_params["res"]),
+                    cad=float(crest_params["cad"]),
+                    nearest_pixel=not bool(crest_params["gauss"]),
+                )
+                threads, _ = nuwt_api["follow_threads"](
+                    located,
+                    min_tlen=int(crest_params["min_tlen"]),
+                    max_dist_jump=int(crest_params["max_dist_jump"]),
+                    max_time_skip=int(crest_params["max_time_skip"]),
+                )
+                threads = nuwt_api["patch_up_threads"](
+                    threads, fit_flag=0, simp_fill=False, debug=False
+                )
+
+                self.background_queue.put(
+                    {
+                        "type": "progress",
+                        "job_id": job_id,
+                        "stage": "Wavelet",
+                        "current": index - 1,
+                        "total": total,
+                        "outer_current": outer_current,
+                        "outer_total": offset_total,
+                        "inner_current": inner_current,
+                        "inner_total": angle_total,
+                        "message": f"{experiment_name}: Wavelet {index}/{total}",
+                    }
+                )
+                wavelet_params = dict(spec["wavelet_params"])
+                segments = wavelet_api["analyze_tracked_threads_with_wavelets"](
+                    threads,
+                    np.asarray(meta["t_indices"], dtype=np.float64),
+                    cadence=float(crest_params["cad"]),
+                    pix_scale=float(crest_params["res"]),
+                    km_per_arcsec=float(wavelet_params["km_per_arcsec"]),
+                    p_min=float(wavelet_params["p_min"]),
+                    p_max=float(wavelet_params["p_max"]),
+                    power_ratio_thresh=float(wavelet_params["power_ratio_thresh"]),
+                    segment_power_frac=float(wavelet_params["segment_power_frac"]),
+                    min_points_segment=int(wavelet_params["min_points_segment"]),
+                    min_amp_arcsec=float(wavelet_params["min_amp_arcsec"]),
+                    max_jump_pix=float(wavelet_params["max_jump_pix"]),
+                    min_points_cut_seg=int(wavelet_params["min_points_cut_seg"]),
+                    rms_amp_ratio_max=float(wavelet_params["rms_amp_ratio_max"]),
+                    density_kg_m3=float(wavelet_params["density_kg_m3"]),
+                    phase_speed_km_s=float(wavelet_params["phase_speed_km_s"]),
+                )
+
+                located_count = int(np.count_nonzero(np.asarray(located.get("errs", [])) > 0))
+                thread_count = len(threads)
+                accepted_count = int(sum(1 for segment in segments if segment.get("accepted")))
+                if bool(save_options.get("save_cell_json", True)):
+                    _write_json(
+                        cell_dir / "cell_summary.json",
+                        {
+                            "experiment_id": int(experiment_id),
+                            "cut_id": int(spec["cut_id"]),
+                            "cut_name": str(spec["cut_name"]),
+                            "offset_idx": int(spec["offset_idx"]),
+                            "offset_value": float(spec["offset_value"]),
+                            "angle_idx": int(spec["angle_idx"]),
+                            "angle_deg": float(spec["angle_deg"]),
+                            "located_count": int(located_count),
+                            "thread_count": int(thread_count),
+                            "accepted_count": int(accepted_count),
+                            "wavelet_segment_count": int(len(segments)),
+                            "updated_at": self._timestamp_now(),
+                        },
+                    )
+                _append_log(
+                    f"{self._timestamp_now()} | cut={int(spec['cut_id'])} "
+                    f"cell={spec['cell_id']} | located={located_count} "
+                    f"threads={thread_count} accepted={accepted_count}"
+                )
+                _write_json(
+                    status_path,
+                    {
+                        "experiment_id": int(experiment_id),
+                        "status": "running",
+                        "updated_at": self._timestamp_now(),
+                        "current": int(index),
+                        "total": int(total),
+                        "outer_current": int(outer_current),
+                        "outer_total": int(offset_total),
+                        "inner_current": int(inner_current),
+                        "inner_total": int(angle_total),
+                        "last_cell": str(spec["cell_id"]),
+                    },
+                )
+                self.background_queue.put(
+                    {
+                        "type": "cell_done",
+                        "job_id": job_id,
+                        "experiment_id": int(experiment_id),
+                        "cut_id": int(spec["cut_id"]),
+                        "cut_name": str(spec["cut_name"]),
+                        "cell_id": str(spec["cell_id"]),
+                        "cell_dir": str(cell_dir),
+                        "offset_idx": int(spec["offset_idx"]),
+                        "offset_value": float(spec["offset_value"]),
+                        "angle_idx": int(spec["angle_idx"]),
+                        "angle_deg": float(spec["angle_deg"]),
+                        "crest_tracking_result": {
+                            "located": located,
+                            "threads": threads,
+                            "params": crest_params,
+                        },
+                        "crest_tracking_td_key": (
+                            int(spec["cut_id"]),
+                            round(float(spec["p0"][0]), 3),
+                            round(float(spec["p0"][1]), 3),
+                            round(float(spec["p1"][0]), 3),
+                            round(float(spec["p1"][1]), 3),
+                            int(spec["t_ini"]),
+                            int(spec["t_fin"]),
+                            int(spec["stride"]),
+                            int(spec["width"]),
+                            str(spec["weighting"]),
+                        ),
+                        "crest_summary": (
+                            f"Located {located_count} crest bins. "
+                            f"Threads: {thread_count}. Longest: "
+                            f"{max((int(th.get('length', 0)) for th in threads), default=0)}."
+                        ),
+                        "wavelet_segments": segments,
+                        "wavelet_params": {
+                            "cad": float(crest_params["cad"]),
+                            "res": float(crest_params["res"]),
+                            **wavelet_params,
+                        },
+                    }
+                )
+                self.background_queue.put(
+                    {
+                        "type": "progress",
+                        "job_id": job_id,
+                        "stage": "Save",
+                        "current": index,
+                        "total": total,
+                        "outer_current": outer_current,
+                        "outer_total": offset_total,
+                        "inner_current": inner_current,
+                        "inner_total": angle_total,
+                        "message": (
+                            f"{experiment_name}: saved cell {index}/{total} "
+                            f"(accepted={accepted_count})"
+                        ),
+                    }
+                )
+
+            self.background_queue.put(
+                {
+                    "type": "done",
+                    "job_id": job_id,
+                    "experiment_id": int(experiment_id),
+                    "summary": f"Exhaustive study completed for {experiment_name}.",
+                }
+            )
+        except Exception as exc:
+            _write_json(
+                status_path,
+                {
+                    "experiment_id": int(experiment_id),
+                    "status": "failed",
+                    "updated_at": self._timestamp_now(),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            self.background_queue.put(
+                {
+                    "type": "error",
+                    "job_id": job_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    def _preserved_locked_wavelet_events_for_cut(self, cut_id: int) -> list[dict[str, Any]]:
+        preserved: list[dict[str, Any]] = []
+        for event in self._cut_analysis(cut_id).get("wavelet_events") or []:
+            self._ensure_wavelet_event_fields(event)
+            if bool(event.get("review_locked")):
+                preserved.append(self._clone_wavelet_payload(event))
+        preserved.sort(key=lambda item: int(item.get("event_id", -1)))
+        return preserved
+
+    def _apply_background_experiment_cell_result(self, payload: dict[str, Any]) -> None:
+        experiment_id = int(payload.get("experiment_id", 0) or 0)
+        cut_id = int(payload.get("cut_id", 0) or 0)
+        experiment = self.experiments.get(experiment_id)
+        if experiment is None or cut_id not in self.cuts:
+            return
+        state = self._cut_analysis(cut_id)
+        state["td_cache_key"] = None
+        state["td_cache_td"] = None
+        state["td_cache_meta"] = None
+        state["crest_tracking_result"] = self._clone_wavelet_payload(
+            payload.get("crest_tracking_result")
+        )
+        state["crest_tracking_td_key"] = self._clone_wavelet_payload(
+            payload.get("crest_tracking_td_key")
+        )
+        params = dict(payload.get("wavelet_params") or {})
+        segments = payload.get("wavelet_segments") or []
+        preserved_locked_events = self._preserved_locked_wavelet_events_for_cut(cut_id)
+        filtered_segments = [
+            segment
+            for segment in segments
+            if not any(
+                self._wavelet_segment_matches_locked_event(segment, locked_event)
+                for locked_event in preserved_locked_events
+            )
+        ]
+        used_ids = {
+            int(event.get("event_id", -1)) for event in preserved_locked_events
+        }
+        next_event_id = max(used_ids, default=0) + 1
+        events = self._clone_wavelet_payload(preserved_locked_events)
+        for segment in filtered_segments:
+            events.append(
+                self._make_td_window_wavelet_event(next_event_id, segment, params)
+            )
+            next_event_id += 1
+        best_segment = self._best_wavelet_segment(filtered_segments)
+        best_event_id = None
+        if best_segment is not None:
+            for event in events:
+                analysis = event.get("analysis") or {}
+                if (
+                    int(analysis.get("thread_index", -999)) == int(best_segment.get("thread_index", -1))
+                    and int(analysis.get("seg_id", -999)) == int(best_segment.get("seg_id", -1))
+                    and int(analysis.get("wseg_id", -999)) == int(best_segment.get("wseg_id", -1))
+                ):
+                    best_event_id = int(event["event_id"])
+                    break
+        state["wavelet_filter_result"] = self._lightweight_wavelet_filter_result(
+            segments=filtered_segments,
+            params=params,
+            best_segment=best_segment,
+            preserved_locked_event_ids=[
+                int(event.get("event_id", -1)) for event in preserved_locked_events
+            ],
+            warnings=[],
+        )
+        state["wavelet_events"] = self._clone_wavelet_payload(events)
+        state["wavelet_next_event_id"] = next_event_id
+        state["wavelet_selected_event_id"] = best_event_id or (
+            int(events[0]["event_id"]) if events else None
+        )
+        for cell in experiment.get("cells") or []:
+            if int(cell.get("cut_id", -1)) != cut_id:
+                continue
+            cell["status"] = "completed"
+            cell["accepted_count"] = int(sum(1 for segment in filtered_segments if segment.get("accepted")))
+            cell["segment_count"] = int(len(filtered_segments))
+            cell["cell_dir"] = str(payload.get("cell_dir") or cell.get("cell_dir") or "")
+            cell["updated_at"] = self._timestamp_now()
+            break
+        experiment["updated_at"] = self._timestamp_now()
+        experiment["last_run_summary"] = (
+            f"Completed cut {cut_id}: "
+            f"{sum(1 for segment in filtered_segments if segment.get('accepted'))} accepted."
+        )
+        for panel in self._panels_for_cut(cut_id):
+            existing = self.td_windows.get(panel.panel_id)
+            if existing is None:
+                continue
+            existing["crest_tracking_result"] = self._clone_wavelet_payload(
+                state.get("crest_tracking_result")
+            )
+            existing["crest_tracking_td_key"] = self._clone_wavelet_payload(
+                state.get("crest_tracking_td_key")
+            )
+            existing["wavelet_filter_result"] = dict(state["wavelet_filter_result"])
+            existing["wavelet_events"] = self._clone_wavelet_payload(events)
+            existing["wavelet_next_event_id"] = next_event_id
+            existing["wavelet_selected_event_id"] = state["wavelet_selected_event_id"]
+            existing["crest_summary_var"].set(
+                str(payload.get("crest_summary", "Crest tracking completed."))
+            )
+            existing["wavelet_summary_var"].set(
+                f"Wavelet accepted {sum(1 for segment in filtered_segments if segment.get('accepted'))}/"
+                f"{len(filtered_segments)} segment(s)."
+            )
+            self._refresh_td_window_wavelet_views(panel.panel_id, redraw_td=True)
+
+    def _write_table_bundle(self, base_path: Path, rows: list[dict[str, Any]]) -> None:
+        base_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path = base_path.with_suffix(".json")
+        csv_path = base_path.with_suffix(".csv")
+        with open(json_path, "w", encoding="utf-8") as handle:
+            json.dump(self._json_safe(rows), handle, indent=2)
+        fieldnames = list(rows[0].keys()) if rows else []
+        if fieldnames:
+            with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    out_row = dict(row)
+                    for key, value in list(out_row.items()):
+                        if isinstance(value, (list, dict)):
+                            out_row[key] = json.dumps(self._json_safe(value), ensure_ascii=False)
+                    writer.writerow(out_row)
+
+    def _experiment_curated_rows(self, experiment: dict[str, Any]) -> list[dict[str, Any]]:
+        experiment_id = int(experiment["experiment_id"])
+        rows: list[dict[str, Any]] = []
+        for row in self._collect_curated_event_rows():
+            if experiment_id not in {int(item) for item in (row.get("experiment_ids") or [])}:
+                continue
+            rows.append(dict(row))
+        rows.sort(
+            key=lambda row: (
+                int(row.get("experiment_offset_idx", 0)),
+                int(row.get("experiment_angle_idx", 0)),
+                int(row.get("cut_id", 0)),
+                int(row.get("event_id", 0)),
+            )
+        )
+        return rows
+
+    def _experiment_cells_table_rows(self, experiment: dict[str, Any]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for cell in self._experiment_cells(experiment):
+            cut_id = int(cell["cut_id"])
+            cut = self.cuts.get(cut_id)
+            if cut is None:
+                continue
+            state = self._cut_analysis_snapshot(cut_id)
+            params = self._cut_td_params(cut_id)
+            counted = sum(
+                1
+                for event in state.get("wavelet_events") or []
+                if self._td_window_wavelet_event_is_counted(event)
+            )
+            rows.append(
+                {
+                    "experiment_id": int(experiment["experiment_id"]),
+                    "experiment_name": str(experiment["name"]),
+                    "cell_id": str(cell.get("cell_id") or ""),
+                    "cut_id": int(cut_id),
+                    "cut_name": str(cut.name),
+                    "offset_idx": int(cell.get("offset_idx", 0)),
+                    "offset_value": float(cell.get("offset_value", 0.0)),
+                    "angle_idx": int(cell.get("angle_idx", 0)),
+                    "angle_deg": float(cell.get("angle_deg", 0.0)),
+                    "status": str(cell.get("status") or "created"),
+                    "segment_count": int(cell.get("segment_count", len(state.get("wavelet_events") or []))),
+                    "accepted_count": int(cell.get("accepted_count", counted)),
+                    "roi_enabled": bool(state.get("roi_enabled", False)),
+                    "roi_t_span": str(state.get("roi_t_span", "") or ""),
+                    "roi_d_span": str(state.get("roi_d_span", "") or ""),
+                    "t_ini": int(params["t_ini"]),
+                    "t_fin": int(params["t_fin"]),
+                    "stride": int(params["stride"]),
+                    "width": int(params["width"]),
+                    "weighting": str(params["weighting"]),
+                    "cell_dir": str(cell.get("cell_dir") or ""),
+                }
+            )
+        return rows
+
+    def _build_experiment_novelty_rows(
+        self,
+        experiment: dict[str, Any],
+        master_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        cell_lookup = self._experiment_cut_lookup(experiment)
+        counted_rows = [
+            row
+            for row in master_rows
+            if bool(row.get("counted")) and np.isfinite(float(row.get("peak_period_s", float("nan"))))
+        ]
+        by_cell: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for row in counted_rows:
+            by_cell.setdefault(
+                (
+                    int(row.get("experiment_offset_idx", 0)),
+                    int(row.get("experiment_angle_idx", 0)),
+                ),
+                [],
+            ).append(row)
+
+        novelty_rows: list[dict[str, Any]] = []
+        for row in master_rows:
+            cell_key = (
+                int(row.get("experiment_offset_idx", 0)),
+                int(row.get("experiment_angle_idx", 0)),
+            )
+            classification = "rejected"
+            match_cut_id = None
+            match_event_id = None
+            novelty_score = 0.0
+            if bool(row.get("counted")):
+                period = float(row.get("peak_period_s", float("nan")))
+                start_frame = float(row.get("wave_start_frame", float("nan")))
+                matches: list[tuple[dict[str, Any], float]] = []
+                for d_offset in range(-EXPERIMENT_NEIGHBOR_RADIUS, EXPERIMENT_NEIGHBOR_RADIUS + 1):
+                    for d_angle in range(-EXPERIMENT_NEIGHBOR_RADIUS, EXPERIMENT_NEIGHBOR_RADIUS + 1):
+                        if d_offset == 0 and d_angle == 0:
+                            continue
+                        neighbor_rows = by_cell.get((cell_key[0] + d_offset, cell_key[1] + d_angle), [])
+                        for other in neighbor_rows:
+                            other_period = float(other.get("peak_period_s", float("nan")))
+                            other_start = float(other.get("wave_start_frame", float("nan")))
+                            if not np.isfinite(period) or not np.isfinite(other_period):
+                                continue
+                            period_delta = abs(period - other_period) / max(abs(period), abs(other_period), 1e-6)
+                            time_delta = abs(start_frame - other_start) if np.isfinite(start_frame) and np.isfinite(other_start) else float("inf")
+                            if period_delta <= EXPERIMENT_NOVEL_PERIOD_FRAC and time_delta <= EXPERIMENT_NOVEL_TIME_FRAMES:
+                                matches.append((other, period_delta + 0.1 * time_delta))
+                if matches:
+                    matches.sort(key=lambda item: item[1])
+                    match_row, score = matches[0]
+                    classification = "matched"
+                    match_cut_id = int(match_row.get("cut_id", -1))
+                    match_event_id = int(match_row.get("event_id", -1))
+                    novelty_score = float(score)
+                else:
+                    classification = "new"
+                    novelty_score = 1.0
+            cut_cell = cell_lookup.get(int(row.get("cut_id", -1)), {})
+            novelty_rows.append(
+                {
+                    "experiment_id": int(experiment["experiment_id"]),
+                    "experiment_name": str(experiment["name"]),
+                    "cut_id": int(row.get("cut_id", -1)),
+                    "event_id": int(row.get("event_id", -1)),
+                    "cell_id": str(cut_cell.get("cell_id") or ""),
+                    "offset_idx": int(row.get("experiment_offset_idx", 0)),
+                    "offset_value": float(row.get("experiment_offset_value", 0.0)),
+                    "angle_idx": int(row.get("experiment_angle_idx", 0)),
+                    "angle_deg": float(row.get("experiment_angle_deg", 0.0)),
+                    "classification": classification,
+                    "matched_cut_id": match_cut_id,
+                    "matched_event_id": match_event_id,
+                    "novelty_score": float(novelty_score),
+                }
+            )
+        return novelty_rows
+
+    def _write_cut_event_arrow_png(
+        self,
+        cut_id: int,
+        event_id: int,
+        save_path: Path,
+        *,
+        map_cut_ids: list[int] | None = None,
+    ) -> None:
+        event = self._wavelet_event_ref_by_cut(cut_id, event_id)
+        if event is None:
+            return
+        trace_rows = self._event_trace_rows(cut_id, event)
+        if not trace_rows:
+            return
+        frame_idx = int(self.t_visual_var.get())
+        fig = self.Figure(figsize=(12.8, 5.8), dpi=160)
+        grid = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.12], wspace=0.24)
+        map_ax = fig.add_subplot(grid[0, 0])
+        td_ax = fig.add_subplot(grid[0, 1])
+        context_cut_ids = (
+            [int(current_cut_id) for current_cut_id in map_cut_ids if int(current_cut_id) in self.cuts]
+            if map_cut_ids is not None
+            else [int(cut_id)]
+        )
+        if int(cut_id) not in context_cut_ids:
+            context_cut_ids.append(int(cut_id))
+        self._draw_export_map_axis(
+            map_ax,
+            frame_idx,
+            cut_ids=context_cut_ids,
+            focus_cut_id=cut_id,
+            trace_rows=trace_rows,
+            title=f"Important zone | cut {cut_id} | event {event_id}",
+        )
+        wave_rows = [row for row in trace_rows if str(row.get("series")) == "wave"]
+        if len(wave_rows) >= 2:
+            start_row = wave_rows[0]
+            end_row = wave_rows[-1]
+            start_disp = self._map_data_to_display(float(start_row["map_x"]), float(start_row["map_y"]))
+            end_disp = self._map_data_to_display(float(end_row["map_x"]), float(end_row["map_y"]))
+            map_ax.annotate(
+                "",
+                xy=(float(end_disp[0]), float(end_disp[1])),
+                xytext=(float(start_disp[0]), float(start_disp[1])),
+                arrowprops={"arrowstyle": "->", "color": "lime", "linewidth": 2.2},
+            )
+        self._draw_cut_td_axis(
+            td_ax,
+            cut_id,
+            use_zoom=False,
+            title_fontsize=10.0,
+            selected_event_id=event_id,
+            title_prefix="Important: ",
+        )
+        self._save_export_figure_png(fig, save_path)
+
+    def _build_experiment_important_rows(
+        self,
+        experiment: dict[str, Any],
+        master_rows: list[dict[str, Any]],
+        novelty_rows: list[dict[str, Any]],
+        cells_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        novelty_map = {
+            (int(row["cut_id"]), int(row["event_id"])): row for row in novelty_rows
+        }
+        important_rows: list[dict[str, Any]] = []
+        important_cell_ids: set[str] = set()
+        image_dir = self._experiment_output_root(experiment) / "important_zones_images"
+        if bool(experiment.get("save_options", {}).get("save_important_images", True)):
+            image_dir.mkdir(parents=True, exist_ok=True)
+        for row in master_rows:
+            novelty = novelty_map.get((int(row["cut_id"]), int(row["event_id"])), {})
+            state = self._cut_analysis(int(row["cut_id"]))
+            is_important = (
+                bool(state.get("roi_enabled"))
+                or str(novelty.get("classification", "")) == "new"
+                or float(row.get("confidence_score", float("nan"))) >= float(
+                    experiment.get("important_zone_rules", {}).get(
+                        "confidence_min", EXPERIMENT_IMPORTANT_CONFIDENCE_MIN
+                    )
+                )
+                or bool(row.get("review_locked"))
+            )
+            if not is_important:
+                continue
+            image_path = ""
+            if bool(experiment.get("save_options", {}).get("save_important_images", True)):
+                image_file = image_dir / (
+                    f"cut{int(row['cut_id']):03d}_event{int(row['event_id']):03d}.png"
+                )
+                self._write_cut_event_arrow_png(
+                    int(row["cut_id"]),
+                    int(row["event_id"]),
+                    image_file,
+                    map_cut_ids=[int(row["cut_id"])],
+                )
+                image_path = str(image_file)
+            important_row = dict(row)
+            important_row["important_reason"] = ",".join(
+                [
+                    label
+                    for label, enabled in (
+                        ("roi", bool(state.get("roi_enabled"))),
+                        ("new", str(novelty.get("classification", "")) == "new"),
+                        (
+                            "high_conf",
+                            float(row.get("confidence_score", float("nan"))) >= float(
+                                experiment.get("important_zone_rules", {}).get(
+                                    "confidence_min", EXPERIMENT_IMPORTANT_CONFIDENCE_MIN
+                                )
+                            ),
+                        ),
+                        ("locked", bool(row.get("review_locked"))),
+                    )
+                    if enabled
+                ]
+            )
+            important_row["important_image"] = image_path
+            important_rows.append(important_row)
+            important_cell_ids.add(str(row.get("experiment_cell_id") or ""))
+        for cell_row in cells_rows:
+            if not bool(cell_row.get("roi_enabled")):
+                continue
+            if str(cell_row.get("cell_id") or "") in important_cell_ids:
+                continue
+            important_rows.append(
+                {
+                    "experiment_id": int(experiment["experiment_id"]),
+                    "experiment_name": str(experiment["name"]),
+                    "cut_id": int(cell_row["cut_id"]),
+                    "cut_name": str(cell_row["cut_name"]),
+                    "event_id": None,
+                    "experiment_cell_id": str(cell_row["cell_id"]),
+                    "experiment_offset_idx": int(cell_row["offset_idx"]),
+                    "experiment_offset_value": float(cell_row["offset_value"]),
+                    "experiment_angle_idx": int(cell_row["angle_idx"]),
+                    "experiment_angle_deg": float(cell_row["angle_deg"]),
+                    "status": "roi-only",
+                    "counted": False,
+                    "confidence_score": float("nan"),
+                    "review_locked": False,
+                    "roi_enabled": True,
+                    "roi_t_span": str(cell_row.get("roi_t_span", "") or ""),
+                    "roi_d_span": str(cell_row.get("roi_d_span", "") or ""),
+                    "important_reason": "roi",
+                    "important_image": "",
+                }
+            )
+        return important_rows
+
+    def _finalize_experiment_outputs(
+        self,
+        experiment_id: int,
+        *,
+        summary: str = "",
+    ) -> None:
+        experiment = self.experiments.get(int(experiment_id))
+        if experiment is None:
+            return
+        root_dir = self._experiment_output_root(experiment)
+        master_rows = self._experiment_curated_rows(experiment)
+        novelty_rows = self._build_experiment_novelty_rows(experiment, master_rows)
+        novelty_map = {
+            (int(row["cut_id"]), int(row["event_id"])): row for row in novelty_rows
+        }
+        for row in master_rows:
+            novelty = novelty_map.get((int(row["cut_id"]), int(row["event_id"])), {})
+            row["novelty_class"] = str(novelty.get("classification", ""))
+            row["novelty_score"] = float(novelty.get("novelty_score", float("nan")))
+            row["novelty_match_cut_id"] = novelty.get("matched_cut_id")
+            row["novelty_match_event_id"] = novelty.get("matched_event_id")
+        cells_rows = self._experiment_cells_table_rows(experiment)
+        trace_rows: list[dict[str, Any]] = []
+        for row in master_rows:
+            event = self._wavelet_event_ref_by_cut(
+                int(row["cut_id"]),
+                int(row["event_id"]),
+            )
+            if event is None:
+                continue
+            for trace_row in self._event_trace_rows(int(row["cut_id"]), event):
+                trace_rows.append(
+                    {
+                        "experiment_id": int(experiment["experiment_id"]),
+                        "experiment_name": str(experiment["name"]),
+                        "cut_id": int(row["cut_id"]),
+                        "event_id": int(row["event_id"]),
+                        "cell_id": str(row.get("experiment_cell_id") or ""),
+                        "offset_idx": int(row.get("experiment_offset_idx", 0)),
+                        "offset_value": float(row.get("experiment_offset_value", 0.0)),
+                        "angle_idx": int(row.get("experiment_angle_idx", 0)),
+                        "angle_deg": float(row.get("experiment_angle_deg", 0.0)),
+                        **trace_row,
+                    }
+                )
+        important_rows = self._build_experiment_important_rows(
+            experiment,
+            master_rows,
+            novelty_rows,
+            cells_rows,
+        )
+
+        displacement_rows: list[dict[str, Any]] = []
+        for stack_id in experiment.get("displacement_stack_ids") or []:
+            stack = self.stacks.get(int(stack_id))
+            if stack is None:
+                continue
+            displacement_rows.append(
+                {
+                    "experiment_id": int(experiment["experiment_id"]),
+                    "stack_id": int(stack["stack_id"]),
+                    "stack_name": str(stack["name"]),
+                    "cut_count": int(len([cut_id for cut_id in (stack.get("cut_ids") or []) if int(cut_id) in self.cuts])),
+                }
+            )
+        rotation_rows: list[dict[str, Any]] = []
+        for stack_id in experiment.get("rotation_stack_ids") or []:
+            stack = self.stacks.get(int(stack_id))
+            if stack is None:
+                continue
+            rotation_rows.append(
+                {
+                    "experiment_id": int(experiment["experiment_id"]),
+                    "stack_id": int(stack["stack_id"]),
+                    "stack_name": str(stack["name"]),
+                    "cut_count": int(len([cut_id for cut_id in (stack.get("cut_ids") or []) if int(cut_id) in self.cuts])),
+                }
+            )
+
+        self._write_table_bundle(root_dir / "master_table", master_rows)
+        self._write_table_bundle(root_dir / "cells_table", cells_rows)
+        self._write_table_bundle(root_dir / "trace_table", trace_rows)
+        self._write_table_bundle(root_dir / "novelty_table", novelty_rows)
+        self._write_table_bundle(root_dir / "important_zones_table", important_rows)
+        self._write_table_bundle(root_dir / "displacements" / "summary", displacement_rows)
+        self._write_table_bundle(root_dir / "rotates" / "summary", rotation_rows)
+        with open(root_dir / "manifest.json", "w", encoding="utf-8") as handle:
+            json.dump(
+                self._json_safe(
+                    {
+                        "experiment": experiment,
+                        "summary": {
+                            "master_rows": len(master_rows),
+                            "cells_rows": len(cells_rows),
+                            "trace_rows": len(trace_rows),
+                            "important_rows": len(important_rows),
+                            "novelty_rows": len(novelty_rows),
+                        },
+                    }
+                ),
+                handle,
+                indent=2,
+            )
+        with open(root_dir / "status.json", "w", encoding="utf-8") as handle:
+            json.dump(
+                self._json_safe(
+                    {
+                        "experiment_id": int(experiment["experiment_id"]),
+                        "status": "completed",
+                        "updated_at": self._timestamp_now(),
+                        "summary": summary or f"Completed with {len(master_rows)} event row(s).",
+                    }
+                ),
+                handle,
+                indent=2,
+            )
+        with open(root_dir / "run_log.txt", "a", encoding="utf-8") as handle:
+            handle.write(
+                f"{self._timestamp_now()} | finalize | master={len(master_rows)} "
+                f"important={len(important_rows)} novelty={len(novelty_rows)}\n"
+            )
+        experiment["status"] = "completed"
+        experiment["updated_at"] = self._timestamp_now()
+        experiment["completed_at"] = self._timestamp_now()
+        experiment["last_run_summary"] = summary or f"Completed with {len(master_rows)} event row(s)."
+        self._record_session_change()
+        self.refresh_all()
+        self._set_status(
+            summary or f"Exhaustive study completed for {experiment['name']}."
+        )
+
+    def _export_selected_experiment_tables(self) -> None:
+        experiment = self._selected_experiment()
+        if experiment is None:
+            self._set_status("Select a study first.")
+            return
+        self._finalize_experiment_outputs(
+            int(experiment["experiment_id"]),
+            summary=f"Exported tables for {experiment['name']}.",
+        )
+
     def _td_window_wavelet_event_final_mode(self, event: dict[str, Any]) -> str:
         origin = str(event.get("origin", "") or "")
         if event.get("split_children_ids") or origin == "manual-split":
@@ -5165,6 +6539,8 @@ class TDMosaicApp:
             panels = self._panels_for_cut(cut_id)
             primary_panel = panels[0] if panels else None
             memberships = self._stack_memberships_for_cut(cut_id)
+            experiment_refs = self._experiment_memberships_for_cut(cut_id)
+            primary_experiment = experiment_refs[0] if experiment_refs else {}
             dynamic_enabled = self._cut_dynamic_enabled(cut_id)
             dynamic_reference_frame = self._cut_dynamic_reference_frame(cut_id)
             dynamic_keyframes = self._cut_dynamic_keyframes(cut_id)
@@ -5218,6 +6594,20 @@ class TDMosaicApp:
                             for item in memberships
                         ],
                         "stack_refs": self._clone_wavelet_payload(memberships),
+                        "experiment_ids": [
+                            int(item["experiment_id"]) for item in experiment_refs
+                        ],
+                        "experiment_names": [
+                            str(item["experiment_name"]) for item in experiment_refs
+                        ],
+                        "experiment_refs": self._clone_wavelet_payload(experiment_refs),
+                        "experiment_id": primary_experiment.get("experiment_id"),
+                        "experiment_name": str(primary_experiment.get("experiment_name") or ""),
+                        "experiment_cell_id": str(primary_experiment.get("cell_id") or ""),
+                        "experiment_offset_idx": int(primary_experiment.get("offset_idx", 0)),
+                        "experiment_offset_value": float(primary_experiment.get("offset_value", 0.0)),
+                        "experiment_angle_idx": int(primary_experiment.get("angle_idx", 0)),
+                        "experiment_angle_deg": float(primary_experiment.get("angle_deg", 0.0)),
                         "dynamic_enabled": bool(dynamic_enabled),
                         "dynamic_reference_frame": int(dynamic_reference_frame),
                         "dynamic_keyframe_count": int(len(dynamic_keyframes)),
@@ -9182,6 +10572,161 @@ class TDMosaicApp:
             member_button_row, text="Move Down", command=lambda: self._move_selected_stack_member(1)
         ).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
 
+        experiments_box = self.ttk.LabelFrame(
+            self.sidebar_stacks_tab, text="Exhaustive Study", padding=8
+        )
+        experiments_box.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        experiments_box.columnconfigure(0, weight=1)
+        experiments_box.columnconfigure(1, weight=1)
+
+        self.ttk.Label(
+            experiments_box,
+            text="Base cut = selected cut. Offsets are parallel shifts; angles are relative rotations.",
+            justify="left",
+            wraplength=320,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        self.ttk.Label(experiments_box, text="Name").grid(
+            row=1, column=0, sticky="w", pady=(6, 0)
+        )
+        self.ttk.Entry(
+            experiments_box, textvariable=self.experiment_name_var
+        ).grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
+        self.ttk.Label(experiments_box, text="d step").grid(
+            row=2, column=0, sticky="w", pady=(6, 0)
+        )
+        self.ttk.Entry(
+            experiments_box, textvariable=self.experiment_displacement_step_var, width=10
+        ).grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
+        self.ttk.Label(experiments_box, text="d limit").grid(
+            row=3, column=0, sticky="w", pady=(6, 0)
+        )
+        self.ttk.Entry(
+            experiments_box, textvariable=self.experiment_displacement_limit_var, width=10
+        ).grid(row=3, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
+        self.ttk.Label(experiments_box, text="ang min").grid(
+            row=4, column=0, sticky="w", pady=(6, 0)
+        )
+        self.ttk.Entry(
+            experiments_box, textvariable=self.experiment_angle_min_var, width=10
+        ).grid(row=4, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
+        self.ttk.Label(experiments_box, text="ang max").grid(
+            row=5, column=0, sticky="w", pady=(6, 0)
+        )
+        self.ttk.Entry(
+            experiments_box, textvariable=self.experiment_angle_max_var, width=10
+        ).grid(row=5, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
+        self.ttk.Label(experiments_box, text="ang step").grid(
+            row=6, column=0, sticky="w", pady=(6, 0)
+        )
+        self.ttk.Entry(
+            experiments_box, textvariable=self.experiment_angle_step_var, width=10
+        ).grid(row=6, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
+
+        save_row = self.ttk.Frame(experiments_box)
+        save_row.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        save_row.columnconfigure(0, weight=1)
+        save_row.columnconfigure(1, weight=1)
+        save_row.columnconfigure(2, weight=1)
+        self.ttk.Checkbutton(
+            save_row,
+            text="Save TD FITS",
+            variable=self.experiment_save_td_fits_var,
+        ).grid(row=0, column=0, sticky="w")
+        self.ttk.Checkbutton(
+            save_row,
+            text="Save cell JSON",
+            variable=self.experiment_save_cell_json_var,
+        ).grid(row=0, column=1, sticky="w")
+        self.ttk.Checkbutton(
+            save_row,
+            text="Important images",
+            variable=self.experiment_save_important_images_var,
+        ).grid(row=0, column=2, sticky="w")
+
+        experiment_button_row = self.ttk.Frame(experiments_box)
+        experiment_button_row.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        experiment_button_row.columnconfigure(0, weight=1)
+        experiment_button_row.columnconfigure(1, weight=1)
+        self.ttk.Button(
+            experiment_button_row,
+            text="Generate Study",
+            command=self._generate_exhaustive_experiment,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.ttk.Button(
+            experiment_button_row,
+            text="Run Exhaustive",
+            command=self._run_selected_experiment,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.ttk.Button(
+            experiment_button_row,
+            text="Export Tables",
+            command=self._export_selected_experiment_tables,
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(6, 0))
+        self.ttk.Button(
+            experiment_button_row,
+            text="Delete Study",
+            command=self._delete_selected_experiment,
+        ).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
+
+        self.experiment_listbox = self.tk.Listbox(
+            experiments_box, height=7, exportselection=False
+        )
+        self.experiment_listbox.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.experiment_listbox.bind("<<ListboxSelect>>", self._on_experiment_list_select)
+
+        experiment_view_row = self.ttk.Frame(experiments_box)
+        experiment_view_row.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        experiment_view_row.columnconfigure(0, weight=1)
+        experiment_view_row.columnconfigure(1, weight=1)
+        self.ttk.Radiobutton(
+            experiment_view_row,
+            text="By displacement",
+            variable=self.experiment_view_mode_var,
+            value="displacement",
+            command=lambda: self._activate_selected_experiment_view("displacement"),
+        ).grid(row=0, column=0, sticky="w")
+        self.ttk.Radiobutton(
+            experiment_view_row,
+            text="By rotation",
+            variable=self.experiment_view_mode_var,
+            value="rotation",
+            command=lambda: self._activate_selected_experiment_view("rotation"),
+        ).grid(row=0, column=1, sticky="w")
+
+        progress_box = self.ttk.LabelFrame(experiments_box, text="Progress", padding=6)
+        progress_box.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        progress_box.columnconfigure(0, weight=1)
+        self.ttk.Label(
+            progress_box, textvariable=self.experiment_progress_global_var, justify="left"
+        ).grid(row=0, column=0, sticky="w")
+        self.experiment_global_progress = self.ttk.Progressbar(
+            progress_box, mode="determinate", maximum=1.0, value=0.0
+        )
+        self.experiment_global_progress.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.ttk.Label(
+            progress_box, textvariable=self.experiment_progress_outer_var, justify="left"
+        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.experiment_outer_progress = self.ttk.Progressbar(
+            progress_box, mode="determinate", maximum=1.0, value=0.0
+        )
+        self.experiment_outer_progress.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        self.ttk.Label(
+            progress_box, textvariable=self.experiment_progress_inner_var, justify="left"
+        ).grid(row=4, column=0, sticky="w", pady=(6, 0))
+        self.experiment_inner_progress = self.ttk.Progressbar(
+            progress_box, mode="determinate", maximum=1.0, value=0.0
+        )
+        self.experiment_inner_progress.grid(row=5, column=0, sticky="ew", pady=(4, 0))
+        self.ttk.Label(
+            progress_box, textvariable=self.experiment_progress_stage_var, justify="left"
+        ).grid(row=6, column=0, sticky="w", pady=(6, 0))
+        self.ttk.Button(
+            progress_box,
+            text="Cancel run",
+            command=self._cancel_running_experiment,
+        ).grid(row=7, column=0, sticky="ew", pady=(8, 0))
+
         export_dir_box = self.ttk.LabelFrame(
             self.sidebar_export_tab, text="Export Folder", padding=8
         )
@@ -9600,7 +11145,362 @@ class TDMosaicApp:
             self.stack_member_listbox.selection_set(member_index)
             self.stack_member_listbox.activate(member_index)
 
+    def _refresh_experiment_list(self) -> None:
+        if not hasattr(self, "experiment_listbox"):
+            return
+        self.experiment_listbox.delete(0, self.tk.END)
+        ordered = sorted(
+            self.experiments.values(),
+            key=lambda item: int(item.get("experiment_id", 0)),
+        )
+        for experiment in ordered:
+            self.experiment_listbox.insert(self.tk.END, self._experiment_label(experiment))
+        if self.active_experiment_id not in self.experiments:
+            self.active_experiment_id = ordered[0]["experiment_id"] if ordered else None
+        if self.active_experiment_id is not None:
+            index = next(
+                (
+                    idx
+                    for idx, experiment in enumerate(ordered)
+                    if int(experiment["experiment_id"]) == int(self.active_experiment_id)
+                ),
+                None,
+            )
+            if index is not None:
+                self.experiment_listbox.selection_clear(0, self.tk.END)
+                self.experiment_listbox.selection_set(index)
+                self.experiment_listbox.activate(index)
+        experiment = self._selected_experiment()
+        if experiment is None:
+            self.experiment_progress_global_var.set("Idle.")
+            self.experiment_progress_outer_var.set("Displacements: 0/0")
+            self.experiment_progress_inner_var.set("Angles: 0/0")
+            self.experiment_progress_stage_var.set("Stage: idle")
+            self.experiment_view_mode_var.set("displacement")
+            return
+        self.experiment_view_mode_var.set(str(experiment.get("view_mode") or "displacement"))
+        cells = len(self._experiment_cells(experiment))
+        self.experiment_progress_global_var.set(
+            f"{experiment['name']} | status={experiment.get('status', 'created')} | cells={cells}"
+        )
+        self.experiment_progress_outer_var.set(
+            f"Displacements: {len(experiment.get('offset_values') or [])}"
+        )
+        self.experiment_progress_inner_var.set(
+            f"Angles: {len(experiment.get('angle_values') or [])}"
+        )
+        self.experiment_progress_stage_var.set(
+            f"Stage: {experiment.get('last_run_summary') or experiment.get('status', 'idle')}"
+        )
+
+    def _on_experiment_list_select(self, _event: Any) -> None:
+        if not hasattr(self, "experiment_listbox"):
+            return
+        selection = self.experiment_listbox.curselection()
+        if not selection:
+            return
+        ordered = sorted(
+            self.experiments.values(),
+            key=lambda item: int(item.get("experiment_id", 0)),
+        )
+        index = int(selection[0])
+        if not (0 <= index < len(ordered)):
+            return
+        self.active_experiment_id = int(ordered[index]["experiment_id"])
+        self._refresh_experiment_list()
+
+    def _activate_selected_experiment_view(self, mode: str) -> None:
+        experiment = self._selected_experiment()
+        if experiment is None:
+            self._set_status("Select a study first.")
+            return
+        normalized_mode = "rotation" if str(mode) == "rotation" else "displacement"
+        experiment["view_mode"] = normalized_mode
+        stack_ids = (
+            experiment.get("rotation_stack_ids")
+            if normalized_mode == "rotation"
+            else experiment.get("displacement_stack_ids")
+        ) or []
+        valid_stack_ids = [int(stack_id) for stack_id in stack_ids if int(stack_id) in self.stacks]
+        if valid_stack_ids:
+            self.active_stack_id = int(valid_stack_ids[0])
+            stack = self.stacks[int(valid_stack_ids[0])]
+            cut_ids = [int(cut_id) for cut_id in (stack.get("cut_ids") or []) if int(cut_id) in self.cuts]
+            self.selected_stack_cut_id = cut_ids[0] if cut_ids else None
+        self._record_session_change()
+        self.refresh_all()
+        self._set_status(
+            f"{experiment['name']}: viewing stacks by {normalized_mode}."
+        )
+
+    def _series_from_range(self, start_value: float, end_value: float, step_value: float) -> list[float]:
+        step_value = abs(float(step_value))
+        if step_value <= 0.0:
+            return [float(start_value)]
+        if end_value < start_value:
+            start_value, end_value = end_value, start_value
+        count = int(math.floor((end_value - start_value) / step_value + 1e-9)) + 1
+        values = [float(start_value + idx * step_value) for idx in range(max(count, 1))]
+        if not values or values[-1] < end_value - 1e-6:
+            values.append(float(end_value))
+        rounded = [round(value, 6) for value in values]
+        out: list[float] = []
+        for value in rounded:
+            if not out or abs(value - out[-1]) > 1e-6:
+                out.append(float(value))
+        return out
+
+    def _symmetric_series(self, limit_value: float, step_value: float) -> list[float]:
+        limit_value = abs(float(limit_value))
+        values = self._series_from_range(-limit_value, limit_value, step_value)
+        if not any(abs(value) <= 1e-6 for value in values):
+            values.append(0.0)
+            values.sort()
+        return values
+
+    def _experiment_output_root(self, experiment: dict[str, Any]) -> Path:
+        configured = str(experiment.get("export_root") or "").strip()
+        if configured:
+            target = Path(configured).expanduser().resolve()
+        else:
+            base_dir = self._resolved_export_dir()
+            target = base_dir / (
+                f"{self._safe_export_slug(self.cube_path.stem)}"
+                f"_cut{int(experiment.get('base_cut_id') or 0):03d}"
+                f"_study{int(experiment.get('experiment_id') or 0):03d}"
+                f"_{self._safe_export_slug(str(experiment.get('name') or 'study'))}"
+            )
+        target.mkdir(parents=True, exist_ok=True)
+        experiment["export_root"] = str(target)
+        return target
+
+    def _drop_cut_from_experiments(self, cut_id: int) -> None:
+        for experiment in self.experiments.values():
+            experiment["cut_ids"] = [
+                int(member_cut_id)
+                for member_cut_id in (experiment.get("cut_ids") or [])
+                if int(member_cut_id) != int(cut_id)
+            ]
+            experiment["cells"] = [
+                dict(cell)
+                for cell in (experiment.get("cells") or [])
+                if int(cell.get("cut_id", -1)) != int(cut_id)
+            ]
+
+    def _drop_stack_from_experiments(self, stack_id: int) -> None:
+        for experiment in self.experiments.values():
+            experiment["displacement_stack_ids"] = [
+                int(current_stack_id)
+                for current_stack_id in (experiment.get("displacement_stack_ids") or [])
+                if int(current_stack_id) != int(stack_id)
+            ]
+            experiment["rotation_stack_ids"] = [
+                int(current_stack_id)
+                for current_stack_id in (experiment.get("rotation_stack_ids") or [])
+                if int(current_stack_id) != int(stack_id)
+            ]
+
+    def _generate_exhaustive_experiment(self) -> None:
+        base_cut = self._selected_cut()
+        if base_cut is None:
+            self._set_status("Select a base cut first.")
+            return
+        step_value = self._parse_float_var(
+            self.experiment_displacement_step_var.get(), "displacement step"
+        )
+        limit_value = self._parse_float_var(
+            self.experiment_displacement_limit_var.get(), "displacement limit"
+        )
+        angle_min = self._parse_float_var(self.experiment_angle_min_var.get(), "angle min")
+        angle_max = self._parse_float_var(self.experiment_angle_max_var.get(), "angle max")
+        angle_step = self._parse_float_var(self.experiment_angle_step_var.get(), "angle step")
+        if None in {step_value, limit_value, angle_min, angle_max, angle_step}:
+            return
+        step_value = max(float(step_value), 1.0)
+        limit_value = max(float(limit_value), 0.0)
+        angle_step = max(abs(float(angle_step)), 0.1)
+        offset_values = self._symmetric_series(limit_value, step_value)
+        angle_values = self._series_from_range(float(angle_min), float(angle_max), angle_step)
+        total_cells = len(offset_values) * len(angle_values)
+        if total_cells <= 0:
+            self._set_status("The study definition produced no cells.")
+            return
+        if total_cells > MAX_EXPERIMENT_CUTS:
+            self._set_status(
+                f"Study would generate {total_cells} cuts. Reduce the ranges first."
+            )
+            return
+
+        base_preview = self._cut_preview(base_cut.cut_id, int(self.t_visual_var.get())) or base_cut
+        dx = float(base_preview.p1[0] - base_preview.p0[0])
+        dy = float(base_preview.p1[1] - base_preview.p0[1])
+        norm = math.hypot(dx, dy)
+        if norm <= 1e-6:
+            self._set_status("Base cut is too short for a study.")
+            return
+        normal_x = -dy / norm
+        normal_y = dx / norm
+        base_name = str(self.experiment_name_var.get()).strip() or f"Study {self.next_experiment_id}"
+        experiment_id = int(self.next_experiment_id)
+        self.next_experiment_id += 1
+        experiment = self._make_default_experiment_state(
+            experiment_id,
+            base_name,
+            base_cut_id=base_cut.cut_id,
+        )
+        experiment["base_cut_name"] = str(base_cut.name)
+        experiment["base_frame_idx"] = int(self.t_visual_var.get())
+        experiment["base_angle_deg"] = float(cut_display_angle_deg(base_preview))
+        experiment["base_length_px"] = float(cut_length(base_preview))
+        experiment["displacement_step"] = float(step_value)
+        experiment["displacement_limit"] = float(limit_value)
+        experiment["offset_values"] = [float(value) for value in offset_values]
+        experiment["angle_min"] = float(min(angle_values))
+        experiment["angle_max"] = float(max(angle_values))
+        experiment["angle_step"] = float(angle_step)
+        experiment["angle_values"] = [float(value) for value in angle_values]
+        experiment["save_options"] = {
+            "save_td_fits": bool(self.experiment_save_td_fits_var.get()),
+            "save_cell_json": bool(self.experiment_save_cell_json_var.get()),
+            "save_important_images": bool(self.experiment_save_important_images_var.get()),
+        }
+        experiment_root = self._experiment_output_root(experiment)
+        for folder_name in ("cells", "displacements", "rotates", "important_zones_images"):
+            (experiment_root / folder_name).mkdir(parents=True, exist_ok=True)
+        experiment["status_path"] = str(experiment_root / "status.json")
+        experiment["manifest_path"] = str(experiment_root / "manifest.json")
+
+        generated_cut_ids: list[int] = []
+        cells: list[dict[str, Any]] = []
+        displacement_stack_ids: list[int] = []
+        rotation_stack_map: dict[int, list[int]] = {idx: [] for idx in range(len(angle_values))}
+        template_panel = self.active_panel
+        for offset_idx, offset_value in enumerate(offset_values):
+            row_cut_ids: list[int] = []
+            displacement_label = f"{base_name} | d={offset_value:+.1f}px"
+            displacement_stack = self._create_stack_state(
+                name=displacement_label, cut_ids=[]
+            )
+            displacement_stack_ids.append(int(displacement_stack["stack_id"]))
+            for angle_idx, angle_value in enumerate(angle_values):
+                shifted = Cut(
+                    cut_id=-1,
+                    name="template",
+                    color=base_preview.color,
+                    p0=base_preview.p0,
+                    p1=base_preview.p1,
+                )
+                shifted.p0, shifted.p1 = shift_cut(
+                    shifted,
+                    float(offset_value * normal_x),
+                    float(offset_value * normal_y),
+                    self.nx,
+                    self.ny,
+                )
+                rotate_cut(shifted, float(angle_value), self.nx, self.ny)
+                if cut_length(shifted) < 1.0:
+                    continue
+                cut = self._create_cut(shifted.p0, shifted.p1)
+                cut.name = (
+                    f"{base_name} d{offset_idx:02d} a{angle_idx:02d}"
+                )
+                self._seed_cut_td_params_from_panel(cut.cut_id, template_panel)
+                row_cut_ids.append(int(cut.cut_id))
+                rotation_stack_map[int(angle_idx)].append(int(cut.cut_id))
+                generated_cut_ids.append(int(cut.cut_id))
+                cell_id = f"off_{offset_idx:03d}_ang_{angle_idx:03d}"
+                cells.append(
+                    {
+                        "cell_id": cell_id,
+                        "cut_id": int(cut.cut_id),
+                        "cut_name": str(cut.name),
+                        "offset_idx": int(offset_idx),
+                        "offset_value": float(offset_value),
+                        "angle_idx": int(angle_idx),
+                        "angle_deg": float(angle_value),
+                        "cell_dir": str(experiment_root / "cells" / cell_id),
+                        "status": "created",
+                    }
+                )
+            displacement_stack["cut_ids"] = row_cut_ids
+
+        rotation_stack_ids: list[int] = []
+        for angle_idx, angle_value in enumerate(angle_values):
+            cut_ids = [
+                int(cut_id)
+                for cut_id in rotation_stack_map.get(int(angle_idx), [])
+                if int(cut_id) in self.cuts
+            ]
+            rotation_stack = self._create_stack_state(
+                name=f"{base_name} | a={float(angle_value):+.1f}deg",
+                cut_ids=cut_ids,
+            )
+            rotation_stack_ids.append(int(rotation_stack["stack_id"]))
+
+        if not generated_cut_ids:
+            for stack_id in displacement_stack_ids + rotation_stack_ids:
+                self.stacks.pop(int(stack_id), None)
+            self.next_experiment_id = max(self.next_experiment_id - 1, 1)
+            self._set_status("Study generation produced no valid cuts.")
+            return
+
+        experiment["cut_ids"] = generated_cut_ids
+        experiment["cells"] = cells
+        experiment["displacement_stack_ids"] = displacement_stack_ids
+        experiment["rotation_stack_ids"] = rotation_stack_ids
+        experiment["status"] = "generated"
+        experiment["updated_at"] = self._timestamp_now()
+        experiment["last_run_summary"] = "Generated geometry."
+        self.experiments[experiment_id] = experiment
+        self.active_experiment_id = experiment_id
+        self.selected_cut_id = int(generated_cut_ids[0])
+        self.active_stack_id = (
+            int(displacement_stack_ids[0]) if displacement_stack_ids else self.active_stack_id
+        )
+        self.selected_stack_cut_id = int(generated_cut_ids[0])
+        self._record_session_change()
+        self.refresh_all()
+        self._set_status(
+            f"Generated {len(generated_cut_ids)} exhaustive cuts for {base_name} "
+            f"({len(offset_values)} displacements x {len(angle_values)} angles)."
+        )
+
+    def _delete_selected_experiment(self) -> None:
+        experiment = self._selected_experiment()
+        if experiment is None:
+            self._set_status("Select a study first.")
+            return
+        if not self.messagebox.askyesno(
+            "Delete Study",
+            "Delete the study metadata and its generated view stacks?\n\n"
+            "Generated cuts will be kept so you can still inspect them manually.",
+            parent=self.root,
+        ):
+            return
+        for stack_id in (
+            list(experiment.get("displacement_stack_ids") or [])
+            + list(experiment.get("rotation_stack_ids") or [])
+        ):
+            self.stacks.pop(int(stack_id), None)
+        experiment_id = int(experiment["experiment_id"])
+        self.experiments.pop(experiment_id, None)
+        if self.active_experiment_id == experiment_id:
+            self.active_experiment_id = next(iter(sorted(self.experiments.keys())), None)
+        self._record_session_change()
+        self.refresh_all()
+        self._set_status(f"Deleted study {experiment_id}.")
+
     def _create_stack(
+        self, *, name: str | None = None, cut_ids: list[int] | None = None
+    ) -> dict[str, Any]:
+        stack = self._create_stack_state(name=name, cut_ids=cut_ids)
+        self.active_stack_id = int(stack["stack_id"])
+        self.selected_stack_cut_id = (cut_ids or [None])[0]
+        self._record_session_change()
+        self.refresh_all()
+        return stack
+
+    def _create_stack_state(
         self, *, name: str | None = None, cut_ids: list[int] | None = None
     ) -> dict[str, Any]:
         stack_id = int(self.next_stack_id)
@@ -9611,10 +11511,6 @@ class TDMosaicApp:
             cut_ids or [],
         )
         self.stacks[stack_id] = stack
-        self.active_stack_id = stack_id
-        self.selected_stack_cut_id = (cut_ids or [None])[0]
-        self._record_session_change()
-        self.refresh_all()
         return stack
 
     def _new_empty_stack(self) -> None:
@@ -9653,6 +11549,7 @@ class TDMosaicApp:
             return
         stack_id = int(stack["stack_id"])
         self.stacks.pop(stack_id, None)
+        self._drop_stack_from_experiments(stack_id)
         if self.active_stack_id == stack_id:
             self.active_stack_id = next(iter(sorted(self.stacks.keys())), None)
         self.selected_stack_cut_id = None
@@ -11044,6 +12941,7 @@ class TDMosaicApp:
                 for member_cut_id in (stack.get("cut_ids") or [])
                 if int(member_cut_id) != int(cut_id)
             ]
+        self._drop_cut_from_experiments(cut_id)
         del self.cuts[cut_id]
         if self.selected_cut_id == cut_id:
             self.selected_cut_id = None
@@ -12198,6 +14096,9 @@ class TDMosaicApp:
         event.setdefault("confidence_label", "")
         if event.get("history") is None:
             event["history"] = []
+        analysis = event.get("analysis")
+        if isinstance(analysis, dict):
+            analysis.setdefault("decision_warnings", [])
         source_t_idx = np.asarray(event.get("source_t_idx", []), dtype=np.float64)
         event.setdefault("base_source_fit_mask", np.ones(source_t_idx.shape, dtype=bool))
         event.setdefault(
@@ -12948,6 +14849,17 @@ class TDMosaicApp:
             "manual accepted",
         }
 
+    def _set_readonly_text(self, widget: Any, text: str) -> None:
+        if widget is None:
+            return
+        try:
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", str(text))
+            widget.configure(state="disabled")
+        except Exception:
+            return
+
     def _td_window_wavelet_event_reason(self, event: dict[str, Any]) -> str:
         status = self._td_window_wavelet_event_status(event)
         if status == "manual accepted":
@@ -12956,7 +14868,18 @@ class TDMosaicApp:
             return "rejected manually"
         if status == "split parent":
             return "replaced by split children"
-        return str((event.get("analysis") or {}).get("decision_reason", "") or "")
+        analysis = event.get("analysis") or {}
+        base_reason = str(analysis.get("decision_reason", "") or "")
+        warnings = [
+            str(item)
+            for item in (analysis.get("decision_warnings") or [])
+            if str(item).strip()
+        ]
+        if warnings and base_reason:
+            return f"{base_reason} ({', '.join(warnings)})"
+        if warnings:
+            return ", ".join(warnings)
+        return base_reason
 
     def _td_window_wavelet_advanced_filter_values(
         self, panel_id: int
@@ -13257,6 +15180,8 @@ class TDMosaicApp:
         finally:
             existing["wavelet_table_updating"] = False
 
+        self._refresh_td_window_wavelet_popup_table(panel_id)
+
         events = self._td_window_wavelet_events(panel_id)
         counted = sum(1 for event in events if self._td_window_wavelet_event_is_counted(event))
         rejected = sum(
@@ -13284,19 +15209,36 @@ class TDMosaicApp:
         existing = self.td_windows.get(panel_id)
         if existing is None:
             return
+
+        def _update_detail_widgets() -> None:
+            selected_text = str(existing["wavelet_selected_var"].get() or "").strip()
+            diag_text = str(existing["wavelet_diag_var"].get() or "").strip()
+            detail_text = "\n\n".join(
+                item for item in (selected_text, diag_text) if item
+            ).strip()
+            if not detail_text:
+                detail_text = "Select a wavelet event to inspect it."
+            self._set_readonly_text(existing.get("wavelet_detail_text"), detail_text)
+            self._set_readonly_text(existing.get("wavelet_table_detail_text"), detail_text)
+
         selected_event = self._td_window_wavelet_selected_event(panel_id)
         diag_canvas = existing.get("diag_canvas")
         diag_fig = existing.get("diag_figure")
         diag_axes = existing.get("diag_axes")
-        if diag_fig is None or diag_canvas is None or diag_axes is None:
-            return
+        plotting_enabled = (
+            diag_fig is not None and diag_canvas is not None and diag_axes is not None
+        )
 
-        for axis in diag_axes:
-            axis.clear()
+        if plotting_enabled:
+            for axis in diag_axes:
+                axis.clear()
 
         if selected_event is None:
             existing["wavelet_selected_var"].set("Select a wavelet event to inspect it.")
             existing["wavelet_diag_var"].set("")
+            _update_detail_widgets()
+            if not plotting_enabled:
+                return
             diag_axes[0].text(0.5, 0.5, "Select an event in the table.", ha="center", va="center", transform=diag_axes[0].transAxes)
             for axis in diag_axes[1:]:
                 axis.axis("off")
@@ -13317,6 +15259,9 @@ class TDMosaicApp:
         if diagnostic is None:
             existing["wavelet_selected_var"].set("Could not build diagnostics for the selected event.")
             existing["wavelet_diag_var"].set("")
+            _update_detail_widgets()
+            if not plotting_enabled:
+                return
             diag_axes[0].text(0.5, 0.5, "Diagnostics unavailable.", ha="center", va="center", transform=diag_axes[0].transAxes)
             for axis in diag_axes[1:]:
                 axis.axis("off")
@@ -13381,6 +15326,9 @@ class TDMosaicApp:
             f"F={float(analysis.get('energy_flux_w_m2', float('nan'))):.3e} W/m^2 | "
             "diag: drag-left=trim, right-click=split"
         )
+        _update_detail_widgets()
+        if not plotting_enabled:
+            return
 
         raw_ax, detr_ax, scal_ax, spec_ax = diag_axes
         if t_seg.size and y_arc.size == t_seg.size:
@@ -14539,6 +16487,196 @@ class TDMosaicApp:
         if toggle_var is not None:
             toggle_var.set("Wavelet diag window")
 
+    def _open_td_window_wavelet_table_window(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        panel = self._td_window_panel(panel_id)
+        if existing is None or panel is None:
+            return
+        parent_top = existing.get("top")
+        if parent_top is None or not parent_top.winfo_exists():
+            return
+
+        table_top = existing.get("wavelet_table_top")
+        if table_top is not None and table_top.winfo_exists():
+            table_top.deiconify()
+            table_top.lift()
+            self._refresh_td_window_wavelet_popup_table(panel_id)
+            self._refresh_td_window_wavelet_diagnostics(panel_id)
+            return
+
+        table_top = self.tk.Toplevel(parent_top)
+        table_top.title(f"Wavelet Event Table - {panel.name}")
+        table_top.geometry("1760x720")
+        table_top.rowconfigure(0, weight=1)
+        table_top.columnconfigure(0, weight=1)
+
+        frame = self.ttk.Frame(table_top, padding=8)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.rowconfigure(1, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        self.ttk.Label(
+            frame,
+            text=(
+                "Expanded event table. Selection stays synced with the main editor so "
+                "reasons and candidates remain readable."
+            ),
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+
+        tree_frame = self.ttk.Frame(frame)
+        tree_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+
+        tree = self.ttk.Treeview(
+            tree_frame,
+            columns=WAVELET_EVENT_TABLE_COLUMNS,
+            show="headings",
+            height=22,
+        )
+        tree.grid(row=0, column=0, sticky="nsew")
+        tree_y = self.ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree_x = self.ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=tree_y.set, xscrollcommand=tree_x.set)
+        tree_y.grid(row=0, column=1, sticky="ns")
+        tree_x.grid(row=1, column=0, sticky="ew")
+        for column, (label, width) in WAVELET_EVENT_TABLE_HEADINGS.items():
+            tree.heading(column, text=label)
+            tree.column(
+                column,
+                width=(360 if column == "reason" else width),
+                stretch=(column in {"reason", "flags"}),
+            )
+        for tag_name, color in (
+            ("auto_accepted", "green4"),
+            ("auto_rejected", "firebrick"),
+            ("custom_accepted", "darkcyan"),
+            ("custom_rejected", "darkorange"),
+            ("manual_accepted", "dodgerblue4"),
+            ("manual_rejected", "red4"),
+            ("split_parent", "gray45"),
+        ):
+            tree.tag_configure(tag_name, foreground=color)
+        tree.bind(
+            "<<TreeviewSelect>>",
+            lambda _event, pid=panel_id: self._on_td_window_wavelet_popup_select(pid),
+        )
+
+        detail_frame = self.ttk.LabelFrame(
+            frame, text="Selected event detail", padding=6
+        )
+        detail_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        detail_frame.rowconfigure(0, weight=1)
+        detail_frame.columnconfigure(0, weight=1)
+        detail_text = self.tk.Text(detail_frame, height=8, wrap="word", state="disabled")
+        detail_text.grid(row=0, column=0, sticky="nsew")
+        detail_y = self.ttk.Scrollbar(
+            detail_frame, orient="vertical", command=detail_text.yview
+        )
+        detail_text.configure(yscrollcommand=detail_y.set)
+        detail_y.grid(row=0, column=1, sticky="ns")
+
+        existing["wavelet_table_top"] = table_top
+        existing["wavelet_table_tree"] = tree
+        existing["wavelet_table_detail_text"] = detail_text
+        existing["wavelet_popup_table_updating"] = False
+        table_top.protocol(
+            "WM_DELETE_WINDOW",
+            lambda pid=panel_id: self._close_td_window_wavelet_table_window(pid),
+        )
+        self._refresh_td_window_wavelet_popup_table(panel_id)
+        self._refresh_td_window_wavelet_diagnostics(panel_id)
+
+    def _close_td_window_wavelet_table_window(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            return
+        table_top = existing.get("wavelet_table_top")
+        if table_top is not None and table_top.winfo_exists():
+            table_top.destroy()
+        existing["wavelet_table_top"] = None
+        existing["wavelet_table_tree"] = None
+        existing["wavelet_table_detail_text"] = None
+        existing["wavelet_popup_table_updating"] = False
+
+    def _refresh_td_window_wavelet_popup_table(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            return
+        table_top = existing.get("wavelet_table_top")
+        tree = existing.get("wavelet_table_tree")
+        if (
+            table_top is None
+            or tree is None
+            or not table_top.winfo_exists()
+        ):
+            return
+
+        filter_name = str(existing["wavelet_events_filter_var"].get() or "all")
+        advanced_filters = self._td_window_wavelet_advanced_filter_values(panel_id)
+        selected_event_id = existing.get("wavelet_selected_event_id")
+        existing["wavelet_popup_table_updating"] = True
+        try:
+            children = tree.get_children()
+            if children:
+                tree.delete(*children)
+
+            visible_ids: list[int] = []
+            for event in self._td_window_wavelet_events(panel_id):
+                if not self._td_window_wavelet_event_filter_match(
+                    event, filter_name, advanced_filters
+                ):
+                    continue
+                iid = f"evt-popup-{int(event['event_id'])}"
+                visible_ids.append(int(event["event_id"]))
+                tree.insert(
+                    "",
+                    "end",
+                    iid=iid,
+                    values=self._td_window_wavelet_event_row(event),
+                    tags=(self._td_window_wavelet_table_tag(event),),
+                )
+
+            target_iid: str | None = None
+            if selected_event_id in visible_ids:
+                target_iid = f"evt-popup-{int(selected_event_id)}"
+            elif visible_ids:
+                target_iid = f"evt-popup-{visible_ids[0]}"
+
+            if target_iid is not None:
+                current_selection = tree.selection()
+                if current_selection != (target_iid,):
+                    tree.selection_set(target_iid)
+                tree.focus(target_iid)
+                tree.see(target_iid)
+            else:
+                tree.selection_remove(tree.selection())
+        finally:
+            existing["wavelet_popup_table_updating"] = False
+
+    def _on_td_window_wavelet_popup_select(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        if existing is None or existing.get("wavelet_popup_table_updating"):
+            return
+        tree = existing.get("wavelet_table_tree")
+        if tree is None:
+            return
+        previous_event_id = existing.get("wavelet_selected_event_id")
+        selection = tree.selection()
+        if not selection:
+            existing["wavelet_selected_event_id"] = None
+        else:
+            iid = str(selection[0])
+            if iid.startswith("evt-popup-"):
+                try:
+                    existing["wavelet_selected_event_id"] = int(iid.split("-", 2)[2])
+                except Exception:
+                    existing["wavelet_selected_event_id"] = None
+        if existing.get("wavelet_selected_event_id") == previous_event_id:
+            return
+        self._refresh_td_window_wavelet_views(panel_id, redraw_td=True)
+
     def _toggle_td_window_diag_window(self, panel_id: int) -> None:
         existing = self.td_windows.get(panel_id)
         if existing is None:
@@ -15665,7 +17803,12 @@ class TDMosaicApp:
 
         self.ttk.Label(
             events_frame, textvariable=wavelet_events_summary_var
-        ).grid(row=0, column=0, columnspan=6, sticky="w")
+        ).grid(row=0, column=0, columnspan=4, sticky="w")
+        self.ttk.Button(
+            events_frame,
+            text="Expand table",
+            command=lambda pid=panel_id: self._open_td_window_wavelet_table_window(pid),
+        ).grid(row=0, column=4, columnspan=2, sticky="ew", padx=(6, 8))
         self.ttk.Label(events_frame, text="Filter").grid(row=0, column=6, sticky="e")
         wavelet_filter_box = self.ttk.Combobox(
             events_frame,
@@ -15787,50 +17930,30 @@ class TDMosaicApp:
             command=lambda pid=panel_id: self._clear_td_window_advanced_filters(pid),
         ).grid(row=2, column=6, columnspan=2, sticky="ew", padx=(4, 0), pady=(8, 0))
 
-        self.ttk.Label(
-            events_frame,
-            textvariable=wavelet_selected_var,
-            wraplength=520,
-            justify="left",
-        ).grid(row=2, column=0, columnspan=8, sticky="w", pady=(6, 0))
-        self.ttk.Label(
-            events_frame,
-            textvariable=wavelet_diag_var,
-            wraplength=520,
-            justify="left",
-        ).grid(row=3, column=0, columnspan=8, sticky="w", pady=(4, 0))
+        detail_frame = self.ttk.LabelFrame(
+            events_frame, text="Selected event detail", padding=6
+        )
+        detail_frame.grid(row=2, column=0, columnspan=8, sticky="ew", pady=(8, 0))
+        detail_frame.rowconfigure(0, weight=1)
+        detail_frame.columnconfigure(0, weight=1)
+        wavelet_detail_text = self.tk.Text(
+            detail_frame, height=6, wrap="word", state="disabled"
+        )
+        wavelet_detail_text.grid(row=0, column=0, sticky="nsew")
+        wavelet_detail_y = self.ttk.Scrollbar(
+            detail_frame, orient="vertical", command=wavelet_detail_text.yview
+        )
+        wavelet_detail_text.configure(yscrollcommand=wavelet_detail_y.set)
+        wavelet_detail_y.grid(row=0, column=1, sticky="ns")
 
         tree_frame = self.ttk.Frame(events_frame)
-        tree_frame.grid(row=4, column=0, columnspan=8, sticky="nsew", pady=(8, 0))
+        tree_frame.grid(row=3, column=0, columnspan=8, sticky="nsew", pady=(8, 0))
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
-        events_frame.rowconfigure(4, weight=1)
+        events_frame.rowconfigure(3, weight=1)
         wavelet_events_tree = self.ttk.Treeview(
             tree_frame,
-            columns=(
-                "id",
-                "status",
-                "origin",
-                "thread",
-                "seg",
-                "wseg",
-                "mode",
-                "period",
-                "freq",
-                "amp_arc",
-                "amp_km",
-                "vel",
-                "accel",
-                "energy",
-                "dur",
-                "ratio",
-                "score",
-                "pts",
-                "lock",
-                "links",
-                "flags",
-                "reason",
-            ),
+            columns=WAVELET_EVENT_TABLE_COLUMNS,
             show="headings",
             height=16,
         )
@@ -15844,31 +17967,7 @@ class TDMosaicApp:
         wavelet_events_tree.grid(row=0, column=0, sticky="nsew")
         tree_y.grid(row=0, column=1, sticky="ns")
         tree_x.grid(row=1, column=0, sticky="ew")
-        headings = {
-            "id": ("ID", 50),
-            "status": ("Status", 110),
-            "origin": ("Origin", 90),
-            "thread": ("Thr", 50),
-            "seg": ("Seg", 50),
-            "wseg": ("Wseg", 55),
-            "mode": ("Mode", 55),
-            "period": ("P [s]", 70),
-            "freq": ("f [mHz]", 70),
-            "amp_arc": ("A ['']", 70),
-            "amp_km": ("A [km]", 75),
-            "vel": ("v [km/s]", 80),
-            "accel": ("a [km/s2]", 85),
-            "energy": ("E/m [J/kg]", 100),
-            "dur": ("dur [s]", 70),
-            "ratio": ("ratio", 60),
-            "score": ("Conf", 62),
-            "pts": ("fit/int", 72),
-            "lock": ("Lock", 55),
-            "links": ("Links", 55),
-            "flags": ("QA", 110),
-            "reason": ("Reason", 140),
-        }
-        for column, (label, width) in headings.items():
+        for column, (label, width) in WAVELET_EVENT_TABLE_HEADINGS.items():
             wavelet_events_tree.heading(column, text=label)
             wavelet_events_tree.column(
                 column,
@@ -15884,7 +17983,7 @@ class TDMosaicApp:
         wavelet_events_tree.tag_configure("split_parent", foreground="gray45")
 
         actions_frame = self.ttk.Frame(events_frame)
-        actions_frame.grid(row=5, column=0, columnspan=8, sticky="ew", pady=(8, 0))
+        actions_frame.grid(row=4, column=0, columnspan=8, sticky="ew", pady=(8, 0))
         for idx in range(10):
             actions_frame.columnconfigure(idx, weight=1)
         self.ttk.Button(
@@ -16142,6 +18241,10 @@ class TDMosaicApp:
             "<<TreeviewSelect>>",
             lambda _event, pid=panel_id: self._on_td_window_wavelet_event_select(pid),
         )
+        wavelet_events_tree.bind(
+            "<Double-1>",
+            lambda _event, pid=panel_id: self._open_td_window_wavelet_table_window(pid),
+        )
         for widget in (
             wavelet_trim_start_entry,
             wavelet_trim_end_entry,
@@ -16250,6 +18353,7 @@ class TDMosaicApp:
             "wavelet_events_summary_var": wavelet_events_summary_var,
             "wavelet_selected_var": wavelet_selected_var,
             "wavelet_diag_var": wavelet_diag_var,
+            "wavelet_detail_text": wavelet_detail_text,
             "wavelet_progress_var": wavelet_progress_var,
             "wavelet_progressbar": wavelet_progressbar,
             "wavelet_run_button": wavelet_run_button,
@@ -16268,6 +18372,10 @@ class TDMosaicApp:
             "wavelet_trim_start_var": wavelet_trim_start_var,
             "wavelet_trim_end_var": wavelet_trim_end_var,
             "wavelet_split_frames_var": wavelet_split_frames_var,
+            "wavelet_table_top": None,
+            "wavelet_table_tree": None,
+            "wavelet_table_detail_text": None,
+            "wavelet_popup_table_updating": False,
             "center_x_var": center_x_var,
             "center_y_var": center_y_var,
             "cut_x1_var": cut_x1_var,
@@ -16299,6 +18407,7 @@ class TDMosaicApp:
         self._sync_panel_analysis_state_from_window(panel_id)
         self._close_td_window_roi_window(panel_id)
         self._close_td_window_diag_window(panel_id)
+        self._close_td_window_wavelet_table_window(panel_id)
         existing = self.td_windows.pop(panel_id, None)
         if existing is None:
             return
@@ -16371,6 +18480,7 @@ class TDMosaicApp:
         self._refresh_feature_axis_list()
         self._refresh_stack_list()
         self._refresh_stack_member_list()
+        self._refresh_experiment_list()
         self._draw_map()
         self._draw_td_panels()
         self.canvas.draw_idle()

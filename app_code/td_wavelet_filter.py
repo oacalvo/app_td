@@ -10,13 +10,13 @@ import pywt
 DEFAULT_WAVELET_FILTER = {
     "p_min": 10.0,
     "p_max": 100.0,
-    "power_ratio_thresh": 2.4,
-    "segment_power_frac": 0.35,
-    "min_points_segment": 25,
-    "min_amp_arcsec": 0.055,
-    "max_jump_pix": 1.5,
-    "min_points_cut_seg": 8,
-    "rms_amp_ratio_max": 0.7,
+    "power_ratio_thresh": 1.75,
+    "segment_power_frac": 0.22,
+    "min_points_segment": 12,
+    "min_amp_arcsec": 0.03,
+    "max_jump_pix": 2.5,
+    "min_points_cut_seg": 6,
+    "rms_amp_ratio_max": 1.1,
     "km_per_arcsec": 725.27,
     "density_kg_m3": float("nan"),
     "phase_speed_km_s": float("nan"),
@@ -618,7 +618,7 @@ def wavelet_select_segment(
     return is_wave_like, segments_time, diag
 
 
-def _decision_reason(
+def _candidate_decision(
     *,
     has_segment: bool,
     is_wave_like: bool,
@@ -629,18 +629,28 @@ def _decision_reason(
     rms_amp_ratio: float,
     rms_amp_ratio_max: float,
     point_count: int,
-) -> str:
+) -> tuple[bool, str, list[str]]:
     if not has_segment:
-        return "no wavelet segment"
+        return False, "no wavelet segment", []
     if point_count < 3:
-        return "too few points"
-    if not is_wave_like or power_ratio < power_ratio_thresh:
-        return "low power ratio"
-    if amp_arcsec < min_amp_arcsec:
-        return "low amplitude"
-    if np.isfinite(rms_amp_ratio) and rms_amp_ratio > rms_amp_ratio_max:
-        return "high fit residual"
-    return "accepted"
+        return False, "too few points", []
+
+    warnings: list[str] = []
+    soft_power_floor = max(float(power_ratio_thresh) * 0.8, 1.15)
+    if (not np.isfinite(power_ratio)) or power_ratio < soft_power_floor:
+        return False, "low power ratio", warnings
+    if (not is_wave_like) or power_ratio < power_ratio_thresh:
+        warnings.append("borderline power ratio")
+    if np.isfinite(min_amp_arcsec) and min_amp_arcsec > 0.0:
+        if (not np.isfinite(amp_arcsec)) or amp_arcsec < min_amp_arcsec:
+            warnings.append("low amplitude")
+    if (
+        np.isfinite(rms_amp_ratio)
+        and np.isfinite(rms_amp_ratio_max)
+        and rms_amp_ratio > rms_amp_ratio_max
+    ):
+        warnings.append("high fit residual")
+    return True, "accepted", warnings
 
 
 def analyze_tracked_segment_with_wavelet(
@@ -740,6 +750,7 @@ def analyze_tracked_segment_with_wavelet(
                 "fit_point_count": 0,
                 "interp_point_count": 0,
                 "decision_reason": "no wavelet segment",
+                "decision_warnings": [],
                 **compute_segment_physical_params(
                     np.array([], dtype=np.float64),
                     np.array([], dtype=np.float64),
@@ -784,6 +795,7 @@ def analyze_tracked_segment_with_wavelet(
             wave_y_detr = np.array([], dtype=np.float64)
             wave_model = np.array([], dtype=np.float64)
             rms_amp_ratio = float("nan")
+            decision_warnings: list[str] = []
             fit_params = compute_segment_physical_params(
                 wave_t_s if has_segment else np.array([], dtype=np.float64),
                 wave_y_arc if has_segment else np.array([], dtype=np.float64),
@@ -834,15 +846,9 @@ def analyze_tracked_segment_with_wavelet(
                     wave_y_detr = np.array([], dtype=np.float64)
                     wave_model = np.array([], dtype=np.float64)
                     span_amp_arcsec = float("nan")
+                    decision_warnings.append("detrend failed")
 
-                if (
-                    mode_is_wave
-                    and mode_power_ratio >= power_ratio_thresh
-                    and amp_metric >= min_amp_arcsec
-                ):
-                    accepted = True
-
-                if accepted and np.isfinite(mode_peak_period) and mode_peak_period > 0.0:
+                if np.isfinite(mode_peak_period) and mode_peak_period > 0.0:
                     try:
                         wave_model, fit_amp, _ = fit_sine_with_trend(
                             wave_t_s,
@@ -857,11 +863,29 @@ def analyze_tracked_segment_with_wavelet(
                             if np.isfinite(fit_amp) and fit_amp > 1e-9
                             else float("inf")
                         )
-                        if rms_amp_ratio > rms_amp_ratio_max:
-                            accepted = False
                     except Exception:
-                        rms_amp_ratio = float("inf")
-                        accepted = False
+                        rms_amp_ratio = float("nan")
+                        decision_warnings.append("fit check unavailable")
+
+            accepted, decision_reason, hard_warnings = _candidate_decision(
+                has_segment=has_segment,
+                is_wave_like=mode_is_wave,
+                power_ratio=mode_power_ratio,
+                power_ratio_thresh=power_ratio_thresh,
+                amp_arcsec=amp,
+                min_amp_arcsec=min_amp_arcsec,
+                rms_amp_ratio=rms_amp_ratio,
+                rms_amp_ratio_max=rms_amp_ratio_max,
+                point_count=fit_point_count,
+            )
+            decision_warnings.extend(hard_warnings)
+            if decision_warnings:
+                seen_warnings: set[str] = set()
+                decision_warnings = [
+                    warning
+                    for warning in decision_warnings
+                    if not (warning in seen_warnings or seen_warnings.add(warning))
+                ]
 
             candidates.append(
                 {
@@ -886,17 +910,8 @@ def analyze_tracked_segment_with_wavelet(
                     "rms_amp_ratio": rms_amp_ratio,
                     "fit_point_count": fit_point_count,
                     "interp_point_count": interp_point_count,
-                    "decision_reason": _decision_reason(
-                        has_segment=has_segment,
-                        is_wave_like=mode_is_wave,
-                        power_ratio=mode_power_ratio,
-                        power_ratio_thresh=power_ratio_thresh,
-                        amp_arcsec=amp,
-                        min_amp_arcsec=min_amp_arcsec,
-                        rms_amp_ratio=rms_amp_ratio,
-                        rms_amp_ratio_max=rms_amp_ratio_max,
-                        point_count=fit_point_count,
-                    ),
+                    "decision_reason": decision_reason,
+                    "decision_warnings": decision_warnings,
                     **fit_params,
                 }
             )
@@ -994,7 +1009,8 @@ def analyze_tracked_threads_with_wavelets(
                         "source_fit_mask": np.asarray(fit_mask_seg, dtype=bool),
                     }
                 )
-
+    from collections import Counter
+    print("decision reasons:", Counter(r["decision_reason"] for r in results))
     return results
 
 
