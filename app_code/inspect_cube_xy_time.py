@@ -16,12 +16,6 @@ from astropy.io import fits
 from matplotlib.widgets import Slider
 
 
-DEFAULT_CUBE = (
-    Path(__file__).resolve().parents[4]
-    / "cube_core_avg_all_WOW_nodenoise_g1.0.fits"
-)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -32,8 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cube",
         type=Path,
-        default=DEFAULT_CUBE,
-        help=f"Path to the FITS cube. Default: {DEFAULT_CUBE}",
+        default=None,
+        help="Path to the FITS cube. If omitted, the inspector asks for one at startup.",
     )
     parser.add_argument(
         "--time-index",
@@ -72,6 +66,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _prompt_for_cube_path(initial_cube: Path | None = None) -> Path | None:
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    current_path = (
+        initial_cube.expanduser()
+        if initial_cube is not None
+        else Path.home()
+    )
+    selected = filedialog.askopenfilename(
+        title="Open FITS cube",
+        initialdir=str(current_path.parent if current_path.suffix else current_path),
+        filetypes=[("FITS", "*.fits *.fit *.fts"), ("All files", "*.*")],
+        parent=root,
+    )
+    root.destroy()
+    return Path(selected).expanduser().resolve() if selected else None
+
+
 def load_cube(cube_path: Path) -> tuple[np.ndarray, fits.Header]:
     cube_path = cube_path.expanduser().resolve()
     with fits.open(cube_path, memmap=True) as hdul:
@@ -102,14 +117,19 @@ def compute_limits(frame: np.ndarray) -> tuple[float, float]:
 
 def main() -> None:
     args = parse_args()
-    cube, header = load_cube(args.cube)
+    cube_path = args.cube.expanduser().resolve() if args.cube is not None else None
+    if cube_path is None:
+        cube_path = _prompt_for_cube_path()
+        if cube_path is None:
+            raise SystemExit("No FITS cube selected.")
+    cube, header = load_cube(cube_path)
     nt, ny, nx = cube.shape
 
     t_index = clamp_index(args.time_index, nt, "time-index")
     x_init = None if args.x is None else clamp_index(args.x, nx, "x")
     y_init = None if args.y is None else clamp_index(args.y, ny, "y")
 
-    print(f"Loaded cube: {args.cube}")
+    print(f"Loaded cube: {cube_path}")
     print(f"Shape: nt={nt}, ny={ny}, nx={nx}")
     print("Axis convention: data[t, y, x]  <->  DS9 axes (x, y, frame/time)")
     print(

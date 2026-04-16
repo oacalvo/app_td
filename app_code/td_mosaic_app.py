@@ -121,11 +121,6 @@ except ImportError:
         width_offsets_and_weights,
     )
 
-
-DEFAULT_CUBE = (
-    Path(__file__).resolve().parents[4]
-    / "cube_core_avg_all_WOW_nodenoise_g1.0.fits"
-)
 MAX_FEATURE_AXIS_CUTS = 600
 LAYOUT_PRESETS = {
     "1x1": (1, 1),
@@ -169,9 +164,24 @@ DEFAULT_WAVELET_FILTER = {
     "km_per_arcsec": 725.27,
     "density_kg_m3": float("nan"),
     "phase_speed_km_s": float("nan"),
+    "min_prominence": 0.0,
+    "min_snr": 1.0,
+    "continuity_weight": 1.5,
+    "time_weight": 2.0,
+    "quality_weight": 0.35,
+    "error_weight": 0.15,
 }
 
-SESSION_VERSION = 4
+WAVELET_EDITABLE_TRACKING_KEYS = (
+    "min_prominence",
+    "min_snr",
+    "continuity_weight",
+    "time_weight",
+    "quality_weight",
+    "error_weight",
+)
+
+SESSION_VERSION = 5
 DEFAULT_AUTOSAVE_EVERY = 10
 WAVELET_QA_EDGE_FRACTION = 0.1
 WAVELET_QA_RESIDUAL_WARN_FRAC = 0.85
@@ -215,6 +225,66 @@ PARAMETER_PRESETS = {
             "min_points_cut_seg": 7,
             "rms_amp_ratio_max": 0.75,
             "km_per_arcsec": 725.27,
+        },
+    },
+    "sst_halpha_conservative": {
+        "label": "SST H-alpha Conservative",
+        "crest": {
+            **dict(DEFAULT_CREST_TRACKING),
+            "cad": 1.00,
+            "res": 0.059,
+            "grad": 0.42,
+            "min_tlen": 16,
+            "max_dist_jump": 2,
+            "max_time_skip": 3,
+        },
+        "wavelet": {
+            **dict(DEFAULT_WAVELET_FILTER),
+            "p_min": 8.0,
+            "p_max": 120.0,
+            "power_ratio_thresh": 2.2,
+            "segment_power_frac": 0.32,
+            "min_points_segment": 20,
+            "min_amp_arcsec": 0.035,
+            "max_jump_pix": 1.2,
+            "min_points_cut_seg": 7,
+            "rms_amp_ratio_max": 0.75,
+            "km_per_arcsec": 725.27,
+            "min_snr": 1.0,
+            "continuity_weight": 1.2,
+            "time_weight": 1.6,
+            "quality_weight": 0.20,
+            "error_weight": 0.10,
+        },
+    },
+    "sst_halpha_strict": {
+        "label": "SST H-alpha Strict",
+        "crest": {
+            **dict(DEFAULT_CREST_TRACKING),
+            "cad": 1.00,
+            "res": 0.059,
+            "grad": 0.52,
+            "min_tlen": 22,
+            "max_dist_jump": 2,
+            "max_time_skip": 2,
+        },
+        "wavelet": {
+            **dict(DEFAULT_WAVELET_FILTER),
+            "p_min": 8.0,
+            "p_max": 120.0,
+            "power_ratio_thresh": 2.5,
+            "segment_power_frac": 0.38,
+            "min_points_segment": 24,
+            "min_amp_arcsec": 0.040,
+            "max_jump_pix": 1.0,
+            "min_points_cut_seg": 8,
+            "rms_amp_ratio_max": 0.65,
+            "km_per_arcsec": 725.27,
+            "min_snr": 1.8,
+            "continuity_weight": 2.4,
+            "time_weight": 2.8,
+            "quality_weight": 0.55,
+            "error_weight": 0.20,
         },
     },
     "iris_sji": {
@@ -283,16 +353,22 @@ def load_local_nuwt_api() -> tuple[dict[str, Any] | None, str | None]:
     if _NUWT_IMPORT_ERROR is not None:
         return None, _NUWT_IMPORT_ERROR
 
-    package_root = Path(__file__).resolve().parents[2]
-    package_root_str = str(package_root)
-    if package_root_str not in sys.path:
-        sys.path.insert(0, package_root_str)
-
     try:
-        from nuwt import follow_threads, locate_things, patch_up_threads
-    except Exception as exc:
-        _NUWT_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
-        return None, _NUWT_IMPORT_ERROR
+        from .nuwt import follow_threads, locate_things, patch_up_threads
+    except Exception as embedded_exc:
+        package_root = Path(__file__).resolve().parents[2]
+        package_root_str = str(package_root)
+        if package_root_str not in sys.path:
+            sys.path.insert(0, package_root_str)
+
+        try:
+            from nuwt import follow_threads, locate_things, patch_up_threads
+        except Exception as exc:
+            _NUWT_IMPORT_ERROR = (
+                f"embedded={type(embedded_exc).__name__}: {embedded_exc}; "
+                f"external={type(exc).__name__}: {exc}"
+            )
+            return None, _NUWT_IMPORT_ERROR
 
     _NUWT_API = {
         "locate_things": locate_things,
@@ -398,15 +474,143 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cube",
         type=Path,
-        default=DEFAULT_CUBE,
-        help=f"Path to the FITS cube. Default: {DEFAULT_CUBE}",
+        default=None,
+        help="Path to the FITS cube. If omitted, the app asks for one at startup.",
     )
     parser.add_argument(
         "--cube-order",
         default="TYX",
-        help="Input cube axis order. Use TYX/TXY/YTX/YXT/XTY/XYT or 123/132/213/231/312/321.",
+        help=(
+            "Input cube axis order. Use TYX/TXY/YTX/YXT/XTY/XYT or "
+            "123/132/213/231/312/321. Also used as the default choice in the startup dialog."
+        ),
+    )
+    parser.add_argument(
+        "--session",
+        type=Path,
+        default=None,
+        help=(
+            "Optional saved session JSON. If it references another cube, "
+            "the app reopens that cube automatically."
+        ),
+    )
+    parser.add_argument(
+        "--session-cube-override",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args()
+
+
+def _prompt_for_initial_cube(
+    initial_cube: Path | None = None,
+    initial_order: str = "TYX",
+) -> tuple[Path, str] | None:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    root = tk.Tk()
+    root.title("Open Input Cube")
+    root.geometry("720x220")
+    root.rowconfigure(0, weight=1)
+    root.columnconfigure(0, weight=1)
+
+    frame = ttk.Frame(root, padding=12)
+    frame.grid(row=0, column=0, sticky="nsew")
+    frame.columnconfigure(1, weight=1)
+
+    initial_path = (
+        str(initial_cube.expanduser())
+        if initial_cube is not None
+        else str(Path.home())
+    )
+    path_var = tk.StringVar(value=initial_path)
+    order_var = tk.StringVar(
+        value=cube_axis_order_display_label(normalize_cube_axis_order(initial_order))
+    )
+    info_var = tk.StringVar(
+        value=(
+            "Choose the raw input cube and how its file axes map to T,Y,X. "
+            "Examples: 123|TYX, 213|YTX, 312|XTY."
+        )
+    )
+    result: dict[str, Any] = {}
+
+    def _browse() -> None:
+        current_path = Path(str(path_var.get()).strip() or str(Path.home())).expanduser()
+        selected = filedialog.askopenfilename(
+            title="Open FITS cube",
+            initialdir=str(current_path.parent if current_path.suffix else current_path),
+            filetypes=[("FITS", "*.fits *.fit *.fts"), ("All files", "*.*")],
+            parent=root,
+        )
+        if selected:
+            path_var.set(selected)
+
+    def _accept() -> None:
+        cube_text = str(path_var.get()).strip()
+        if not cube_text:
+            messagebox.showerror("Open Input Cube", "Choose a FITS cube first.", parent=root)
+            return
+        cube_path = Path(cube_text).expanduser()
+        if not cube_path.exists():
+            messagebox.showerror(
+                "Open Input Cube",
+                "The selected cube does not exist.",
+                parent=root,
+            )
+            return
+        try:
+            order = normalize_cube_axis_order(str(order_var.get()).split("|", 1)[0].strip())
+        except Exception as exc:
+            messagebox.showerror("Open Input Cube", str(exc), parent=root)
+            return
+        result["value"] = (cube_path.resolve(), order)
+        root.destroy()
+
+    def _cancel() -> None:
+        root.destroy()
+
+    ttk.Label(frame, text="Cube").grid(row=0, column=0, sticky="w")
+    ttk.Entry(frame, textvariable=path_var).grid(row=0, column=1, sticky="ew", padx=(8, 8))
+    ttk.Button(frame, text="Browse", command=_browse).grid(row=0, column=2, sticky="ew")
+
+    ttk.Label(frame, text="Axis order").grid(row=1, column=0, sticky="w", pady=(12, 0))
+    order_values = [cube_axis_order_display_label(order) for order in CUBE_AXIS_ORDERS]
+    ttk.Combobox(
+        frame,
+        textvariable=order_var,
+        values=order_values,
+        state="readonly",
+        width=24,
+    ).grid(row=1, column=1, sticky="w", padx=(8, 8), pady=(12, 0))
+    ttk.Label(
+        frame,
+        textvariable=info_var,
+        justify="left",
+        wraplength=660,
+    ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+    buttons = ttk.Frame(frame)
+    buttons.grid(row=3, column=0, columnspan=3, sticky="e", pady=(16, 0))
+    ttk.Button(buttons, text="Cancel", command=_cancel).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(buttons, text="Open Cube", command=_accept).grid(row=0, column=1)
+
+    root.bind("<Return>", lambda _event: _accept())
+    root.bind("<Escape>", lambda _event: _cancel())
+    root.protocol("WM_DELETE_WINDOW", _cancel)
+    root.wait_window()
+    return result.get("value")
+
+
+def _session_startup_defaults(session_path: Path) -> tuple[Path | None, str]:
+    with open(session_path.expanduser().resolve(), "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    session_cube = str(payload.get("cube_path") or "").strip()
+    session_order = normalize_cube_axis_order(str(payload.get("cube_axis_order", "TYX")))
+    cube_path = Path(session_cube).expanduser().resolve() if session_cube else None
+    return cube_path, session_order
 
 
 class TDMosaicApp:
@@ -537,6 +741,9 @@ class TDMosaicApp:
         self.next_link_group_id = 1
         self.export_dir_var = tk.StringVar(value=str(self.cube_path.parent))
         self.export_info_var = tk.StringVar(value="")
+        self.export_write_fits_var = tk.BooleanVar(value=True)
+        self.export_write_png_var = tk.BooleanVar(value=True)
+        self.export_split_dirs_var = tk.BooleanVar(value=True)
         self.autosave_path = (
             Path(__file__).resolve().parent.parent
             / f"{self.cube_path.stem}_td_session_autosave.json"
@@ -606,6 +813,29 @@ class TDMosaicApp:
             "dynamic_reference_frame": 0,
             "dynamic_keyframes": {},
         }
+
+    def _merge_crest_and_wavelet_params(
+        self,
+        crest_source: dict[str, Any] | None,
+        wavelet_source: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        crest_in = dict(crest_source or {})
+        wavelet_in = dict(wavelet_source or {})
+
+        crest_params = dict(DEFAULT_CREST_TRACKING)
+        for key in DEFAULT_CREST_TRACKING:
+            if key in crest_in:
+                crest_params[key] = crest_in[key]
+
+        wavelet_params = dict(DEFAULT_WAVELET_FILTER)
+        for key in WAVELET_EDITABLE_TRACKING_KEYS:
+            if key in crest_in and key not in wavelet_in:
+                wavelet_params[key] = crest_in[key]
+        for key in DEFAULT_WAVELET_FILTER:
+            if key in wavelet_in:
+                wavelet_params[key] = wavelet_in[key]
+
+        return crest_params, wavelet_params
 
     def _make_default_stack_state(
         self, stack_id: int, name: str, cut_ids: list[int] | None = None
@@ -961,6 +1191,23 @@ class TDMosaicApp:
         self.export_dir_var.set(str(resolved))
         return resolved
 
+    def _export_kind_enabled(self, kind: str) -> bool:
+        if kind == "fits":
+            return bool(self.export_write_fits_var.get())
+        if kind == "png":
+            return bool(self.export_write_png_var.get())
+        return False
+
+    def _resolved_export_target_dir(self, kind: str, *, create: bool = True) -> Path:
+        base_dir = self._resolved_export_dir()
+        if bool(self.export_split_dirs_var.get()):
+            target = base_dir / str(kind).lower()
+        else:
+            target = base_dir
+        if create:
+            target.mkdir(parents=True, exist_ok=True)
+        return target
+
     def _browse_export_dir(self) -> None:
         initial_dir = str(
             Path(str(self.export_dir_var.get()).strip() or self.cube_path.parent).expanduser()
@@ -978,12 +1225,26 @@ class TDMosaicApp:
         self._record_session_change()
         self._set_status(f"Export folder set to {self.export_dir_var.get()}.")
 
+    def _on_export_settings_change(self) -> None:
+        self._refresh_export_controls()
+        self._refresh_saved_fits_browser()
+        self._record_session_change()
+
     def _refresh_export_controls(self) -> None:
         if not hasattr(self, "export_info_var"):
             return
         current_t = int(self.t_visual_var.get())
+        fits_dir = self._resolved_export_target_dir("fits", create=False)
+        png_dir = self._resolved_export_target_dir("png", create=False)
         lines = [
             f"Folder: {str(self.export_dir_var.get()).strip() or self.cube_path.parent}",
+            (
+                f"Outputs: FITS={'on' if self.export_write_fits_var.get() else 'off'} | "
+                f"PNG={'on' if self.export_write_png_var.get() else 'off'} | "
+                f"split dirs={'on' if self.export_split_dirs_var.get() else 'off'}"
+            ),
+            f"FITS dir: {fits_dir}",
+            f"PNG dir: {png_dir}",
             f"Cube order: {cube_axis_order_display_label(self.cube_axis_order)}",
             f"Current map frame: t={current_t}",
         ]
@@ -1194,7 +1455,7 @@ class TDMosaicApp:
         return fits.Column(name=name, format=f"{max(width, 1)}A", array=array)
 
     def _saved_fits_file_items(self) -> list[dict[str, Any]]:
-        export_dir = Path(str(self.export_dir_var.get()).strip() or self.cube_path.parent).expanduser()
+        export_dir = self._resolved_export_target_dir("fits", create=False)
         if not export_dir.exists() or not export_dir.is_dir():
             return []
         items: list[dict[str, Any]] = []
@@ -1614,14 +1875,14 @@ class TDMosaicApp:
             self.saved_fits_window = None
             return
         items = self._saved_fits_file_items()
+        fits_dir = self._resolved_export_target_dir("fits", create=False)
         browser["items"] = items
         listbox = browser["file_listbox"]
         listbox.delete(0, self.tk.END)
         for item in items:
             listbox.insert(self.tk.END, self._saved_fits_item_label(item))
         browser["summary_var"].set(
-            f"Export folder: {str(self.export_dir_var.get()).strip() or self.cube_path.parent} | "
-            f"saved FITS found: {len(items)}"
+            f"FITS folder: {fits_dir} | saved FITS found: {len(items)}"
         )
         if items:
             current_selection = listbox.curselection()
@@ -1652,7 +1913,12 @@ class TDMosaicApp:
             return
         self._on_saved_fits_file_select()
 
-    def _choose_cube_dialog(self) -> tuple[Path, str] | None:
+    def _choose_cube_dialog(
+        self,
+        *,
+        initial_cube: Path | None = None,
+        initial_axis_order: str | None = None,
+    ) -> tuple[Path, str] | None:
         top = self.tk.Toplevel(self.root)
         top.title("Open Input Cube")
         top.geometry("720x220")
@@ -1664,8 +1930,16 @@ class TDMosaicApp:
         frame = self.ttk.Frame(top, padding=12)
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(1, weight=1)
-        path_var = self.tk.StringVar(value=str(self.cube_path))
-        order_var = self.tk.StringVar(value=cube_axis_order_display_label(self.cube_axis_order))
+        start_cube = (
+            initial_cube.expanduser().resolve()
+            if initial_cube is not None
+            else self.cube_path
+        )
+        start_order = normalize_cube_axis_order(
+            initial_axis_order if initial_axis_order is not None else self.cube_axis_order
+        )
+        path_var = self.tk.StringVar(value=str(start_cube))
+        order_var = self.tk.StringVar(value=cube_axis_order_display_label(start_order))
         info_var = self.tk.StringVar(
             value=(
                 "Choose the raw input cube and how its file axes map to T,Y,X. "
@@ -1733,14 +2007,14 @@ class TDMosaicApp:
         top.wait_window()
         return result.get("value")
 
-    def _choose_input_cube_and_restart(self) -> None:
-        selection = self._choose_cube_dialog()
-        if selection is None:
-            return
-        cube_path, cube_axis_order = selection
-        if cube_path == self.cube_path and cube_axis_order == self.cube_axis_order:
-            self._set_status("Cube and axis order are unchanged.")
-            return
+    def _restart_app_with_cube(
+        self,
+        cube_path: Path,
+        cube_axis_order: str,
+        *,
+        session_path: Path | None = None,
+        session_cube_override: Path | None = None,
+    ) -> None:
         script_path = Path(__file__).resolve()
         argv = [
             sys.executable,
@@ -1750,9 +2024,65 @@ class TDMosaicApp:
             "--cube-order",
             str(cube_axis_order),
         ]
+        if session_path is not None:
+            argv.extend(["--session", str(session_path.expanduser().resolve())])
+        if session_cube_override is not None:
+            argv.extend(
+                [
+                    "--session-cube-override",
+                    str(session_cube_override.expanduser().resolve()),
+                ]
+            )
         if self.root.winfo_exists():
             self.root.destroy()
         os.execv(sys.executable, argv)
+
+    def _confirm_restart_with_warning(
+        self,
+        *,
+        title: str,
+        message: str,
+    ) -> bool:
+        choice = self.messagebox.askyesnocancel(
+            title,
+            message
+            + "\n\nYes: save an autosave snapshot and continue."
+            + "\nNo: continue without saving."
+            + "\nCancel: stay in the current app.",
+        )
+        if choice is None:
+            self._set_status("Restart cancelled.")
+            return False
+        if choice:
+            try:
+                self._sync_all_panel_analysis_state_from_windows()
+                self._write_session_file(self.autosave_path, autosave=True)
+            except Exception as exc:
+                self.messagebox.showerror(
+                    title,
+                    "Could not save an autosave snapshot before restarting.\n\n"
+                    f"{type(exc).__name__}: {exc}",
+                )
+                return False
+        return True
+
+    def _choose_input_cube_and_restart(self) -> None:
+        selection = self._choose_cube_dialog()
+        if selection is None:
+            return
+        cube_path, cube_axis_order = selection
+        if cube_path == self.cube_path and cube_axis_order == self.cube_axis_order:
+            self._set_status("Cube and axis order are unchanged.")
+            return
+        if not self._confirm_restart_with_warning(
+            title="Open Cube",
+            message=(
+                "Opening a different cube requires restarting the app. "
+                "Current unsaved work in the open cube may be lost."
+            ),
+        ):
+            return
+        self._restart_app_with_cube(cube_path, cube_axis_order)
 
     def _write_current_map_fits(self, save_path: Path, frame_idx: int) -> None:
         frame_idx = clamp_int(int(frame_idx), 0, self.nt - 1)
@@ -2618,50 +2948,66 @@ class TDMosaicApp:
         return True
 
     def _export_current_map_fits(self) -> None:
+        if not self._export_kind_enabled("fits") and not self._export_kind_enabled("png"):
+            self._set_status("Enable FITS and/or PNG export first.")
+            return
         try:
-            export_dir = self._resolved_export_dir()
             frame_idx = int(self.t_visual_var.get())
-            save_path = export_dir / f"{self.cube_path.stem}_t{frame_idx:04d}_map.fits"
-            png_path = save_path.with_suffix(".png")
-            self._write_current_map_fits(save_path, frame_idx)
-            self._write_current_map_png(png_path, frame_idx)
+            base_name = f"{self.cube_path.stem}_t{frame_idx:04d}_map"
+            save_path = None
+            png_path = None
+            if self._export_kind_enabled("fits"):
+                save_path = self._resolved_export_target_dir("fits") / f"{base_name}.fits"
+                self._write_current_map_fits(save_path, frame_idx)
+            if self._export_kind_enabled("png"):
+                png_path = self._resolved_export_target_dir("png") / f"{base_name}.png"
+                self._write_current_map_png(png_path, frame_idx)
         except Exception as exc:
-            self._set_status(f"Map FITS export failed: {type(exc).__name__}: {exc}")
+            self._set_status(f"Map export failed: {type(exc).__name__}: {exc}")
             return
         self._refresh_saved_fits_browser()
-        self._set_status(f"Saved current map FITS to {save_path} and PNG to {png_path}.")
+        saved_bits = []
+        if save_path is not None:
+            saved_bits.append(f"FITS: {save_path}")
+        if png_path is not None:
+            saved_bits.append(f"PNG: {png_path}")
+        self._set_status("Saved current map " + " | ".join(saved_bits) + ".")
 
     def _export_cut_ids_fits(self, cut_ids: list[int], label: str) -> None:
         valid_cut_ids = [int(cut_id) for cut_id in cut_ids if int(cut_id) in self.cuts]
         if not valid_cut_ids:
             self._set_status(f"No valid cuts available for {label}.")
             return
+        if not self._export_kind_enabled("fits") and not self._export_kind_enabled("png"):
+            self._set_status("Enable FITS and/or PNG export first.")
+            return
         self._sync_all_panel_analysis_state_from_windows()
         try:
-            export_dir = self._resolved_export_dir()
-            written = 0
+            fits_written = 0
             png_written = 0
             for cut_id in valid_cut_ids:
                 cut = self.cuts[cut_id]
-                save_path = export_dir / (
-                    f"{self.cube_path.stem}_cut{cut_id:03d}_{self._safe_export_slug(cut.name)}_td.fits"
+                base_name = (
+                    f"{self.cube_path.stem}_cut{cut_id:03d}_{self._safe_export_slug(cut.name)}_td"
                 )
-                png_path = save_path.with_suffix(".png")
-                self._write_cut_td_fits(cut_id, save_path)
-                self._write_cut_quicklook_png(
-                    cut_id,
-                    png_path,
-                    map_cut_ids=valid_cut_ids,
-                )
-                written += 1
-                png_written += 1
+                if self._export_kind_enabled("fits"):
+                    save_path = self._resolved_export_target_dir("fits") / f"{base_name}.fits"
+                    self._write_cut_td_fits(cut_id, save_path)
+                    fits_written += 1
+                if self._export_kind_enabled("png"):
+                    png_path = self._resolved_export_target_dir("png") / f"{base_name}.png"
+                    self._write_cut_quicklook_png(
+                        cut_id,
+                        png_path,
+                        map_cut_ids=valid_cut_ids,
+                    )
+                    png_written += 1
         except Exception as exc:
-            self._set_status(f"Cut FITS export failed: {type(exc).__name__}: {exc}")
+            self._set_status(f"Cut export failed: {type(exc).__name__}: {exc}")
             return
         self._refresh_saved_fits_browser()
         self._set_status(
-            f"Saved {written} cut FITS file(s) and {png_written} PNG quicklook(s) "
-            f"for {label} in {export_dir}."
+            f"Saved {fits_written} cut FITS file(s) and {png_written} PNG quicklook(s) for {label}."
         )
 
     def _export_trace_ids_fits(self, cut_ids: list[int], label: str) -> None:
@@ -2669,40 +3015,55 @@ class TDMosaicApp:
         if not valid_cut_ids:
             self._set_status(f"No valid cuts available for {label}.")
             return
+        if not self._export_kind_enabled("fits") and not self._export_kind_enabled("png"):
+            self._set_status("Enable FITS and/or PNG export first.")
+            return
         self._sync_all_panel_analysis_state_from_windows()
         try:
-            export_dir = self._resolved_export_dir()
-            written = 0
+            fits_written = 0
             png_written = 0
+            total_products = 0
             for cut_id in valid_cut_ids:
                 cut = self.cuts[cut_id]
                 state = self._cut_analysis_snapshot(cut_id)
                 for event in state.get("wavelet_events") or []:
                     event_id = int(event.get("event_id", -1))
-                    save_path = export_dir / (
+                    base_name = (
                         f"{self.cube_path.stem}_cut{cut_id:03d}_{self._safe_export_slug(cut.name)}"
                         f"_evt{event_id:04d}_trace.fits"
                     )
-                    png_path = save_path.with_suffix(".png")
-                    if self._write_trace_event_fits(cut_id, event, save_path):
+                    base_path = Path(base_name)
+                    fits_ok = False
+                    if self._export_kind_enabled("fits"):
+                        save_path = self._resolved_export_target_dir("fits") / base_path.name
+                        fits_ok = self._write_trace_event_fits(cut_id, event, save_path)
+                        if fits_ok:
+                            fits_written += 1
+                    else:
+                        td, meta = self._cut_td(cut_id)
+                        fits_ok = meta is not None and "error" not in meta and bool(
+                            self._event_trace_rows(cut_id, event, meta=meta)
+                        )
+                    if fits_ok and self._export_kind_enabled("png"):
+                        png_path = self._resolved_export_target_dir("png") / base_path.with_suffix(".png").name
                         self._write_cut_quicklook_png(
                             cut_id,
                             png_path,
                             map_cut_ids=valid_cut_ids,
                             selected_event_id=event_id,
                         )
-                        written += 1
                         png_written += 1
-            if written <= 0:
+                    if fits_ok:
+                        total_products += 1
+            if total_products <= 0:
                 self._set_status(f"No traces/waves available for {label}.")
                 return
         except Exception as exc:
-            self._set_status(f"Trace FITS export failed: {type(exc).__name__}: {exc}")
+            self._set_status(f"Trace export failed: {type(exc).__name__}: {exc}")
             return
         self._refresh_saved_fits_browser()
         self._set_status(
-            f"Saved {written} trace FITS file(s) and {png_written} PNG quicklook(s) "
-            f"for {label} in {export_dir}."
+            f"Saved {fits_written} trace FITS file(s) and {png_written} PNG quicklook(s) for {label}."
         )
 
     def _export_selected_cut_fits(self) -> None:
@@ -2930,11 +3291,9 @@ class TDMosaicApp:
         existing = self.td_windows.get(panel_id)
         if existing is None:
             state = self._panel_analysis(panel_id)
-            crest_params = dict(DEFAULT_CREST_TRACKING)
-            crest_params.update(state.get("crest_params") or {})
-            wavelet_params = dict(DEFAULT_WAVELET_FILTER)
-            wavelet_params.update(state.get("wavelet_params") or {})
-            return crest_params, wavelet_params
+            return self._merge_crest_and_wavelet_params(
+                state.get("crest_params"), state.get("wavelet_params")
+            )
 
         density_text = str(existing["wavelet_density_var"].get()).strip()
         phase_speed_text = str(existing["wavelet_phase_speed_var"].get()).strip()
@@ -3003,6 +3362,30 @@ class TDMosaicApp:
             ),
             "density_kg_m3": self._safe_float_text(density_text, float("nan")),
             "phase_speed_km_s": self._safe_float_text(phase_speed_text, float("nan")),
+            "min_prominence": self._safe_float_text(
+                existing["wavelet_min_prominence_var"].get(),
+                DEFAULT_WAVELET_FILTER["min_prominence"],
+            ),
+            "min_snr": self._safe_float_text(
+                existing["wavelet_min_snr_var"].get(),
+                DEFAULT_WAVELET_FILTER["min_snr"],
+            ),
+            "continuity_weight": self._safe_float_text(
+                existing["wavelet_continuity_weight_var"].get(),
+                DEFAULT_WAVELET_FILTER["continuity_weight"],
+            ),
+            "time_weight": self._safe_float_text(
+                existing["wavelet_time_weight_var"].get(),
+                DEFAULT_WAVELET_FILTER["time_weight"],
+            ),
+            "quality_weight": self._safe_float_text(
+                existing["wavelet_quality_weight_var"].get(),
+                DEFAULT_WAVELET_FILTER["quality_weight"],
+            ),
+            "error_weight": self._safe_float_text(
+                existing["wavelet_error_weight_var"].get(),
+                DEFAULT_WAVELET_FILTER["error_weight"],
+            ),
         }
         return crest_params, wavelet_params
 
@@ -3029,10 +3412,9 @@ class TDMosaicApp:
             self._set_status(f"Unknown parameter preset '{preset_name}'.")
             return
 
-        crest_params = dict(DEFAULT_CREST_TRACKING)
-        crest_params.update(preset.get("crest") or {})
-        wavelet_params = dict(DEFAULT_WAVELET_FILTER)
-        wavelet_params.update(preset.get("wavelet") or {})
+        crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
+            preset.get("crest"), preset.get("wavelet")
+        )
 
         existing["crest_cad_var"].set(f"{float(crest_params['cad']):.2f}")
         existing["crest_res_var"].set(f"{float(crest_params['res']):.2f}")
@@ -3078,6 +3460,22 @@ class TDMosaicApp:
             ""
             if not np.isfinite(float(wavelet_params["phase_speed_km_s"]))
             else f"{float(wavelet_params['phase_speed_km_s']):.2f}"
+        )
+        existing["wavelet_min_prominence_var"].set(
+            f"{float(wavelet_params['min_prominence']):.3f}"
+        )
+        existing["wavelet_min_snr_var"].set(f"{float(wavelet_params['min_snr']):.2f}")
+        existing["wavelet_continuity_weight_var"].set(
+            f"{float(wavelet_params['continuity_weight']):.2f}"
+        )
+        existing["wavelet_time_weight_var"].set(
+            f"{float(wavelet_params['time_weight']):.2f}"
+        )
+        existing["wavelet_quality_weight_var"].set(
+            f"{float(wavelet_params['quality_weight']):.2f}"
+        )
+        existing["wavelet_error_weight_var"].set(
+            f"{float(wavelet_params['error_weight']):.2f}"
         )
 
         state = self._panel_analysis(panel_id)
@@ -3173,6 +3571,12 @@ class TDMosaicApp:
             "km_per_arcsec": self._safe_float_text(existing["wavelet_km_per_arcsec_var"].get(), DEFAULT_WAVELET_FILTER["km_per_arcsec"]),
             "density_kg_m3": self._safe_float_text(density_text, float("nan")),
             "phase_speed_km_s": self._safe_float_text(phase_speed_text, float("nan")),
+            "min_prominence": self._safe_float_text(existing["wavelet_min_prominence_var"].get(), DEFAULT_WAVELET_FILTER["min_prominence"]),
+            "min_snr": self._safe_float_text(existing["wavelet_min_snr_var"].get(), DEFAULT_WAVELET_FILTER["min_snr"]),
+            "continuity_weight": self._safe_float_text(existing["wavelet_continuity_weight_var"].get(), DEFAULT_WAVELET_FILTER["continuity_weight"]),
+            "time_weight": self._safe_float_text(existing["wavelet_time_weight_var"].get(), DEFAULT_WAVELET_FILTER["time_weight"]),
+            "quality_weight": self._safe_float_text(existing["wavelet_quality_weight_var"].get(), DEFAULT_WAVELET_FILTER["quality_weight"]),
+            "error_weight": self._safe_float_text(existing["wavelet_error_weight_var"].get(), DEFAULT_WAVELET_FILTER["error_weight"]),
         }
         snapshot["crest_tracking_result"] = self._clone_wavelet_payload(
             existing.get("crest_tracking_result")
@@ -3238,6 +3642,82 @@ class TDMosaicApp:
         for panel_id in list(self.td_windows.keys()):
             self._sync_panel_analysis_state_from_window(panel_id)
 
+    def _session_analysis_state_payload(
+        self, state: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        default_state = self._make_default_panel_analysis_state()
+        normalized = self._clone_wavelet_payload(state or {})
+        td_params = {
+            **dict(default_state["td_params"]),
+            **dict(normalized.get("td_params") or {}),
+        }
+        crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
+            normalized.get("crest_params"), normalized.get("wavelet_params")
+        )
+        advanced_filters = {
+            **dict(default_state["wavelet_advanced_filters"]),
+            **dict(normalized.get("wavelet_advanced_filters") or {}),
+        }
+        return {
+            "td_params": {
+                "t_ini": int(td_params["t_ini"]),
+                "t_fin": int(td_params["t_fin"]),
+                "stride": int(td_params["stride"]),
+                "width": int(td_params["width"]),
+                "weighting": str(td_params["weighting"]),
+            },
+            "dynamic_enabled": bool(normalized.get("dynamic_enabled", False)),
+            "dynamic_reference_frame": int(
+                normalized.get("dynamic_reference_frame", 0)
+            ),
+            "dynamic_keyframes": self._clone_wavelet_payload(
+                normalized.get("dynamic_keyframes") or {}
+            ),
+            "crest_params": self._clone_wavelet_payload(crest_params),
+            "crest_tracking_result": self._clone_wavelet_payload(
+                normalized.get("crest_tracking_result")
+            ),
+            "crest_tracking_td_key": self._clone_wavelet_payload(
+                normalized.get("crest_tracking_td_key")
+            ),
+            "wavelet_params": self._clone_wavelet_payload(wavelet_params),
+            "wavelet_thread_filter_text": str(
+                normalized.get("wavelet_thread_filter_text", "") or ""
+            ),
+            "wavelet_filter_result": self._clone_wavelet_payload(
+                normalized.get("wavelet_filter_result")
+            ),
+            "wavelet_events": self._clone_wavelet_payload(
+                normalized.get("wavelet_events") or []
+            ),
+            "wavelet_next_event_id": int(
+                normalized.get("wavelet_next_event_id", 1)
+            ),
+            "wavelet_selected_event_id": normalized.get("wavelet_selected_event_id"),
+            "wavelet_events_filter": str(
+                normalized.get("wavelet_events_filter", "accepted") or "accepted"
+            ),
+            "wavelet_advanced_filters": self._clone_wavelet_payload(
+                advanced_filters
+            ),
+            "wavelet_undo_stack": self._clone_wavelet_payload(
+                normalized.get("wavelet_undo_stack") or []
+            ),
+            "wavelet_redo_stack": self._clone_wavelet_payload(
+                normalized.get("wavelet_redo_stack") or []
+            ),
+            "preset_name": str(normalized.get("preset_name", "custom") or "custom"),
+            "roi_enabled": bool(normalized.get("roi_enabled", False)),
+            "roi_t_span": str(normalized.get("roi_t_span", "") or ""),
+            "roi_d_span": str(normalized.get("roi_d_span", "") or ""),
+            "roi_center_t": self._clone_wavelet_payload(
+                normalized.get("roi_center_t")
+            ),
+            "roi_center_d": self._clone_wavelet_payload(
+                normalized.get("roi_center_d")
+            ),
+        }
+
     def _json_safe(self, value: Any) -> Any:
         if isinstance(value, np.ndarray):
             return value.tolist()
@@ -3251,6 +3731,20 @@ class TDMosaicApp:
             return [self._json_safe(item) for item in value]
         if isinstance(value, tuple):
             return [self._json_safe(item) for item in value]
+        return value
+
+    def _normalized_tracking_key(self, value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            return tuple(self._normalized_tracking_key(item) for item in value.tolist())
+        if isinstance(value, (list, tuple)):
+            return tuple(self._normalized_tracking_key(item) for item in value)
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {
+                str(key): self._normalized_tracking_key(item)
+                for key, item in value.items()
+            }
         return value
 
     def _close_all_td_windows(self) -> None:
@@ -3322,10 +3816,27 @@ class TDMosaicApp:
             "next_stack_id": int(self.next_stack_id),
             "active_stack_id": self.active_stack_id,
             "stacks": self._json_safe(list(self.stacks.values())),
-            "cut_analysis_state": self._json_safe(self.cut_analysis_state),
-            "panel_analysis_state": self._json_safe(self.panel_analysis_state),
+            "cut_analysis_state": self._json_safe(
+                {
+                    str(cut_id): self._session_analysis_state_payload(
+                        self._cut_analysis(cut_id)
+                    )
+                    for cut_id in sorted(self.cuts.keys())
+                }
+            ),
+            "panel_analysis_state": self._json_safe(
+                {
+                    str(panel.panel_id): self._session_analysis_state_payload(
+                        self.panel_analysis_state.get(panel.panel_id)
+                    )
+                    for panel in self.panels
+                }
+            ),
             "export_settings": {
                 "dir": str(self.export_dir_var.get() or ""),
+                "write_fits": bool(self.export_write_fits_var.get()),
+                "write_png": bool(self.export_write_png_var.get()),
+                "split_dirs": bool(self.export_split_dirs_var.get()),
             },
         }
 
@@ -3368,23 +3879,88 @@ class TDMosaicApp:
             return
         self._load_session_from_path(Path(session_path))
 
-    def _load_session_from_path(self, session_path: Path) -> None:
+    def _load_session_from_path(
+        self,
+        session_path: Path,
+        *,
+        session_cube_override: Path | None = None,
+    ) -> None:
         session_path = session_path.expanduser().resolve()
         with open(session_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
 
-        session_cube = payload.get("cube_path")
-        if session_cube and Path(session_cube).expanduser().resolve() != self.cube_path:
-            self.messagebox.showerror(
-                "Load session",
-                "This session was saved for a different cube. Open the matching cube first.",
-            )
-            return
         session_axis_order = str(payload.get("cube_axis_order", self.cube_axis_order))
-        if normalize_cube_axis_order(session_axis_order) != self.cube_axis_order:
-            self.messagebox.showerror(
+        normalized_session_axis_order = normalize_cube_axis_order(session_axis_order)
+        session_cube_text = str(payload.get("cube_path") or "").strip()
+        session_cube_path = (
+            Path(session_cube_text).expanduser().resolve()
+            if session_cube_text
+            else self.cube_path
+        )
+        approved_session_cube = (
+            session_cube_override.expanduser().resolve()
+            if session_cube_override is not None
+            else None
+        )
+        if (
+            approved_session_cube is not None
+            and approved_session_cube != session_cube_path
+            and approved_session_cube == self.cube_path
+            and normalized_session_axis_order == self.cube_axis_order
+        ):
+            self.messagebox.showwarning(
                 "Load session",
-                "This session was saved for a different cube axis order. Open the cube with the same axis permutation first.",
+                "The session was saved with a different FITS path, but the current cube "
+                "has been explicitly approved as its replacement. The session will be loaded "
+                "using the currently open cube.",
+            )
+            session_cube_path = approved_session_cube
+        if (
+            session_cube_path != self.cube_path
+            or normalized_session_axis_order != self.cube_axis_order
+        ):
+            target_cube = session_cube_path
+            if not target_cube.exists():
+                self.messagebox.showwarning(
+                    "Load session",
+                    "This session references a cube that is not available at the saved path. "
+                    "Locate the matching FITS file to continue. The app will need to restart "
+                    "to open that replacement cube.",
+                )
+                selection = self._choose_cube_dialog(
+                    initial_cube=target_cube,
+                    initial_axis_order=normalized_session_axis_order,
+                )
+                if selection is None:
+                    return
+                target_cube, normalized_session_axis_order = selection
+                if not self._confirm_restart_with_warning(
+                    title="Load session",
+                    message=(
+                        "This session needs a replacement FITS cube before it can be loaded. "
+                        "The app will restart with the cube you selected."
+                    ),
+                ):
+                    return
+                self._restart_app_with_cube(
+                    target_cube,
+                    normalized_session_axis_order,
+                    session_path=session_path,
+                    session_cube_override=target_cube,
+                )
+                return
+            if not self._confirm_restart_with_warning(
+                title="Load session",
+                message=(
+                    "This session belongs to a different cube or axis order. "
+                    "The app must restart to open the matching dataset before loading it."
+                ),
+            ):
+                return
+            self._restart_app_with_cube(
+                target_cube,
+                normalized_session_axis_order,
+                session_path=session_path,
             )
             return
 
@@ -3527,14 +4103,11 @@ class TDMosaicApp:
                 **dict(self._make_default_panel_analysis_state()["td_params"]),
                 **dict(loaded_state.get("td_params") or {}),
             }
-            state["crest_params"] = {
-                **dict(DEFAULT_CREST_TRACKING),
-                **dict(loaded_state.get("crest_params") or {}),
-            }
-            state["wavelet_params"] = {
-                **dict(DEFAULT_WAVELET_FILTER),
-                **dict(loaded_state.get("wavelet_params") or {}),
-            }
+            crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
+                loaded_state.get("crest_params"), loaded_state.get("wavelet_params")
+            )
+            state["crest_params"] = crest_params
+            state["wavelet_params"] = wavelet_params
             state["wavelet_advanced_filters"] = {
                 **dict(self._make_default_panel_analysis_state()["wavelet_advanced_filters"]),
                 **dict(loaded_state.get("wavelet_advanced_filters") or {}),
@@ -3554,14 +4127,11 @@ class TDMosaicApp:
             loaded_state = loaded_panel_state.get(str(panel.panel_id)) or loaded_panel_state.get(panel.panel_id)
             if isinstance(loaded_state, dict):
                 state.update(self._clone_wavelet_payload(loaded_state))
-                state["crest_params"] = {
-                    **dict(DEFAULT_CREST_TRACKING),
-                    **dict(loaded_state.get("crest_params") or {}),
-                }
-                state["wavelet_params"] = {
-                    **dict(DEFAULT_WAVELET_FILTER),
-                    **dict(loaded_state.get("wavelet_params") or {}),
-                }
+                crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
+                    loaded_state.get("crest_params"), loaded_state.get("wavelet_params")
+                )
+                state["crest_params"] = crest_params
+                state["wavelet_params"] = wavelet_params
                 state["wavelet_advanced_filters"] = {
                     **dict(self._make_default_panel_analysis_state()["wavelet_advanced_filters"]),
                     **dict(loaded_state.get("wavelet_advanced_filters") or {}),
@@ -3631,6 +4201,9 @@ class TDMosaicApp:
         )
         export_settings = payload.get("export_settings") or {}
         self.export_dir_var.set(str(export_settings.get("dir") or self.cube_path.parent))
+        self.export_write_fits_var.set(bool(export_settings.get("write_fits", True)))
+        self.export_write_png_var.set(bool(export_settings.get("write_png", True)))
+        self.export_split_dirs_var.set(bool(export_settings.get("split_dirs", True)))
 
         self._apply_layout()
         self._sync_controls_from_active_panel()
@@ -4233,10 +4806,9 @@ class TDMosaicApp:
                 continue
             cut = self.cuts[panel.cut_id]
             state = self._panel_analysis_snapshot(panel.panel_id)
-            crest_params = dict(DEFAULT_CREST_TRACKING)
-            crest_params.update(state.get("crest_params") or {})
-            wavelet_params = dict(DEFAULT_WAVELET_FILTER)
-            wavelet_params.update(state.get("wavelet_params") or {})
+            crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
+                state.get("crest_params"), state.get("wavelet_params")
+            )
             panel_specs.append(
                 {
                     "panel_id": panel.panel_id,
@@ -4587,10 +5159,9 @@ class TDMosaicApp:
             if cut is None:
                 continue
             state = self._cut_analysis_snapshot(cut_id)
-            crest_params = dict(DEFAULT_CREST_TRACKING)
-            crest_params.update(state.get("crest_params") or {})
-            wavelet_params = dict(DEFAULT_WAVELET_FILTER)
-            wavelet_params.update(state.get("wavelet_params") or {})
+            crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
+                state.get("crest_params"), state.get("wavelet_params")
+            )
             panels = self._panels_for_cut(cut_id)
             primary_panel = panels[0] if panels else None
             memberships = self._stack_memberships_for_cut(cut_id)
@@ -5121,45 +5692,368 @@ class TDMosaicApp:
             f"Propagation tables exported to {observations_path} and {groups_path}"
         )
 
+    def _metrics_field_specs(self) -> list[tuple[str, str]]:
+        return [
+            ("peak_period_s", "Period [s]"),
+            ("fit_amp_arcsec", "Amplitude [arcsec]"),
+            ("fit_amp_km", "Amplitude [km]"),
+            ("velocity_amp_km_s", "Velocity amplitude [km s^-1]"),
+            ("accel_amp_km_s2", "Acceleration amplitude [km s^-2]"),
+            ("specific_energy_j_kg", "Specific energy [J kg^-1]"),
+            ("energy_flux_w_m2", "Energy flux [W m^-2]"),
+            ("power_ratio", "Power ratio"),
+            ("confidence_score", "Confidence score"),
+            ("duration_s", "Duration [s]"),
+            ("link_count", "Link count"),
+        ]
+
+    def _metrics_group_specs(self) -> list[tuple[str, str]]:
+        return [
+            ("cut_name", "Cut"),
+            ("status", "Status"),
+            ("resolved_propagation_class", "Propagation class"),
+            ("panel_name", "Panel"),
+            ("group_key", "Link group"),
+        ]
+
+    def _metrics_field_label(self, key: str) -> str:
+        mapping = dict(self._metrics_field_specs())
+        return mapping.get(str(key), str(key))
+
+    def _metrics_key_from_label(
+        self,
+        label: str,
+        specs: list[tuple[str, str]],
+        default_key: str,
+    ) -> str:
+        mapping = {display: key for key, display in specs}
+        return mapping.get(str(label), str(default_key))
+
+    def _metrics_label_from_key(
+        self,
+        key: str,
+        specs: list[tuple[str, str]],
+        default_label: str,
+    ) -> str:
+        mapping = {item_key: display for item_key, display in specs}
+        return mapping.get(str(key), str(default_label))
+
+    def _metrics_scope_specs(self) -> list[tuple[str, str]]:
+        scopes = [
+            ("counted_all", "All counted waves"),
+            ("all_events", "All events"),
+        ]
+        stack = self._selected_stack()
+        if stack is not None:
+            stack_name = str(stack.get("name") or f"Stack {int(stack['stack_id'])}")
+            scopes.extend(
+                [
+                    ("active_stack_counted", f"Active stack counted: {stack_name}"),
+                    ("active_stack_all", f"Active stack all: {stack_name}"),
+                ]
+            )
+        cut = self._selected_cut()
+        if cut is not None:
+            scopes.extend(
+                [
+                    ("selected_cut_counted", f"Selected cut counted: {cut.name}"),
+                    ("selected_cut_all", f"Selected cut all: {cut.name}"),
+                ]
+            )
+        return scopes
+
+    def _metrics_scope_rows(self, scope_key: str) -> list[dict[str, Any]]:
+        rows = list(self._collect_curated_event_rows())
+        scope_key = str(scope_key or "counted_all")
+        if scope_key.endswith("_counted"):
+            rows = [row for row in rows if bool(row.get("counted"))]
+        if scope_key.startswith("active_stack"):
+            stack = self._selected_stack()
+            if stack is None:
+                return []
+            stack_id = int(stack["stack_id"])
+            rows = [
+                row
+                for row in rows
+                if stack_id in {int(item) for item in (row.get("stack_ids") or [])}
+            ]
+        elif scope_key.startswith("selected_cut"):
+            cut = self._selected_cut()
+            if cut is None:
+                return []
+            rows = [row for row in rows if int(row.get("cut_id", -1)) == int(cut.cut_id)]
+        return rows
+
+    def _metrics_numeric_values(
+        self, rows: list[dict[str, Any]], field_key: str
+    ) -> tuple[np.ndarray, list[dict[str, Any]]]:
+        values: list[float] = []
+        kept_rows: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                value = float(row.get(field_key, float("nan")))
+            except Exception:
+                continue
+            if not np.isfinite(value):
+                continue
+            values.append(value)
+            kept_rows.append(row)
+        return np.asarray(values, dtype=np.float64), kept_rows
+
+    def _style_metrics_axis(self, axis: Any) -> None:
+        axis.set_facecolor("white")
+        axis.grid(True, color="0.86", linewidth=0.7)
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
+        axis.spines["left"].set_linewidth(0.9)
+        axis.spines["bottom"].set_linewidth(0.9)
+
+    def _export_metrics_table(self) -> None:
+        existing = self.metrics_window
+        if existing is None:
+            return
+        rows = list(existing.get("current_rows") or [])
+        if not rows:
+            self._set_status("No rows available in the current statistics scope.")
+            return
+        scope_key = self._metrics_key_from_label(
+            existing["scope_var"].get(),
+            self._metrics_scope_specs(),
+            "counted_all",
+        )
+        default_name = f"{self.cube_path.stem}_{scope_key}_master_table.csv"
+        save_path = self.filedialog.asksaveasfilename(
+            title="Export master table",
+            initialdir=str(Path(__file__).resolve().parent.parent),
+            initialfile=default_name,
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not save_path:
+            return
+        save_path_obj = Path(save_path).expanduser().resolve()
+        save_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        if save_path_obj.suffix.lower() == ".json":
+            payload = {
+                "cube_path": str(self.cube_path),
+                "scope": scope_key,
+                "rows": self._json_safe(rows),
+            }
+            with open(save_path_obj, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        else:
+            fieldnames = list(rows[0].keys())
+            with open(save_path_obj, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    out_row = dict(row)
+                    for key, value in list(out_row.items()):
+                        if isinstance(value, (list, dict)):
+                            out_row[key] = json.dumps(self._json_safe(value), ensure_ascii=False)
+                    writer.writerow(out_row)
+        self._set_status(f"Exported master table to {save_path_obj}")
+
+    def _export_metrics_figure(self) -> None:
+        existing = self.metrics_window
+        if existing is None:
+            return
+        fig = existing.get("figure")
+        if fig is None:
+            return
+        scope_key = self._metrics_key_from_label(
+            existing["scope_var"].get(),
+            self._metrics_scope_specs(),
+            "counted_all",
+        )
+        plot_mode = str(existing["plot_mode_var"].get() or "histogram").lower()
+        default_name = f"{self.cube_path.stem}_{scope_key}_{plot_mode}.png"
+        save_path = self.filedialog.asksaveasfilename(
+            title="Export statistics figure",
+            initialdir=str(Path(__file__).resolve().parent.parent),
+            initialfile=default_name,
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg"), ("All files", "*.*")],
+        )
+        if not save_path:
+            return
+        save_path_obj = Path(save_path).expanduser().resolve()
+        save_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path_obj, bbox_inches="tight")
+        self._set_status(f"Exported statistics figure to {save_path_obj}")
+
     def _open_metrics_window(self) -> None:
         existing = self.metrics_window
         if existing is not None:
             top = existing.get("top")
             if top is not None and top.winfo_exists():
+                self._refresh_metrics_window()
                 top.deiconify()
                 top.lift()
-                self._refresh_metrics_window()
                 return
             self.metrics_window = None
 
         top = self.tk.Toplevel(self.root)
-        top.title("Wavelet Metrics")
-        top.geometry("1160x840")
-        top.rowconfigure(1, weight=1)
+        top.title("Wave Statistics")
+        top.geometry("1280x900")
+        top.rowconfigure(2, weight=1)
         top.columnconfigure(0, weight=1)
+
         header = self.ttk.Frame(top, padding=8)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
         summary_var = self.tk.StringVar(value="")
+        detail_var = self.tk.StringVar(value="")
         self.ttk.Label(
-            header, textvariable=summary_var, justify="left", wraplength=1100
+            header, textvariable=summary_var, justify="left", wraplength=1220
         ).grid(row=0, column=0, sticky="w")
+        self.ttk.Label(
+            header, textvariable=detail_var, justify="left", wraplength=1220
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        controls = self.ttk.LabelFrame(top, text="Plot Controls", padding=8)
+        controls.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        for idx in range(12):
+            controls.columnconfigure(idx, weight=1)
+
+        scope_specs = self._metrics_scope_specs()
+        field_specs = self._metrics_field_specs()
+        group_specs = self._metrics_group_specs()
+        scope_var = self.tk.StringVar(
+            value=scope_specs[0][1] if scope_specs else "All counted waves"
+        )
+        plot_mode_var = self.tk.StringVar(value="histogram")
+        x_var = self.tk.StringVar(
+            value=self._metrics_label_from_key("fit_amp_km", field_specs, "Amplitude [km]")
+        )
+        y_var = self.tk.StringVar(
+            value=self._metrics_label_from_key("peak_period_s", field_specs, "Period [s]")
+        )
+        color_var = self.tk.StringVar(
+            value=self._metrics_label_from_key(
+                "confidence_score", field_specs, "Confidence score"
+            )
+        )
+        group_var = self.tk.StringVar(
+            value=self._metrics_label_from_key("cut_name", group_specs, "Cut")
+        )
+        bins_var = self.tk.StringVar(value="18")
+        log_x_var = self.tk.BooleanVar(value=False)
+        log_y_var = self.tk.BooleanVar(value=False)
+
+        self.ttk.Label(controls, text="Scope").grid(row=0, column=0, sticky="w")
+        scope_box = self.ttk.Combobox(
+            controls,
+            textvariable=scope_var,
+            values=[label for _key, label in scope_specs],
+            state="readonly",
+            width=24,
+        )
+        scope_box.grid(row=0, column=1, sticky="ew", padx=(6, 8))
+        self.ttk.Label(controls, text="Mode").grid(row=0, column=2, sticky="w")
+        mode_box = self.ttk.Combobox(
+            controls,
+            textvariable=plot_mode_var,
+            values=["histogram", "scatter", "bar"],
+            state="readonly",
+            width=12,
+        )
+        mode_box.grid(row=0, column=3, sticky="ew", padx=(6, 8))
+        self.ttk.Label(controls, text="X").grid(row=0, column=4, sticky="w")
+        x_box = self.ttk.Combobox(
+            controls,
+            textvariable=x_var,
+            values=[label for _key, label in field_specs],
+            state="readonly",
+            width=18,
+        )
+        x_box.grid(row=0, column=5, sticky="ew", padx=(6, 8))
+        self.ttk.Label(controls, text="Y").grid(row=0, column=6, sticky="w")
+        y_box = self.ttk.Combobox(
+            controls,
+            textvariable=y_var,
+            values=[label for _key, label in field_specs],
+            state="readonly",
+            width=18,
+        )
+        y_box.grid(row=0, column=7, sticky="ew", padx=(6, 8))
+        self.ttk.Label(controls, text="Bins").grid(row=0, column=8, sticky="w")
+        bins_entry = self.ttk.Entry(controls, textvariable=bins_var, width=8)
+        bins_entry.grid(row=0, column=9, sticky="ew", padx=(6, 0))
+
+        self.ttk.Label(controls, text="Color").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        color_box = self.ttk.Combobox(
+            controls,
+            textvariable=color_var,
+            values=["none"] + [label for _key, label in field_specs],
+            state="readonly",
+            width=18,
+        )
+        color_box.grid(row=1, column=1, sticky="ew", padx=(6, 8), pady=(8, 0))
+        self.ttk.Label(controls, text="Group").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        group_box = self.ttk.Combobox(
+            controls,
+            textvariable=group_var,
+            values=[label for _key, label in group_specs],
+            state="readonly",
+            width=18,
+        )
+        group_box.grid(row=1, column=3, sticky="ew", padx=(6, 8), pady=(8, 0))
+        self.ttk.Checkbutton(
+            controls,
+            text="log X",
+            variable=log_x_var,
+            command=self._refresh_metrics_window,
+        ).grid(row=1, column=4, sticky="w", pady=(8, 0))
+        self.ttk.Checkbutton(
+            controls,
+            text="log Y",
+            variable=log_y_var,
+            command=self._refresh_metrics_window,
+        ).grid(row=1, column=5, sticky="w", pady=(8, 0))
+        self.ttk.Button(
+            controls,
+            text="Export Figure",
+            command=self._export_metrics_figure,
+        ).grid(row=1, column=10, sticky="ew", padx=(6, 4), pady=(8, 0))
+        self.ttk.Button(
+            controls,
+            text="Export Master Table",
+            command=self._export_metrics_table,
+        ).grid(row=1, column=11, sticky="ew", padx=(4, 0), pady=(8, 0))
 
         body = self.ttk.Frame(top, padding=(8, 0, 8, 8))
-        body.grid(row=1, column=0, sticky="nsew")
+        body.grid(row=2, column=0, sticky="nsew")
         body.rowconfigure(0, weight=1)
         body.columnconfigure(0, weight=1)
-        fig = self.Figure(figsize=(9.2, 6.6), dpi=120)
-        axes = tuple(np.ravel(fig.subplots(2, 2)))
+        fig = self.Figure(figsize=(10.0, 7.2), dpi=130)
+        axis = fig.add_subplot(111)
         canvas = self.FigureCanvasTkAgg(fig, master=body)
         canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
         self.metrics_window = {
             "top": top,
             "summary_var": summary_var,
+            "detail_var": detail_var,
             "figure": fig,
-            "axes": axes,
+            "axis": axis,
             "canvas": canvas,
+            "scope_var": scope_var,
+            "plot_mode_var": plot_mode_var,
+            "x_var": x_var,
+            "y_var": y_var,
+            "color_var": color_var,
+            "group_var": group_var,
+            "bins_var": bins_var,
+            "log_x_var": log_x_var,
+            "log_y_var": log_y_var,
+            "scope_box": scope_box,
+            "current_rows": [],
         }
+        for widget in (scope_box, mode_box, x_box, y_box, color_box, group_box):
+            widget.bind("<<ComboboxSelected>>", lambda _event: self._refresh_metrics_window())
+        bins_entry.bind("<Return>", lambda _event: self._refresh_metrics_window())
+        bins_entry.bind("<FocusOut>", lambda _event: self._refresh_metrics_window())
         top.protocol("WM_DELETE_WINDOW", self._close_metrics_window)
         self._refresh_metrics_window()
 
@@ -5180,59 +6074,273 @@ class TDMosaicApp:
         if top is None or not top.winfo_exists():
             self.metrics_window = None
             return
-        rows = [row for row in self._collect_curated_event_rows() if row["counted"]]
-        summary_var = existing["summary_var"]
-        axes = existing["axes"]
+
+        scope_specs = self._metrics_scope_specs()
+        scope_values = [label for _key, label in scope_specs]
+        scope_var = existing["scope_var"]
+        if scope_var.get() not in scope_values:
+            scope_var.set(scope_values[0] if scope_values else "All counted waves")
+        existing["scope_box"].configure(values=scope_values)
+
+        scope_key = self._metrics_key_from_label(
+            scope_var.get(),
+            scope_specs,
+            "counted_all",
+        )
+        rows = self._metrics_scope_rows(scope_key)
+        existing["current_rows"] = list(rows)
         fig = existing["figure"]
         canvas = existing["canvas"]
-        for axis in axes:
-            axis.clear()
+        fig.clear()
+        axis = fig.add_subplot(111)
+        existing["axis"] = axis
+        self._style_metrics_axis(axis)
 
-        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for row in rows:
-            key = (str(row["panel_name"]), str(row["cut_name"]))
-            grouped.setdefault(key, []).append(row)
+        plot_mode = str(existing["plot_mode_var"].get() or "histogram").lower()
+        field_specs = self._metrics_field_specs()
+        x_key = self._metrics_key_from_label(
+            existing["x_var"].get(),
+            field_specs,
+            "fit_amp_km",
+        )
+        y_key = self._metrics_key_from_label(
+            existing["y_var"].get(),
+            field_specs,
+            "peak_period_s",
+        )
+        group_specs = self._metrics_group_specs()
+        group_key = self._metrics_key_from_label(
+            existing["group_var"].get(),
+            group_specs,
+            "cut_name",
+        )
+        color_label = str(existing["color_var"].get() or "")
+        color_key = self._metrics_key_from_label(
+            color_label,
+            field_specs,
+            "confidence_score",
+        )
+        if color_label == "none":
+            color_key = ""
+        bins = max(self._safe_int_text(existing["bins_var"].get(), 18), 4)
+        log_x = bool(existing["log_x_var"].get())
+        log_y = bool(existing["log_y_var"].get())
 
-        lines = [f"Counted events: {len(rows)} | panel/cut groups: {len(grouped)}"]
-        for (panel_name, cut_name), items in sorted(grouped.items()):
-            periods = [float(item["peak_period_s"]) for item in items if np.isfinite(float(item["peak_period_s"]))]
-            amps = [float(item["fit_amp_arcsec"]) for item in items if np.isfinite(float(item["fit_amp_arcsec"]))]
-            vels = [float(item["velocity_amp_km_s"]) for item in items if np.isfinite(float(item["velocity_amp_km_s"]))]
-            energies = [float(item["specific_energy_j_kg"]) for item in items if np.isfinite(float(item["specific_energy_j_kg"]))]
-            lines.append(
-                f"{panel_name}/{cut_name}: n={len(items)} | "
-                f"Pmed={np.nanmedian(periods) if periods else float('nan'):.2f}s | "
-                f"Amed={np.nanmedian(amps) if amps else float('nan'):.3f}'' | "
-                f"vmed={np.nanmedian(vels) if vels else float('nan'):.2f} km/s | "
-                f"Emed={np.nanmedian(energies) if energies else float('nan'):.3e} J/kg"
-            )
-        summary_var.set("\n".join(lines))
+        x_values, x_rows = self._metrics_numeric_values(rows, x_key)
+        summary_scope = scope_var.get()
+        existing["summary_var"].set(
+            f"Scope: {summary_scope} | rows: {len(rows)} | finite X values: {x_values.size}"
+        )
 
-        metric_specs = [
-            ("peak_period_s", "Period [s]"),
-            ("fit_amp_arcsec", "Amplitude ['']"),
-            ("velocity_amp_km_s", "Velocity [km/s]"),
-            ("specific_energy_j_kg", "Energy/m [J/kg]"),
-        ]
-        for axis, (key, title) in zip(axes, metric_specs):
-            values = [
-                float(row[key]) for row in rows if np.isfinite(float(row[key]))
+        if plot_mode == "scatter":
+            y_values, y_rows = self._metrics_numeric_values(rows, y_key)
+            row_pairs = [
+                row
+                for row in rows
+                if row in x_rows and row in y_rows
             ]
-            if values:
-                axis.hist(values, bins=min(max(len(values), 5), 18), color="tab:blue", alpha=0.8)
+            x_plot, row_pairs = self._metrics_numeric_values(row_pairs, x_key)
+            y_plot, row_pairs = self._metrics_numeric_values(row_pairs, y_key)
+            if x_plot.size and y_plot.size and x_plot.size == y_plot.size:
+                color_values = None
+                cmap = None
+                if color_key:
+                    color_values, color_rows = self._metrics_numeric_values(row_pairs, color_key)
+                    if color_values.size != x_plot.size or color_rows != row_pairs:
+                        color_values = None
+                    else:
+                        cmap = "viridis"
+                scatter = axis.scatter(
+                    x_plot,
+                    y_plot,
+                    c=color_values if color_values is not None else "#2E5FA7",
+                    cmap=cmap,
+                    s=44,
+                    alpha=0.86,
+                    edgecolors="white",
+                    linewidths=0.5,
+                )
+                if color_values is not None:
+                    cbar = fig.colorbar(scatter, ax=axis, pad=0.02)
+                    cbar.set_label(self._metrics_field_label(color_key))
+                axis.set_xlabel(self._metrics_field_label(x_key))
+                axis.set_ylabel(self._metrics_field_label(y_key))
+                axis.set_title(
+                    f"{self._metrics_field_label(y_key)} vs {self._metrics_field_label(x_key)}",
+                    fontsize=12,
+                    fontweight="bold",
+                    family="serif",
+                )
+                existing["detail_var"].set(
+                    f"Scatter plot | n={x_plot.size} | "
+                    f"median X={float(np.nanmedian(x_plot)):.3g} | "
+                    f"median Y={float(np.nanmedian(y_plot)):.3g}"
+                )
             else:
                 axis.text(
                     0.5,
                     0.5,
-                    "No counted events.",
+                    "No finite rows for the selected scatter variables.",
                     ha="center",
                     va="center",
                     transform=axis.transAxes,
                 )
-            axis.set_title(title, fontsize=10)
-            axis.set_ylabel("count")
+                existing["detail_var"].set("Scatter plot unavailable for the selected variables.")
+        elif plot_mode == "bar":
+            y_values, y_rows = self._metrics_numeric_values(rows, y_key)
+            grouped_values: dict[str, list[float]] = {}
+            for row in y_rows:
+                group_label = str(row.get(group_key, "-") or "-").strip() or "-"
+                grouped_values.setdefault(group_label, []).append(float(row[y_key]))
+            grouped_items = [
+                (label, np.asarray(values, dtype=np.float64))
+                for label, values in grouped_values.items()
+                if values
+            ]
+            grouped_items.sort(
+                key=lambda item: (-int(item[1].size), str(item[0]).lower())
+            )
+            grouped_items = grouped_items[:20]
+            if grouped_items:
+                labels: list[str] = []
+                centers: list[float] = []
+                lower_err: list[float] = []
+                upper_err: list[float] = []
+                for label, values in grouped_items:
+                    median = float(np.nanmedian(values))
+                    p16 = float(np.nanpercentile(values, 16))
+                    p84 = float(np.nanpercentile(values, 84))
+                    labels.append(label)
+                    centers.append(median)
+                    lower_err.append(max(median - p16, 0.0))
+                    upper_err.append(max(p84 - median, 0.0))
+                x_pos = np.arange(len(labels), dtype=np.float64)
+                axis.bar(
+                    x_pos,
+                    centers,
+                    color="#2E5FA7",
+                    alpha=0.88,
+                    edgecolor="white",
+                    linewidth=0.8,
+                )
+                axis.errorbar(
+                    x_pos,
+                    centers,
+                    yerr=np.vstack(
+                        [
+                            np.asarray(lower_err, dtype=np.float64),
+                            np.asarray(upper_err, dtype=np.float64),
+                        ]
+                    ),
+                    fmt="none",
+                    ecolor="#1F1F1F",
+                    elinewidth=1.0,
+                    capsize=4,
+                    capthick=1.0,
+                )
+                axis.set_xticks(x_pos)
+                axis.set_xticklabels(labels, rotation=28, ha="right")
+                axis.set_xlabel(
+                    self._metrics_label_from_key(group_key, group_specs, group_key)
+                )
+                axis.set_ylabel(self._metrics_field_label(y_key))
+                axis.set_title(
+                    f"{self._metrics_field_label(y_key)} by "
+                    f"{self._metrics_label_from_key(group_key, group_specs, group_key)}",
+                    fontsize=12,
+                    fontweight="bold",
+                    family="serif",
+                )
+                existing["detail_var"].set(
+                    f"Bar plot | groups={len(grouped_items)} | finite Y values={y_values.size} | "
+                    "error bars = p16-p84"
+                )
+            else:
+                axis.text(
+                    0.5,
+                    0.5,
+                    "No finite rows for the selected bar metric.",
+                    ha="center",
+                    va="center",
+                    transform=axis.transAxes,
+                )
+                existing["detail_var"].set("Bar plot unavailable for the selected metric/group.")
+        else:
+            if x_values.size:
+                axis.hist(
+                    x_values,
+                    bins=min(max(int(bins), 4), max(12, min(48, x_values.size))),
+                    color="#2E5FA7",
+                    alpha=0.88,
+                    edgecolor="white",
+                    linewidth=0.8,
+                )
+                median = float(np.nanmedian(x_values))
+                axis.axvline(median, color="#B04A3A", linewidth=1.4, linestyle="--")
+                axis.set_xlabel(self._metrics_field_label(x_key))
+                axis.set_ylabel("Count")
+                axis.set_title(
+                    f"Distribution of {self._metrics_field_label(x_key)}",
+                    fontsize=12,
+                    fontweight="bold",
+                    family="serif",
+                )
+                existing["detail_var"].set(
+                    f"Histogram | n={x_values.size} | median={median:.3g} | "
+                    f"p16={float(np.nanpercentile(x_values, 16)):.3g} | "
+                    f"p84={float(np.nanpercentile(x_values, 84)):.3g}"
+                )
+            else:
+                axis.text(
+                    0.5,
+                    0.5,
+                    "No finite rows for the selected histogram variable.",
+                    ha="center",
+                    va="center",
+                    transform=axis.transAxes,
+                )
+                existing["detail_var"].set("Histogram unavailable for the selected variable.")
+
+        if log_x and plot_mode != "bar":
+            try:
+                axis.set_xscale("log")
+            except Exception:
+                pass
+        if log_y:
+            try:
+                axis.set_yscale("log")
+            except Exception:
+                pass
+
         fig.tight_layout()
         canvas.draw_idle()
+
+    def _focus_metrics_window_scope(
+        self,
+        scope_key: str,
+        *,
+        plot_mode: str = "scatter",
+        group_key: str | None = None,
+    ) -> None:
+        self._open_metrics_window()
+        existing = self.metrics_window
+        if existing is None:
+            return
+        scope_specs = self._metrics_scope_specs()
+        group_specs = self._metrics_group_specs()
+        scope_label = self._metrics_label_from_key(
+            scope_key,
+            scope_specs,
+            existing["scope_var"].get(),
+        )
+        existing["scope_var"].set(scope_label)
+        if str(plot_mode) in {"histogram", "scatter", "bar"}:
+            existing["plot_mode_var"].set(str(plot_mode))
+        if group_key is not None:
+            existing["group_var"].set(
+                self._metrics_label_from_key(group_key, group_specs, existing["group_var"].get())
+            )
+        self._refresh_metrics_window()
 
     def _open_propagation_window(self) -> None:
         existing = self.propagation_window
@@ -6622,6 +7730,47 @@ class TDMosaicApp:
             title_name=f"Detached {cut.name}",
         )
 
+    def _open_stack_browser_metrics(self, browser_id: int, plot_mode: str) -> None:
+        browser = self.stack_browsers.get(browser_id)
+        if browser is None:
+            return
+        cut_ids = self._stack_browser_cut_ids(browser_id)
+        if not cut_ids:
+            self._set_status("No valid cuts available in this browser.")
+            return
+        current_index = clamp_int(
+            int(browser.get("current_index", 0)),
+            0,
+            len(cut_ids) - 1,
+        )
+        current_cut_id = int(cut_ids[current_index])
+        self.selected_cut_id = current_cut_id
+        stack_id = browser.get("stack_id")
+        if stack_id is not None and int(stack_id) in self.stacks:
+            self.active_stack_id = int(stack_id)
+            scope_key = "active_stack_counted"
+            group_key = "cut_name" if plot_mode == "bar" else None
+        else:
+            scope_key = "selected_cut_counted"
+            group_key = "status" if plot_mode == "bar" else None
+        self._focus_metrics_window_scope(
+            scope_key,
+            plot_mode=plot_mode,
+            group_key=group_key,
+        )
+
+    def _open_td_window_metrics(self, panel_id: int, plot_mode: str) -> None:
+        panel = self._td_window_panel(panel_id)
+        if panel is None or panel.cut_id is None or panel.cut_id not in self.cuts:
+            self._set_status(f"No valid cut assigned to panel {panel_id}.")
+            return
+        self.selected_cut_id = int(panel.cut_id)
+        self._focus_metrics_window_scope(
+            "selected_cut_counted",
+            plot_mode=plot_mode,
+            group_key="status" if plot_mode == "bar" else None,
+        )
+
     def _open_stack_browser(
         self,
         stack_id: int | None,
@@ -6797,7 +7946,7 @@ class TDMosaicApp:
 
         controls = self.ttk.Frame(tables_frame)
         controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        for idx in range(7):
+        for idx in range(9):
             controls.columnconfigure(idx, weight=1)
         self.ttk.Button(
             controls,
@@ -6833,7 +7982,21 @@ class TDMosaicApp:
             controls,
             text="Refresh",
             command=lambda bid=browser_id: self._refresh_stack_browser(bid),
-        ).grid(row=0, column=6, sticky="ew", padx=(4, 0))
+        ).grid(row=0, column=6, sticky="ew", padx=4)
+        self.ttk.Button(
+            controls,
+            text="Scatter stats",
+            command=lambda bid=browser_id: self._open_stack_browser_metrics(
+                bid, "scatter"
+            ),
+        ).grid(row=0, column=7, sticky="ew", padx=4)
+        self.ttk.Button(
+            controls,
+            text="Bar stats",
+            command=lambda bid=browser_id: self._open_stack_browser_metrics(
+                bid, "bar"
+            ),
+        ).grid(row=0, column=8, sticky="ew", padx=(4, 0))
 
         self.stack_browsers[browser_id] = {
             "browser_id": browser_id,
@@ -8034,12 +9197,34 @@ class TDMosaicApp:
             text="Browse",
             command=self._browse_export_dir,
         ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        export_mode_row = self.ttk.Frame(export_dir_box)
+        export_mode_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        for idx in range(3):
+            export_mode_row.columnconfigure(idx, weight=1)
+        self.ttk.Checkbutton(
+            export_mode_row,
+            text="Write FITS",
+            variable=self.export_write_fits_var,
+            command=self._on_export_settings_change,
+        ).grid(row=0, column=0, sticky="w")
+        self.ttk.Checkbutton(
+            export_mode_row,
+            text="Write PNG",
+            variable=self.export_write_png_var,
+            command=self._on_export_settings_change,
+        ).grid(row=0, column=1, sticky="w")
+        self.ttk.Checkbutton(
+            export_mode_row,
+            text="Separate folders",
+            variable=self.export_split_dirs_var,
+            command=self._on_export_settings_change,
+        ).grid(row=0, column=2, sticky="w")
         self.ttk.Label(
             export_dir_box,
             textvariable=self.export_info_var,
             justify="left",
             wraplength=320,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         export_map_box = self.ttk.LabelFrame(
             self.sidebar_export_tab, text="Maps", padding=8
@@ -8048,12 +9233,12 @@ class TDMosaicApp:
         export_map_box.columnconfigure(0, weight=1)
         self.ttk.Button(
             export_map_box,
-            text="Save current map as FITS+PNG",
+            text="Save current map",
             command=self._export_current_map_fits,
         ).grid(row=0, column=0, sticky="ew")
         self.ttk.Label(
             export_map_box,
-            text="Saves the cube frame at the current visual time as FITS and also a PNG overview with the cuts at that t.",
+            text="Exports the current map using the active FITS/PNG switches and folder layout above.",
             justify="left",
             wraplength=320,
         ).grid(row=1, column=0, sticky="w", pady=(6, 0))
@@ -8066,22 +9251,22 @@ class TDMosaicApp:
         export_cut_box.columnconfigure(1, weight=1)
         self.ttk.Button(
             export_cut_box,
-            text="Selected cut -> FITS+PNG",
+            text="Selected cut",
             command=self._export_selected_cut_fits,
         ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.ttk.Button(
             export_cut_box,
-            text="Stack -> FITS+PNG",
+            text="Stack",
             command=self._export_stack_cut_fits,
         ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self.ttk.Button(
             export_cut_box,
-            text="All cuts -> FITS+PNG",
+            text="All cuts",
             command=self._export_all_cut_fits,
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.ttk.Label(
             export_cut_box,
-            text="Each export writes a FITS with the TD data and a PNG quicklook with map/cut context and TD wavelet overlays.",
+            text="Each export can write the TD FITS, the PNG quicklook, or both. FITS and PNG can go to separate folders.",
             justify="left",
             wraplength=320,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -8094,22 +9279,22 @@ class TDMosaicApp:
         export_trace_box.columnconfigure(1, weight=1)
         self.ttk.Button(
             export_trace_box,
-            text="Selected cut traces -> FITS+PNG",
+            text="Selected cut traces",
             command=self._export_selected_cut_trace_fits,
         ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.ttk.Button(
             export_trace_box,
-            text="Stack traces -> FITS+PNG",
+            text="Stack traces",
             command=self._export_stack_trace_fits,
         ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self.ttk.Button(
             export_trace_box,
-            text="All traces -> FITS+PNG",
+            text="All traces",
             command=self._export_all_trace_fits,
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.ttk.Label(
             export_trace_box,
-            text="Writes one FITS per event/trace and a PNG quicklook with the event trace on the map plus the TD wavelet overlay.",
+            text="Writes one product per event/trace. Use the switches above to choose FITS only, PNG only, or both.",
             justify="left",
             wraplength=320,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -10590,7 +11775,7 @@ class TDMosaicApp:
             return
 
         current_key = self._td_window_tracking_key(panel_id)
-        if existing.get("crest_tracking_td_key") != current_key:
+        if self._normalized_tracking_key(existing.get("crest_tracking_td_key")) != self._normalized_tracking_key(current_key):
             self._clear_td_window_crest_tracking(panel_id, stale=True)
 
     def _refresh_td_window_crest_summary(self, panel_id: int) -> None:
@@ -10792,6 +11977,20 @@ class TDMosaicApp:
             phase_speed_km_s = (
                 float(phase_speed_text) if phase_speed_text else float("nan")
             )
+            min_prominence = float(
+                str(existing["wavelet_min_prominence_var"].get()).strip()
+            )
+            min_snr = float(str(existing["wavelet_min_snr_var"].get()).strip())
+            continuity_weight = float(
+                str(existing["wavelet_continuity_weight_var"].get()).strip()
+            )
+            time_weight = float(str(existing["wavelet_time_weight_var"].get()).strip())
+            quality_weight = float(
+                str(existing["wavelet_quality_weight_var"].get()).strip()
+            )
+            error_weight = float(
+                str(existing["wavelet_error_weight_var"].get()).strip()
+            )
         except Exception:
             self._set_status(f"Invalid wavelet-filter parameter for {panel.name}.")
             return None
@@ -10820,6 +12019,16 @@ class TDMosaicApp:
         if np.isfinite(phase_speed_km_s) and phase_speed_km_s <= 0.0:
             self._set_status(f"Wavelet phase speed must be positive for {panel.name}.")
             return None
+        if (
+            min_prominence < 0.0
+            or min_snr < 0.0
+            or continuity_weight < 0.0
+            or time_weight < 0.0
+            or quality_weight < 0.0
+            or error_weight < 0.0
+        ):
+            self._set_status(f"Wavelet tracking thresholds and weights must be non-negative for {panel.name}.")
+            return None
 
         params = {
             "cad": cad,
@@ -10836,6 +12045,12 @@ class TDMosaicApp:
             "km_per_arcsec": km_per_arcsec,
             "density_kg_m3": density_kg_m3,
             "phase_speed_km_s": phase_speed_km_s,
+            "min_prominence": min_prominence,
+            "min_snr": min_snr,
+            "continuity_weight": continuity_weight,
+            "time_weight": time_weight,
+            "quality_weight": quality_weight,
+            "error_weight": error_weight,
         }
         self._panel_analysis(panel_id)["wavelet_params"] = {
             key: value for key, value in params.items() if key not in {"cad", "res"}
@@ -10983,6 +12198,12 @@ class TDMosaicApp:
         event.setdefault("confidence_label", "")
         if event.get("history") is None:
             event["history"] = []
+        source_t_idx = np.asarray(event.get("source_t_idx", []), dtype=np.float64)
+        event.setdefault("base_source_fit_mask", np.ones(source_t_idx.shape, dtype=bool))
+        event.setdefault(
+            "source_fit_mask",
+            np.asarray(event.get("base_source_fit_mask"), dtype=bool).copy(),
+        )
 
     def _event_source_overlap_fraction(
         self, source_a: np.ndarray, source_b: np.ndarray
@@ -11271,6 +12492,13 @@ class TDMosaicApp:
             segment.get("source_y_idx", segment.get("wave_y_idx", [])),
             dtype=np.float64,
         ).copy()
+        base_source_fit_mask = np.asarray(
+            segment.get(
+                "source_fit_mask",
+                np.ones(base_source_t_idx.shape, dtype=bool),
+            ),
+            dtype=bool,
+        ).copy()
         event = {
             "event_id": int(event_id),
             "parent_event_id": parent_event_id,
@@ -11280,8 +12508,10 @@ class TDMosaicApp:
             "split_children_ids": [],
             "base_source_t_idx": base_source_t_idx,
             "base_source_y_idx": base_source_y_idx,
+            "base_source_fit_mask": base_source_fit_mask,
             "source_t_idx": base_source_t_idx.copy(),
             "source_y_idx": base_source_y_idx.copy(),
+            "source_fit_mask": base_source_fit_mask.copy(),
             "base_analysis": base_segment,
             "analysis": self._clone_wavelet_payload(base_segment),
             "base_params": dict(params),
@@ -11851,6 +13081,8 @@ class TDMosaicApp:
         self._ensure_wavelet_event_fields(event)
         analysis = event.get("analysis") or {}
         confidence_score = self._wavelet_event_confidence_score(event)
+        fit_point_count = int(analysis.get("fit_point_count", 0))
+        interp_point_count = int(analysis.get("interp_point_count", 0))
         return (
             str(int(event.get("event_id", -1))),
             self._td_window_wavelet_event_status(event),
@@ -11858,6 +13090,7 @@ class TDMosaicApp:
             str(int(analysis.get("thread_index", -1)) + 1),
             str(int(analysis.get("seg_id", -1))),
             str(int(analysis.get("wseg_id", -1))),
+            str(int(analysis.get("mode_rank", -1)) + 1),
             f"{float(analysis.get('peak_period_s', float('nan'))):.2f}",
             f"{float(analysis.get('freq_mhz', float('nan'))):.2f}",
             f"{float(analysis.get('fit_amp_arcsec', float('nan'))):.3f}",
@@ -11868,6 +13101,7 @@ class TDMosaicApp:
             f"{float(analysis.get('duration_s', float('nan'))):.2f}",
             f"{float(analysis.get('power_ratio', float('nan'))):.2f}",
             f"{confidence_score:.1f}",
+            f"{fit_point_count}/{interp_point_count}",
             "yes" if bool(event.get("review_locked")) else "no",
             str(self._wavelet_event_link_count(event)),
             ",".join(self._td_window_wavelet_event_qa_flags(event)),
@@ -11877,11 +13111,27 @@ class TDMosaicApp:
     def _td_window_wavelet_table_tag(self, event: dict[str, Any]) -> str:
         return self._td_window_wavelet_event_status(event).replace(" ", "_")
 
+    def _td_window_visible_wavelet_event_ids(self, panel_id: int) -> list[int]:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            return []
+        filter_name = str(existing["wavelet_events_filter_var"].get() or "all")
+        advanced_filters = self._td_window_wavelet_advanced_filter_values(panel_id)
+        visible_ids: list[int] = []
+        for event in self._td_window_wavelet_events(panel_id):
+            if not self._td_window_wavelet_event_filter_match(
+                event, filter_name, advanced_filters
+            ):
+                continue
+            visible_ids.append(int(event.get("event_id", -1)))
+        return visible_ids
+
     def _analyze_td_window_wavelet_event_source(
         self,
         panel_id: int,
         source_t_idx: np.ndarray,
         source_y_idx: np.ndarray,
+        source_fit_mask: np.ndarray | None,
         params: dict[str, Any],
     ) -> dict[str, Any] | None:
         panel = self._td_window_panel(panel_id)
@@ -11907,6 +13157,7 @@ class TDMosaicApp:
                 rms_amp_ratio_max=params["rms_amp_ratio_max"],
                 density_kg_m3=params["density_kg_m3"],
                 phase_speed_km_s=params["phase_speed_km_s"],
+                fit_mask=source_fit_mask,
             )
         except Exception as exc:
             self._set_status(
@@ -11924,6 +13175,15 @@ class TDMosaicApp:
             "y_arcsec": self._clone_wavelet_payload(analysis.get("y_arcsec", np.array([], dtype=np.float64))),
             "source_t_idx": np.asarray(source_t_idx, dtype=np.float64).copy(),
             "source_y_idx": np.asarray(source_y_idx, dtype=np.float64).copy(),
+            "source_fit_mask": np.asarray(
+                analysis.get(
+                    "source_fit_mask",
+                    source_fit_mask
+                    if source_fit_mask is not None
+                    else np.ones(np.asarray(source_t_idx).shape, dtype=bool),
+                ),
+                dtype=bool,
+            ).copy(),
             "params": dict(params),
         }
 
@@ -11938,6 +13198,10 @@ class TDMosaicApp:
                 selected[key] = current_analysis.get(key, -1)
         event["analysis"] = selected
         event["diagnostic"] = self._clone_wavelet_payload(diagnostic)
+        if "source_fit_mask" in diagnostic:
+            event["source_fit_mask"] = np.asarray(
+                diagnostic.get("source_fit_mask", []), dtype=bool
+            ).copy()
         event["current_params"] = dict(diagnostic["params"])
         event["customized"] = bool(customized)
         self._wavelet_event_confidence_details(event)
@@ -12045,6 +13309,7 @@ class TDMosaicApp:
                 panel_id,
                 np.asarray(selected_event.get("source_t_idx", []), dtype=np.float64),
                 np.asarray(selected_event.get("source_y_idx", []), dtype=np.float64),
+                np.asarray(selected_event.get("source_fit_mask", []), dtype=bool),
                 dict(selected_event.get("current_params") or selected_event.get("base_params") or {}),
             )
             if diagnostic is not None:
@@ -12074,6 +13339,15 @@ class TDMosaicApp:
         ]
         note_text = str(selected_event.get("review_notes") or "").strip()
         diag = diagnostic.get("diag") or {}
+        selected_mode_rank = int(analysis.get("mode_rank", 0))
+        mode_diag = next(
+            (
+                item
+                for item in (diag.get("modes") or [])
+                if int(item.get("mode_rank", -1)) == selected_mode_rank
+            ),
+            None,
+        )
         t_seg = np.asarray(diagnostic.get("t_seg_s", []), dtype=np.float64)
         y_arc = np.asarray(diagnostic.get("y_arcsec", []), dtype=np.float64)
         trend = np.asarray(diag.get("trend", []), dtype=np.float64)
@@ -12100,6 +13374,7 @@ class TDMosaicApp:
         existing["wavelet_diag_var"].set(
             f"Reason: {self._td_window_wavelet_event_reason(selected_event)} | "
             f"QA: {','.join(self._td_window_wavelet_event_qa_flags(selected_event)) or '-'} | "
+            f"Aspan={float(analysis.get('span_amp_arcsec', float('nan'))):.3f}'' | "
             f"E/m={float(analysis.get('specific_energy_j_kg', float('nan'))):.3e} J/kg | "
             f"a={float(analysis.get('accel_amp_km_s2', float('nan'))):.3f} km/s^2 | "
             f"rho={selected_event.get('current_params', {}).get('density_kg_m3', float('nan')):.3e} kg/m^3 | "
@@ -12163,16 +13438,51 @@ class TDMosaicApp:
 
         periods = np.asarray(diag.get("periods", []), dtype=np.float64)
         power = np.asarray(diag.get("power", []), dtype=np.float64)
-        if power.ndim == 2 and periods.size == power.shape[0] and t_seg.size == power.shape[1]:
+        power_t = np.asarray(diag.get("power_t", t_seg), dtype=np.float64)
+        ridge_periods = np.asarray(
+            (mode_diag or {}).get("ridge_periods", diag.get("ridge_periods", [])),
+            dtype=np.float64,
+        )
+        coi_boundary_period = np.asarray(
+            (mode_diag or {}).get(
+                "coi_boundary_period", diag.get("coi_boundary_period", [])
+            ),
+            dtype=np.float64,
+        )
+        diag_peak_period = float(
+            (mode_diag or {}).get("peak_period", diag.get("peak_period", float("nan")))
+        )
+        if (
+            power.ndim == 2
+            and periods.size == power.shape[0]
+            and power_t.size == power.shape[1]
+            and power_t.size > 0
+        ):
             scal_ax.imshow(
                 power,
                 aspect="auto",
                 origin="lower",
-                extent=[float(t_seg[0]), float(t_seg[-1]), float(periods[0]), float(periods[-1])],
+                extent=[
+                    float(power_t[0]),
+                    float(power_t[-1]),
+                    float(periods[0]),
+                    float(periods[-1]),
+                ],
                 cmap="viridis",
             )
-            if np.isfinite(float(diag.get("peak_period", float("nan")))):
-                scal_ax.axhline(float(diag.get("peak_period")), color="w", linestyle="--", linewidth=1.0)
+            if np.isfinite(diag_peak_period):
+                scal_ax.axhline(diag_peak_period, color="w", linestyle="--", linewidth=1.0)
+            if ridge_periods.size == power_t.size:
+                scal_ax.plot(power_t, ridge_periods, color="white", linewidth=1.0, alpha=0.9)
+            if coi_boundary_period.size == power_t.size:
+                scal_ax.plot(
+                    power_t,
+                    coi_boundary_period,
+                    color="tab:orange",
+                    linewidth=1.0,
+                    linestyle=":",
+                    alpha=0.9,
+                )
             if wave_t.size:
                 scal_ax.axvspan(float(wave_t[0]), float(wave_t[-1]), color="tab:red", alpha=0.12)
         else:
@@ -12184,8 +13494,8 @@ class TDMosaicApp:
         global_ws = np.asarray(diag.get("global_ws", []), dtype=np.float64)
         if periods.size and global_ws.size == periods.size:
             spec_ax.plot(periods, global_ws, color="tab:purple", linewidth=1.2)
-            if np.isfinite(float(diag.get("peak_period", float("nan")))):
-                spec_ax.axvline(float(diag.get("peak_period")), color="tab:red", linestyle="--", linewidth=1.0)
+            if np.isfinite(diag_peak_period):
+                spec_ax.axvline(diag_peak_period, color="tab:red", linestyle="--", linewidth=1.0)
         else:
             spec_ax.text(0.5, 0.5, "No global spectrum.", ha="center", va="center", transform=spec_ax.transAxes)
         spec_ax.set_title("Global Spectrum", fontsize=9)
@@ -12304,6 +13614,7 @@ class TDMosaicApp:
             panel_id,
             np.asarray(selected_event.get("source_t_idx", []), dtype=np.float64),
             np.asarray(selected_event.get("source_y_idx", []), dtype=np.float64),
+            np.asarray(selected_event.get("source_fit_mask", []), dtype=bool),
             params,
         )
         if diagnostic is None:
@@ -12391,6 +13702,9 @@ class TDMosaicApp:
         selected_event["source_y_idx"] = np.asarray(
             selected_event.get("base_source_y_idx", []), dtype=np.float64
         ).copy()
+        selected_event["source_fit_mask"] = np.asarray(
+            selected_event.get("base_source_fit_mask", []), dtype=bool
+        ).copy()
         selected_event["analysis"] = self._clone_wavelet_payload(
             selected_event.get("base_analysis") or {}
         )
@@ -12405,6 +13719,105 @@ class TDMosaicApp:
         self._record_session_change()
         self._refresh_td_window_wavelet_views(panel_id, redraw_td=True)
         self._set_status(f"Reset selected wavelet event for {panel.name}.")
+
+    def _bulk_update_td_window_visible_wavelet_events(
+        self, panel_id: int, action: str
+    ) -> None:
+        existing = self.td_windows.get(panel_id)
+        panel = self._td_window_panel(panel_id)
+        if existing is None or panel is None:
+            return
+        visible_ids = self._td_window_visible_wavelet_event_ids(panel_id)
+        if not visible_ids:
+            self._set_status(f"No visible wavelet events to {action} in {panel.name}.")
+            return
+
+        changed = 0
+        skipped_locked = 0
+        skipped_invalid = 0
+        undo_pushed = False
+
+        for event_id in visible_ids:
+            event = self._td_window_wavelet_event_by_id(panel_id, event_id)
+            if event is None:
+                continue
+            self._ensure_wavelet_event_fields(event)
+            if bool(event.get("review_locked")):
+                skipped_locked += 1
+                continue
+            if event.get("split_children_ids") and action in {"accept", "reject"}:
+                skipped_invalid += 1
+                continue
+
+            if action == "accept":
+                wave_t_idx = np.asarray(
+                    (event.get("analysis") or {}).get("wave_t_idx", []),
+                    dtype=np.float64,
+                )
+                if wave_t_idx.size < 2:
+                    skipped_invalid += 1
+                    continue
+                if not undo_pushed:
+                    self._push_wavelet_undo_state(panel_id, f"{action} visible events")
+                    undo_pushed = True
+                event["manual_decision"] = "accepted"
+                self._append_wavelet_event_history(event, "accept", details="bulk visible")
+            elif action == "reject":
+                if not undo_pushed:
+                    self._push_wavelet_undo_state(panel_id, f"{action} visible events")
+                    undo_pushed = True
+                event["manual_decision"] = "rejected"
+                self._append_wavelet_event_history(event, "reject", details="bulk visible")
+            elif action == "reset":
+                if not undo_pushed:
+                    self._push_wavelet_undo_state(panel_id, f"{action} visible events")
+                    undo_pushed = True
+                if event.get("split_children_ids"):
+                    child_ids = {
+                        int(child_id) for child_id in event.get("split_children_ids") or []
+                    }
+                    existing["wavelet_events"] = [
+                        candidate
+                        for candidate in self._td_window_wavelet_events(panel_id)
+                        if int(candidate.get("event_id", -1)) not in child_ids
+                    ]
+                    event["split_children_ids"] = []
+                event["source_t_idx"] = np.asarray(
+                    event.get("base_source_t_idx", []), dtype=np.float64
+                ).copy()
+                event["source_y_idx"] = np.asarray(
+                    event.get("base_source_y_idx", []), dtype=np.float64
+                ).copy()
+                event["source_fit_mask"] = np.asarray(
+                    event.get("base_source_fit_mask", []), dtype=bool
+                ).copy()
+                event["analysis"] = self._clone_wavelet_payload(
+                    event.get("base_analysis") or {}
+                )
+                event["current_params"] = dict(event.get("base_params") or {})
+                event["manual_decision"] = None
+                event["customized"] = False
+                event["diagnostic"] = None
+                self._append_wavelet_event_history(event, "reset", details="bulk visible")
+            else:
+                return
+
+            self._wavelet_event_confidence_details(event)
+            changed += 1
+
+        if changed <= 0:
+            self._set_status(
+                f"No visible wavelet events were updated in {panel.name}. "
+                f"locked={skipped_locked}, skipped={skipped_invalid}."
+            )
+            return
+
+        self._record_session_change()
+        self._refresh_td_window_wavelet_views(panel_id, redraw_td=True)
+        self._set_status(
+            f"{action.capitalize()} updated {changed} visible wavelet event(s) in {panel.name}. "
+            f"locked={skipped_locked}, skipped={skipped_invalid}."
+        )
 
     def _trim_td_window_selected_wavelet_event(self, panel_id: int) -> None:
         existing = self.td_windows.get(panel_id)
@@ -12429,6 +13842,7 @@ class TDMosaicApp:
             return
         source_t_idx = np.asarray(selected_event.get("source_t_idx", []), dtype=np.float64)
         source_y_idx = np.asarray(selected_event.get("source_y_idx", []), dtype=np.float64)
+        source_fit_mask = np.asarray(selected_event.get("source_fit_mask", []), dtype=bool)
         if source_t_idx.size < 3 or source_y_idx.size != source_t_idx.size:
             self._set_status(f"Selected event has no valid source segment in {panel.name}.")
             return
@@ -12450,6 +13864,7 @@ class TDMosaicApp:
             panel_id,
             source_t_idx[mask],
             source_y_idx[mask],
+            source_fit_mask[mask] if source_fit_mask.size == source_t_idx.size else None,
             params,
         )
         if diagnostic is None:
@@ -12457,6 +13872,8 @@ class TDMosaicApp:
         self._push_wavelet_undo_state(panel_id, "trim event")
         selected_event["source_t_idx"] = np.asarray(source_t_idx[mask], dtype=np.float64).copy()
         selected_event["source_y_idx"] = np.asarray(source_y_idx[mask], dtype=np.float64).copy()
+        if source_fit_mask.size == source_t_idx.size:
+            selected_event["source_fit_mask"] = np.asarray(source_fit_mask[mask], dtype=bool).copy()
         selected_event["origin"] = "manual-trim"
         self._set_td_window_wavelet_event_analysis(
             selected_event, diagnostic, customized=True
@@ -12496,6 +13913,7 @@ class TDMosaicApp:
             return
         source_t_idx = np.asarray(selected_event.get("source_t_idx", []), dtype=np.float64)
         source_y_idx = np.asarray(selected_event.get("source_y_idx", []), dtype=np.float64)
+        source_fit_mask = np.asarray(selected_event.get("source_fit_mask", []), dtype=bool)
         if source_t_idx.size < 6 or source_y_idx.size != source_t_idx.size:
             self._set_status(f"Selected event is too short to split in {panel.name}.")
             return
@@ -12528,6 +13946,7 @@ class TDMosaicApp:
                 panel_id,
                 source_t_idx[mask],
                 source_y_idx[mask],
+                source_fit_mask[mask] if source_fit_mask.size == source_t_idx.size else None,
                 params,
             )
             if diagnostic is None:
@@ -12541,6 +13960,9 @@ class TDMosaicApp:
             )
             child_event["source_t_idx"] = np.asarray(source_t_idx[mask], dtype=np.float64).copy()
             child_event["source_y_idx"] = np.asarray(source_y_idx[mask], dtype=np.float64).copy()
+            if source_fit_mask.size == source_t_idx.size:
+                child_event["source_fit_mask"] = np.asarray(source_fit_mask[mask], dtype=bool).copy()
+                child_event["base_source_fit_mask"] = child_event["source_fit_mask"].copy()
             child_event["base_source_t_idx"] = child_event["source_t_idx"].copy()
             child_event["base_source_y_idx"] = child_event["source_y_idx"].copy()
             parent_analysis = selected_event.get("analysis") or {}
@@ -13538,10 +14960,9 @@ class TDMosaicApp:
         cut_length_mode_var = self.tk.StringVar(
             value=str(self.geometry_length_mode_var.get())
         )
-        crest_params = dict(DEFAULT_CREST_TRACKING)
-        crest_params.update(panel_state.get("crest_params") or {})
-        wavelet_params = dict(DEFAULT_WAVELET_FILTER)
-        wavelet_params.update(panel_state.get("wavelet_params") or {})
+        crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
+            panel_state.get("crest_params"), panel_state.get("wavelet_params")
+        )
         crest_summary_var = self.tk.StringVar(value="No crest tracking results.")
         crest_cad_var = self.tk.StringVar(
             value=f"{float(crest_params['cad']):.2f}"
@@ -13612,6 +15033,24 @@ class TDMosaicApp:
                 if not np.isfinite(float(wavelet_params["phase_speed_km_s"]))
                 else f"{float(wavelet_params['phase_speed_km_s']):.2f}"
             )
+        )
+        wavelet_min_prominence_var = self.tk.StringVar(
+            value=f"{float(wavelet_params['min_prominence']):.3f}"
+        )
+        wavelet_min_snr_var = self.tk.StringVar(
+            value=f"{float(wavelet_params['min_snr']):.2f}"
+        )
+        wavelet_continuity_weight_var = self.tk.StringVar(
+            value=f"{float(wavelet_params['continuity_weight']):.2f}"
+        )
+        wavelet_time_weight_var = self.tk.StringVar(
+            value=f"{float(wavelet_params['time_weight']):.2f}"
+        )
+        wavelet_quality_weight_var = self.tk.StringVar(
+            value=f"{float(wavelet_params['quality_weight']):.2f}"
+        )
+        wavelet_error_weight_var = self.tk.StringVar(
+            value=f"{float(wavelet_params['error_weight']):.2f}"
         )
         wavelet_thread_filter_var = self.tk.StringVar(
             value=str(panel_state.get("wavelet_thread_filter_text", "") or "")
@@ -13933,18 +15372,26 @@ class TDMosaicApp:
             variable=crest_gauss_var,
         ).grid(row=2, column=6, columnspan=2, sticky="w", pady=(8, 0))
 
+        self.ttk.Label(
+            analysis_frame,
+            text="NUWT puro: aquí solo se tocan los parámetros reales de tracking. "
+            "Los filtros finos de limpieza/aislamiento están abajo en Wavelet Filter.",
+            wraplength=520,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=8, sticky="w", pady=(8, 0))
+
         self.ttk.Button(
             analysis_frame,
             text="Run tracking",
             command=lambda pid=panel_id: self._run_td_window_crest_tracking(pid),
-        ).grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0), padx=(0, 4))
+        ).grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0), padx=(0, 4))
         self.ttk.Button(
             analysis_frame,
             text="Clear tracking",
             command=lambda pid=panel_id: self._clear_td_window_crest_tracking(
                 pid, refresh=True
             ),
-        ).grid(row=3, column=4, columnspan=4, sticky="ew", pady=(10, 0), padx=(4, 0))
+        ).grid(row=4, column=4, columnspan=4, sticky="ew", pady=(10, 0), padx=(4, 0))
 
         wavelet_frame = self.ttk.LabelFrame(
             edit_frame, text="Wavelet Filter", padding=8
@@ -14051,23 +15498,79 @@ class TDMosaicApp:
         wavelet_km_per_arcsec_entry.grid(
             row=4, column=3, sticky="ew", padx=(6, 8), pady=(8, 0)
         )
-        self.ttk.Label(wavelet_frame, text="density [kg/m3]").grid(
+        self.ttk.Label(wavelet_frame, text="min SNR").grid(
+            row=4, column=4, sticky="w", pady=(8, 0)
+        )
+        wavelet_min_snr_entry = self.ttk.Entry(
+            wavelet_frame, textvariable=wavelet_min_snr_var, width=8
+        )
+        wavelet_min_snr_entry.grid(
+            row=4, column=5, sticky="ew", padx=(6, 8), pady=(8, 0)
+        )
+        self.ttk.Label(wavelet_frame, text="min prominence").grid(
+            row=4, column=6, sticky="w", pady=(8, 0)
+        )
+        wavelet_min_prominence_entry = self.ttk.Entry(
+            wavelet_frame, textvariable=wavelet_min_prominence_var, width=8
+        )
+        wavelet_min_prominence_entry.grid(
+            row=4, column=7, sticky="ew", padx=(6, 0), pady=(8, 0)
+        )
+
+        self.ttk.Label(wavelet_frame, text="continuity w").grid(
             row=5, column=0, sticky="w", pady=(8, 0)
+        )
+        wavelet_continuity_weight_entry = self.ttk.Entry(
+            wavelet_frame, textvariable=wavelet_continuity_weight_var, width=8
+        )
+        wavelet_continuity_weight_entry.grid(
+            row=5, column=1, sticky="ew", padx=(6, 8), pady=(8, 0)
+        )
+        self.ttk.Label(wavelet_frame, text="time w").grid(
+            row=5, column=2, sticky="w", pady=(8, 0)
+        )
+        wavelet_time_weight_entry = self.ttk.Entry(
+            wavelet_frame, textvariable=wavelet_time_weight_var, width=8
+        )
+        wavelet_time_weight_entry.grid(
+            row=5, column=3, sticky="ew", padx=(6, 8), pady=(8, 0)
+        )
+        self.ttk.Label(wavelet_frame, text="quality w").grid(
+            row=5, column=4, sticky="w", pady=(8, 0)
+        )
+        wavelet_quality_weight_entry = self.ttk.Entry(
+            wavelet_frame, textvariable=wavelet_quality_weight_var, width=8
+        )
+        wavelet_quality_weight_entry.grid(
+            row=5, column=5, sticky="ew", padx=(6, 8), pady=(8, 0)
+        )
+        self.ttk.Label(wavelet_frame, text="error w").grid(
+            row=5, column=6, sticky="w", pady=(8, 0)
+        )
+        wavelet_error_weight_entry = self.ttk.Entry(
+            wavelet_frame, textvariable=wavelet_error_weight_var, width=8
+        )
+        wavelet_error_weight_entry.grid(
+            row=5, column=7, sticky="ew", padx=(6, 0), pady=(8, 0)
+        )
+
+        self.ttk.Label(wavelet_frame, text="density [kg/m3]").grid(
+            row=6, column=0, sticky="w", pady=(8, 0)
         )
         wavelet_density_entry = self.ttk.Entry(
             wavelet_frame, textvariable=wavelet_density_var, width=10
         )
         wavelet_density_entry.grid(
-            row=5, column=1, sticky="ew", padx=(6, 8), pady=(8, 0)
+            row=6, column=1, sticky="ew", padx=(6, 8), pady=(8, 0)
         )
         self.ttk.Label(wavelet_frame, text="phase speed [km/s]").grid(
-            row=5, column=2, sticky="w", pady=(8, 0)
+            row=6, column=2, sticky="w", pady=(8, 0)
         )
         wavelet_phase_speed_entry = self.ttk.Entry(
             wavelet_frame, textvariable=wavelet_phase_speed_var, width=10
         )
         wavelet_phase_speed_entry.grid(
-            row=5, column=3, sticky="ew", padx=(6, 8), pady=(8, 0)
+            row=6, column=3, sticky="ew", padx=(6, 8), pady=(8, 0)
         )
         wavelet_run_button = self.ttk.Button(
             wavelet_frame,
@@ -14075,7 +15578,7 @@ class TDMosaicApp:
             command=lambda pid=panel_id: self._run_td_window_wavelet_filter(pid),
         )
         wavelet_run_button.grid(
-            row=4, column=4, columnspan=2, sticky="ew", pady=(8, 0), padx=(0, 4)
+            row=6, column=4, columnspan=2, sticky="ew", pady=(8, 0), padx=(0, 4)
         )
         self.ttk.Button(
             wavelet_frame,
@@ -14083,7 +15586,7 @@ class TDMosaicApp:
             command=lambda pid=panel_id: self._clear_td_window_wavelet_filter(
                 pid, refresh=True
             ),
-        ).grid(row=4, column=6, columnspan=2, sticky="ew", pady=(8, 0), padx=(4, 0))
+        ).grid(row=6, column=6, columnspan=2, sticky="ew", pady=(8, 0), padx=(4, 0))
         wavelet_cancel_button = self.ttk.Button(
             wavelet_frame,
             text="Cancel",
@@ -14091,57 +15594,67 @@ class TDMosaicApp:
             state="disabled",
         )
         wavelet_cancel_button.grid(
-            row=5, column=4, columnspan=2, sticky="ew", pady=(8, 0), padx=(0, 4)
+            row=7, column=4, columnspan=2, sticky="ew", pady=(8, 0), padx=(0, 4)
         )
         wavelet_progressbar = self.ttk.Progressbar(
             wavelet_frame, mode="determinate", maximum=1.0, value=0.0
         )
         wavelet_progressbar.grid(
-            row=5, column=0, columnspan=4, sticky="ew", pady=(8, 0), padx=(0, 8)
+            row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0), padx=(0, 8)
         )
         self.ttk.Label(
             wavelet_frame, textvariable=wavelet_progress_var, justify="left"
-        ).grid(row=5, column=6, columnspan=2, sticky="w", pady=(8, 0), padx=(4, 0))
+        ).grid(row=7, column=6, columnspan=2, sticky="w", pady=(8, 0), padx=(4, 0))
         self.ttk.Label(wavelet_frame, text="Preset").grid(
-            row=6, column=0, sticky="w", pady=(8, 0)
+            row=8, column=0, sticky="w", pady=(8, 0)
         )
         preset_box = self.ttk.Combobox(
             wavelet_frame,
             textvariable=preset_var,
             values=list(PARAMETER_PRESETS.keys()),
             state="readonly",
-            width=14,
+            width=22,
         )
-        preset_box.grid(row=6, column=1, columnspan=2, sticky="ew", padx=(6, 8), pady=(8, 0))
+        preset_box.grid(row=8, column=1, columnspan=2, sticky="ew", padx=(6, 8), pady=(8, 0))
         self.ttk.Button(
             wavelet_frame,
             text="Apply preset",
             command=lambda pid=panel_id: self._apply_td_window_parameter_preset(pid),
-        ).grid(row=6, column=3, columnspan=2, sticky="ew", padx=(0, 4), pady=(8, 0))
+        ).grid(row=8, column=3, columnspan=2, sticky="ew", padx=(0, 4), pady=(8, 0))
         self.ttk.Button(
             wavelet_frame,
             text="Export report",
             command=self._export_curated_report,
-        ).grid(row=6, column=5, columnspan=3, sticky="ew", padx=(4, 0), pady=(8, 0))
+        ).grid(row=8, column=5, columnspan=3, sticky="ew", padx=(4, 0), pady=(8, 0))
         self.ttk.Label(wavelet_frame, text="Threads").grid(
-            row=7, column=0, sticky="w", pady=(8, 0)
+            row=9, column=0, sticky="w", pady=(8, 0)
         )
         wavelet_thread_filter_entry = self.ttk.Entry(
             wavelet_frame, textvariable=wavelet_thread_filter_var, width=14
         )
         wavelet_thread_filter_entry.grid(
-            row=7, column=1, columnspan=2, sticky="ew", padx=(6, 8), pady=(8, 0)
+            row=9, column=1, columnspan=2, sticky="ew", padx=(6, 8), pady=(8, 0)
         )
         self.ttk.Button(
             wavelet_frame,
             text="Use event thread",
             command=lambda pid=panel_id: self._set_td_window_selected_event_thread_filter(pid),
-        ).grid(row=7, column=3, columnspan=2, sticky="ew", padx=(0, 4), pady=(8, 0))
+        ).grid(row=9, column=3, columnspan=2, sticky="ew", padx=(0, 4), pady=(8, 0))
         self.ttk.Button(
             wavelet_frame,
             text="Thread -> stack",
             command=lambda pid=panel_id: self._apply_td_window_selected_event_thread_to_stack(pid),
-        ).grid(row=7, column=5, columnspan=3, sticky="ew", padx=(4, 0), pady=(8, 0))
+        ).grid(row=9, column=5, columnspan=3, sticky="ew", padx=(4, 0), pady=(8, 0))
+        self.ttk.Button(
+            wavelet_frame,
+            text="Scatter stats",
+            command=lambda pid=panel_id: self._open_td_window_metrics(pid, "scatter"),
+        ).grid(row=10, column=0, columnspan=4, sticky="ew", padx=(0, 4), pady=(8, 0))
+        self.ttk.Button(
+            wavelet_frame,
+            text="Bar stats",
+            command=lambda pid=panel_id: self._open_td_window_metrics(pid, "bar"),
+        ).grid(row=10, column=4, columnspan=4, sticky="ew", padx=(4, 0), pady=(8, 0))
 
         events_frame = self.ttk.LabelFrame(
             edit_frame, text="Wavelet Events", padding=8
@@ -14301,6 +15814,7 @@ class TDMosaicApp:
                 "thread",
                 "seg",
                 "wseg",
+                "mode",
                 "period",
                 "freq",
                 "amp_arc",
@@ -14311,13 +15825,14 @@ class TDMosaicApp:
                 "dur",
                 "ratio",
                 "score",
+                "pts",
                 "lock",
                 "links",
                 "flags",
                 "reason",
             ),
             show="headings",
-            height=10,
+            height=16,
         )
         tree_y = self.ttk.Scrollbar(
             tree_frame, orient="vertical", command=wavelet_events_tree.yview
@@ -14336,6 +15851,7 @@ class TDMosaicApp:
             "thread": ("Thr", 50),
             "seg": ("Seg", 50),
             "wseg": ("Wseg", 55),
+            "mode": ("Mode", 55),
             "period": ("P [s]", 70),
             "freq": ("f [mHz]", 70),
             "amp_arc": ("A ['']", 70),
@@ -14346,6 +15862,7 @@ class TDMosaicApp:
             "dur": ("dur [s]", 70),
             "ratio": ("ratio", 60),
             "score": ("Conf", 62),
+            "pts": ("fit/int", 72),
             "lock": ("Lock", 55),
             "links": ("Links", 55),
             "flags": ("QA", 110),
@@ -14465,6 +15982,27 @@ class TDMosaicApp:
             text="Split selected",
             command=lambda pid=panel_id: self._split_td_window_selected_wavelet_event(pid),
         ).grid(row=3, column=4, columnspan=2, sticky="ew", padx=(4, 4), pady=(8, 0))
+        self.ttk.Button(
+            actions_frame,
+            text="Accept visible",
+            command=lambda pid=panel_id: self._bulk_update_td_window_visible_wavelet_events(
+                pid, "accept"
+            ),
+        ).grid(row=4, column=0, columnspan=3, sticky="ew", padx=(0, 4), pady=(8, 0))
+        self.ttk.Button(
+            actions_frame,
+            text="Reject visible",
+            command=lambda pid=panel_id: self._bulk_update_td_window_visible_wavelet_events(
+                pid, "reject"
+            ),
+        ).grid(row=4, column=3, columnspan=3, sticky="ew", padx=4, pady=(8, 0))
+        self.ttk.Button(
+            actions_frame,
+            text="Reset visible",
+            command=lambda pid=panel_id: self._bulk_update_td_window_visible_wavelet_events(
+                pid, "reset"
+            ),
+        ).grid(row=4, column=6, columnspan=4, sticky="ew", padx=(4, 0), pady=(8, 0))
 
         edit_container.grid_remove()
 
@@ -14555,6 +16093,12 @@ class TDMosaicApp:
             wavelet_km_per_arcsec_entry,
             wavelet_density_entry,
             wavelet_phase_speed_entry,
+            wavelet_min_snr_entry,
+            wavelet_min_prominence_entry,
+            wavelet_continuity_weight_entry,
+            wavelet_time_weight_entry,
+            wavelet_quality_weight_entry,
+            wavelet_error_weight_entry,
         ):
             widget.bind(
                 "<Return>",
@@ -14680,6 +16224,12 @@ class TDMosaicApp:
             "wavelet_km_per_arcsec_var": wavelet_km_per_arcsec_var,
             "wavelet_density_var": wavelet_density_var,
             "wavelet_phase_speed_var": wavelet_phase_speed_var,
+            "wavelet_min_prominence_var": wavelet_min_prominence_var,
+            "wavelet_min_snr_var": wavelet_min_snr_var,
+            "wavelet_continuity_weight_var": wavelet_continuity_weight_var,
+            "wavelet_time_weight_var": wavelet_time_weight_var,
+            "wavelet_quality_weight_var": wavelet_quality_weight_var,
+            "wavelet_error_weight_var": wavelet_error_weight_var,
             "wavelet_thread_filter_var": wavelet_thread_filter_var,
             "preset_var": preset_var,
             "wavelet_filter_result": self._clone_wavelet_payload(
@@ -14850,7 +16400,47 @@ class TDMosaicApp:
 def main() -> None:
     args = parse_args()
     try:
-        app = TDMosaicApp(args.cube, cube_axis_order=args.cube_order)
+        session_path = (
+            args.session.expanduser().resolve() if args.session is not None else None
+        )
+        session_cube_override = (
+            args.session_cube_override.expanduser().resolve()
+            if args.session_cube_override is not None
+            else None
+        )
+        cube_path = args.cube.expanduser().resolve() if args.cube is not None else None
+        cube_axis_order = normalize_cube_axis_order(args.cube_order)
+
+        initial_cube_hint: Path | None = cube_path
+        if session_path is not None and cube_path is None:
+            session_cube_hint, session_axis_order = _session_startup_defaults(session_path)
+            initial_cube_hint = session_cube_hint
+            cube_axis_order = session_axis_order
+            if session_cube_hint is not None and session_cube_hint.exists():
+                cube_path = session_cube_hint
+
+        if cube_path is None:
+            selection = _prompt_for_initial_cube(
+                initial_cube=initial_cube_hint,
+                initial_order=cube_axis_order,
+            )
+            if selection is None:
+                raise SystemExit("No FITS cube selected.")
+            cube_path, cube_axis_order = selection
+            if (
+                session_path is not None
+                and session_cube_override is None
+                and initial_cube_hint is not None
+                and cube_path != initial_cube_hint
+            ):
+                session_cube_override = cube_path
+
+        app = TDMosaicApp(cube_path, cube_axis_order=cube_axis_order)
+        if session_path is not None:
+            app._load_session_from_path(
+                session_path,
+                session_cube_override=session_cube_override,
+            )
         app.run()
     except Exception as exc:
         if exc.__class__.__name__ == "TclError":
