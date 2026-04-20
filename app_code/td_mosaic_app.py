@@ -673,7 +673,7 @@ class TDMosaicApp:
         import tkinter as tk
         from tkinter import filedialog, messagebox, simpledialog, ttk
 
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
         from matplotlib.figure import Figure
         from matplotlib.patches import Rectangle
 
@@ -684,6 +684,7 @@ class TDMosaicApp:
         self.simpledialog = simpledialog
         self.Figure = Figure
         self.FigureCanvasTkAgg = FigureCanvasTkAgg
+        self.NavigationToolbar2Tk = NavigationToolbar2Tk
         self.Rectangle = Rectangle
 
         self.cube_path = cube_path.expanduser().resolve()
@@ -764,6 +765,8 @@ class TDMosaicApp:
 
         self.figure = self.Figure(figsize=(12.5, 7.5), dpi=100)
         self.canvas = None
+        self.main_toolbar = None
+        self.main_toolbar_frame = None
         self.map_ax = None
         self.map_image = None
         self.panel_axes: dict[int, Any] = {}
@@ -9795,6 +9798,7 @@ class TDMosaicApp:
         self.figure_frame = self.ttk.Frame(self.root, padding=(8, 0, 8, 8))
         self.figure_frame.grid(row=1, column=0, sticky="nsew")
         self.figure_frame.rowconfigure(0, weight=1)
+        self.figure_frame.rowconfigure(1, weight=0)
         self.figure_frame.columnconfigure(0, weight=1)
 
         self.sidebar = self.ttk.Frame(self.root, padding=(0, 0, 8, 8), width=360)
@@ -9868,11 +9872,14 @@ class TDMosaicApp:
                 pady=(0 if row == 0 else 6, 0),
             )
 
-        view_frame = self.ttk.Frame(secondary_controls)
-        view_frame.grid(row=0, column=1, sticky="e", padx=(16, 0))
+        view_frame = self.ttk.LabelFrame(secondary_controls, text="View", padding=8)
+        view_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        for idx in range(8):
+            view_frame.columnconfigure(idx, weight=0)
+        view_frame.columnconfigure(7, weight=1)
 
         self.ttk.Label(view_frame, text="TD aspect").grid(
-            row=0, column=0, sticky="e", padx=(0, 4)
+            row=0, column=0, sticky="w", padx=(0, 4)
         )
         aspect_box = self.ttk.Combobox(
             view_frame,
@@ -9881,11 +9888,11 @@ class TDMosaicApp:
             state="readonly",
             width=7,
         )
-        aspect_box.grid(row=0, column=1, sticky="e")
+        aspect_box.grid(row=0, column=1, sticky="w")
         aspect_box.bind("<<ComboboxSelected>>", self._on_axis_flip_event)
 
         self.ttk.Label(view_frame, text="TD zoom").grid(
-            row=0, column=2, sticky="e", padx=(12, 4)
+            row=0, column=2, sticky="w", padx=(12, 4)
         )
         zoom_box = self.ttk.Combobox(
             view_frame,
@@ -9894,11 +9901,11 @@ class TDMosaicApp:
             state="readonly",
             width=5,
         )
-        zoom_box.grid(row=0, column=3, sticky="e")
+        zoom_box.grid(row=0, column=3, sticky="w")
         zoom_box.bind("<<ComboboxSelected>>", self._on_axis_flip_event)
 
         flip_frame = self.ttk.Frame(view_frame)
-        flip_frame.grid(row=1, column=0, columnspan=4, sticky="e", pady=(6, 0))
+        flip_frame.grid(row=1, column=0, columnspan=8, sticky="w", pady=(6, 0))
 
         self.ttk.Checkbutton(
             flip_frame,
@@ -9936,6 +9943,11 @@ class TDMosaicApp:
             variable=self.td_flip_y_var,
             command=self._on_axis_flip_change,
         ).grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(4, 0))
+
+        self.ttk.Label(
+            view_frame,
+            text="Map pan/zoom toolbar is below the figure.",
+        ).grid(row=0, column=4, columnspan=4, sticky="w", padx=(18, 0))
 
         self.ttk.Label(
             self.top_frame, textvariable=self.status_var
@@ -10864,6 +10876,24 @@ class TDMosaicApp:
     def _build_figure(self) -> None:
         self.canvas = self.FigureCanvasTkAgg(self.figure, master=self.figure_frame)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.canvas.get_tk_widget().configure(takefocus=True)
+
+        if self.main_toolbar is not None:
+            try:
+                self.main_toolbar.destroy()
+            except Exception:
+                pass
+        if self.main_toolbar_frame is None:
+            self.main_toolbar_frame = self.tk.Frame(self.figure_frame)
+            self.main_toolbar_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        else:
+            for child in self.main_toolbar_frame.winfo_children():
+                child.destroy()
+        self.main_toolbar = self.NavigationToolbar2Tk(
+            self.canvas,
+            self.main_toolbar_frame,
+        )
+        self.main_toolbar.update()
 
         self.canvas.mpl_connect("button_press_event", self._on_canvas_press)
         self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
@@ -12995,6 +13025,8 @@ class TDMosaicApp:
         return best[1], best[2]
 
     def _on_canvas_press(self, event: Any) -> None:
+        if self._main_toolbar_mode_active():
+            return
         if event.inaxes is None or event.xdata is None or event.ydata is None:
             return
 
@@ -13061,6 +13093,8 @@ class TDMosaicApp:
         self.refresh_all()
 
     def _on_canvas_motion(self, event: Any) -> None:
+        if self._main_toolbar_mode_active():
+            return
         if event.inaxes != self.map_ax or event.xdata is None or event.ydata is None:
             return
 
@@ -13116,6 +13150,9 @@ class TDMosaicApp:
         self.refresh_all()
 
     def _on_canvas_release(self, _event: Any) -> None:
+        if self._main_toolbar_mode_active():
+            self.drag_state = None
+            return
         if self.drag_state is not None and self.drag_state.get("dirty"):
             cut_id = int(self.drag_state.get("cut_id", -1))
             if cut_id in self.cuts:
@@ -13124,6 +13161,12 @@ class TDMosaicApp:
                     f"Updated geometry of {self.cuts[cut_id].name} at t={int(self.t_visual_var.get())}."
                 )
         self.drag_state = None
+
+    def _main_toolbar_mode_active(self) -> bool:
+        toolbar = getattr(self, "main_toolbar", None)
+        if toolbar is None:
+            return False
+        return bool(str(getattr(toolbar, "mode", "") or "").strip())
 
     def _draw_map(self) -> None:
         frame = self.cube[int(self.t_visual_var.get())]
