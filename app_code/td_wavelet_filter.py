@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 import pywt
+from scipy.optimize import minimize_scalar
 
 
 DEFAULT_WAVELET_FILTER = {
@@ -33,10 +34,18 @@ def _mad_std(values: np.ndarray) -> float:
     return 1.4826 * mad + 1e-12
 
 
-def _detrend_poly(t: np.ndarray, y: np.ndarray, degree: int = 2) -> tuple[np.ndarray, np.ndarray]:
+def _detrend_poly(t: np.ndarray, y: np.ndarray, degree: int = 1) -> tuple[np.ndarray, np.ndarray]:
     tt = np.asarray(t, dtype=np.float64) - float(np.nanmean(t))
     yy = np.asarray(y, dtype=np.float64)
-    coeffs = np.polyfit(tt, yy, degree)
+    finite = np.isfinite(tt) & np.isfinite(yy)
+    valid_count = int(np.count_nonzero(finite))
+    if valid_count < 2:
+        trend = np.full_like(yy, float(np.nanmedian(yy)), dtype=np.float64)
+        return yy - trend, trend
+
+    max_degree = max(valid_count - 1, 0)
+    degree = int(np.clip(int(degree), 0, max_degree))
+    coeffs = np.polyfit(tt[finite], yy[finite], degree)
     trend = np.polyval(coeffs, tt)
     return yy - trend, trend
 
@@ -46,7 +55,7 @@ def _apply_detrend(
     y: np.ndarray,
     *,
     method: str = "poly",
-    degree: int = 2,
+    degree: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     yy = np.asarray(y, dtype=np.float64)
     if method == "none":
@@ -304,43 +313,213 @@ def fit_sine_with_trend(
     *,
     fit_mask: np.ndarray | None = None,
     weights: np.ndarray | None = None,
+    baseline_degree: int = 0,
 ) -> tuple[np.ndarray, float, float]:
     t = np.asarray(t, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     if t.size == 0 or y.size != t.size:
         raise ValueError("t and y must have the same non-zero length")
+    if not np.isfinite(period_guess) or period_guess <= 0.0:
+        raise ValueError("period_guess must be finite and positive")
 
     t_centered = t - np.mean(t)
-    omega = 2.0 * np.pi / period_guess
-    design = np.column_stack(
-        [
-            np.sin(omega * t_centered),
-            np.cos(omega * t_centered),
-            np.ones_like(t_centered),
-            t_centered,
-            t_centered**2,
-        ]
-    )
-
     valid = np.isfinite(t_centered) & np.isfinite(y)
     if fit_mask is not None:
         fit_mask = np.asarray(fit_mask, dtype=bool)
         if fit_mask.size != t.size:
             raise ValueError("fit_mask must match t and y")
         valid &= fit_mask
-    if np.count_nonzero(valid) < 3:
-        raise ValueError("at least three valid samples are required")
+    baseline_degree = max(int(baseline_degree), 0)
+    min_required = baseline_degree + 3
+    if np.count_nonzero(valid) < min_required:
+        raise ValueError(f"at least {min_required} valid samples are required")
 
+    weights_arr = None
+    if weights is not None:
+        weights_arr = np.asarray(weights, dtype=np.float64)
+        if weights_arr.size != t.size:
+            raise ValueError("weights must match t and y")
+        positive = np.isfinite(weights_arr[valid]) & (weights_arr[valid] > 0.0)
+        if np.count_nonzero(positive) < min_required:
+            raise ValueError(f"at least {min_required} positively weighted samples are required")
+
+    def _fit_for_period(period: float) -> tuple[np.ndarray, float, float, float]:
+        omega = 2.0 * np.pi / float(period)
+        basis = [
+            np.sin(omega * t_centered),
+            np.cos(omega * t_centered),
+        ]
+        basis.extend(t_centered**power for power in range(baseline_degree + 1))
+        design = np.column_stack(basis)
+        design_fit = design[valid]
+        y_fit = y[valid]
+        if weights_arr is not None:
+            w_fit = weights_arr[valid]
+            positive = np.isfinite(w_fit) & (w_fit > 0.0)
+            scale = np.sqrt(w_fit[positive])[:, None]
+            beta, _, _, _ = np.linalg.lstsq(
+                design_fit[positive] * scale,
+                y_fit[positive] * scale[:, 0],
+                rcond=None,
+            )
+        else:
+            beta, _, _, _ = np.linalg.lstsq(design_fit, y_fit, rcond=None)
+        y_model = design @ beta
+        amp = float(np.hypot(beta[0], beta[1]))
+        residuals = y_fit - y_model[valid]
+        mse = float(np.mean(residuals**2)) if residuals.size else float("inf")
+        return y_model, amp, omega, mse
+
+    y_model, amp, omega, best_mse = _fit_for_period(float(period_guess))
+
+    valid_t = t[valid]
+    if valid_t.size >= max(min_required + 1, 5):
+        diffs = np.diff(valid_t)
+        diffs = diffs[np.isfinite(diffs) & (diffs > 0.0)]
+        dt = float(np.nanmedian(diffs)) if diffs.size else 1.0
+        span = float(valid_t[-1] - valid_t[0])
+        lower_period = max(2.0 * dt, 0.5 * float(period_guess))
+        upper_period = min(
+            2.5 * float(period_guess),
+            max(1.15 * float(period_guess), 2.0 * span),
+        )
+        if np.isfinite(lower_period) and np.isfinite(upper_period) and upper_period > lower_period * 1.02:
+            def _objective(period: float) -> float:
+                try:
+                    _model, _amp, _omega, mse = _fit_for_period(float(period))
+                except Exception:
+                    return float("inf")
+                regularization = 0.03 * ((float(period) / float(period_guess)) - 1.0) ** 2
+                return float(mse * (1.0 + regularization))
+
+            result = minimize_scalar(
+                _objective,
+                bounds=(lower_period, upper_period),
+                method="bounded",
+                options={"xatol": max(1e-3, 0.01 * dt)},
+            )
+            if bool(result.success):
+                refined_model, refined_amp, refined_omega, refined_mse = _fit_for_period(
+                    float(result.x)
+                )
+                if np.isfinite(refined_mse) and refined_mse < best_mse * 0.995:
+                    y_model = refined_model
+                    amp = refined_amp
+                    omega = refined_omega
+
+    return y_model, amp, omega
+
+
+def _smooth_positive_periods(periods: np.ndarray) -> np.ndarray:
+    period_arr = np.asarray(periods, dtype=np.float64)
+    valid = np.isfinite(period_arr) & (period_arr > 0.0)
+    if np.count_nonzero(valid) < 2:
+        return np.array([], dtype=np.float64)
+
+    valid_idx = np.flatnonzero(valid)
+    filled = np.interp(
+        np.arange(period_arr.size, dtype=np.float64),
+        valid_idx.astype(np.float64),
+        period_arr[valid_idx],
+        left=float(period_arr[valid_idx[0]]),
+        right=float(period_arr[valid_idx[-1]]),
+    )
+    window = min(5, period_arr.size if period_arr.size % 2 == 1 else period_arr.size - 1)
+    if window < 3:
+        return np.asarray(filled, dtype=np.float64)
+    kernel = np.ones(window, dtype=np.float64) / float(window)
+    pad = window // 2
+    padded = np.pad(filled, pad, mode="edge")
+    return np.asarray(np.convolve(padded, kernel, mode="valid"), dtype=np.float64)
+
+
+def fit_wavelet_guided_oscillation(
+    t: np.ndarray,
+    y: np.ndarray,
+    period_guess: float,
+    *,
+    ridge_periods: np.ndarray | None = None,
+    fit_mask: np.ndarray | None = None,
+    weights: np.ndarray | None = None,
+    baseline_degree: int = 0,
+) -> tuple[np.ndarray, float, float]:
+    if ridge_periods is None:
+        return fit_sine_with_trend(
+            t,
+            y,
+            period_guess,
+            fit_mask=fit_mask,
+            weights=weights,
+            baseline_degree=baseline_degree,
+        )
+
+    t = np.asarray(t, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    ridge_periods = np.asarray(ridge_periods, dtype=np.float64)
+    if ridge_periods.size != t.size:
+        return fit_sine_with_trend(
+            t,
+            y,
+            period_guess,
+            fit_mask=fit_mask,
+            weights=weights,
+            baseline_degree=baseline_degree,
+        )
+    if t.size == 0 or y.size != t.size:
+        raise ValueError("t and y must have the same non-zero length")
+
+    ridge_smoothed = _smooth_positive_periods(ridge_periods)
+    if ridge_smoothed.size != t.size:
+        return fit_sine_with_trend(
+            t,
+            y,
+            period_guess,
+            fit_mask=fit_mask,
+            weights=weights,
+            baseline_degree=baseline_degree,
+        )
+
+    t_centered = t - np.mean(t)
+    valid = np.isfinite(t_centered) & np.isfinite(y)
+    if fit_mask is not None:
+        fit_mask = np.asarray(fit_mask, dtype=bool)
+        if fit_mask.size != t.size:
+            raise ValueError("fit_mask must match t and y")
+        valid &= fit_mask
+    baseline_degree = max(int(baseline_degree), 0)
+    min_required = baseline_degree + 3
+    if np.count_nonzero(valid) < min_required:
+        raise ValueError(f"at least {min_required} valid samples are required")
+
+    weights_arr = None
+    if weights is not None:
+        weights_arr = np.asarray(weights, dtype=np.float64)
+        if weights_arr.size != t.size:
+            raise ValueError("weights must match t and y")
+        positive = np.isfinite(weights_arr[valid]) & (weights_arr[valid] > 0.0)
+        if np.count_nonzero(positive) < min_required:
+            raise ValueError(f"at least {min_required} positively weighted samples are required")
+
+    omega_inst = 2.0 * np.pi / np.maximum(ridge_smoothed, 1e-12)
+    dt = np.diff(t)
+    phase = np.zeros_like(t_centered, dtype=np.float64)
+    if t.size > 1:
+        phase[1:] = np.cumsum(
+            0.5 * (omega_inst[1:] + omega_inst[:-1]) * np.where(np.isfinite(dt), dt, 0.0)
+        )
+    phase -= float(np.nanmean(phase[valid]))
+
+    basis = [
+        np.sin(phase),
+        np.cos(phase),
+    ]
+    basis.extend(t_centered**power for power in range(baseline_degree + 1))
+    design = np.column_stack(basis)
     design_fit = design[valid]
     y_fit = y[valid]
-    if weights is not None:
-        weights = np.asarray(weights, dtype=np.float64)
-        if weights.size != t.size:
-            raise ValueError("weights must match t and y")
-        w_fit = weights[valid]
+    if weights_arr is not None:
+        w_fit = weights_arr[valid]
         positive = np.isfinite(w_fit) & (w_fit > 0.0)
-        if np.count_nonzero(positive) < 3:
-            raise ValueError("at least three positively weighted samples are required")
         scale = np.sqrt(w_fit[positive])[:, None]
         beta, _, _, _ = np.linalg.lstsq(
             design_fit[positive] * scale,
@@ -351,6 +530,10 @@ def fit_sine_with_trend(
         beta, _, _, _ = np.linalg.lstsq(design_fit, y_fit, rcond=None)
     y_model = design @ beta
     amp = float(np.hypot(beta[0], beta[1]))
+    fit_period = float(np.nanmedian(ridge_smoothed[valid]))
+    omega = float(2.0 * np.pi / fit_period) if np.isfinite(fit_period) and fit_period > 0.0 else float(
+        2.0 * np.pi / max(float(period_guess), 1e-12)
+    )
     return y_model, amp, omega
 
 
@@ -361,12 +544,14 @@ def compute_segment_physical_params(
     km_per_arcsec: float,
     density_kg_m3: float = float("nan"),
     phase_speed_km_s: float = float("nan"),
+    ridge_periods: np.ndarray | None = None,
     fit_mask: np.ndarray | None = None,
     weights: np.ndarray | None = None,
 ) -> dict[str, float]:
     params = {
         "fit_amp_arcsec": float("nan"),
         "fit_amp_km": float("nan"),
+        "fit_period_s": float("nan"),
         "peak_to_peak_arcsec": float("nan"),
         "peak_to_peak_km": float("nan"),
         "freq_hz": float("nan"),
@@ -395,12 +580,14 @@ def compute_segment_physical_params(
         return params
 
     try:
-        y_model, fit_amp_arcsec, omega = fit_sine_with_trend(
+        y_model, fit_amp_arcsec, omega = fit_wavelet_guided_oscillation(
             t,
             y_arcsec,
             peak_period,
+            ridge_periods=ridge_periods,
             fit_mask=fit_mask,
             weights=weights,
+            baseline_degree=0,
         )
     except Exception:
         return params
@@ -413,7 +600,12 @@ def compute_segment_physical_params(
     residuals = y_arcsec[fit_eval] - y_model[fit_eval]
     fit_rms_arcsec = float(np.sqrt(np.mean(residuals**2))) if residuals.size else float("nan")
     fit_amp_km = float(fit_amp_arcsec * km_per_arcsec)
-    freq_hz = float(1.0 / peak_period)
+    fit_period_s = float((2.0 * np.pi) / abs(omega)) if abs(omega) > 1e-12 else float("nan")
+    freq_hz = (
+        float(1.0 / fit_period_s)
+        if np.isfinite(fit_period_s) and fit_period_s > 0.0
+        else float("nan")
+    )
     peak_to_peak_arcsec = float(2.0 * fit_amp_arcsec)
     peak_to_peak_km = float(2.0 * fit_amp_km)
     velocity_amp_km_s = float(abs(omega) * fit_amp_km)
@@ -433,6 +625,7 @@ def compute_segment_physical_params(
         {
             "fit_amp_arcsec": float(fit_amp_arcsec),
             "fit_amp_km": fit_amp_km,
+            "fit_period_s": fit_period_s,
             "peak_to_peak_arcsec": peak_to_peak_arcsec,
             "peak_to_peak_km": peak_to_peak_km,
             "freq_hz": freq_hz,
@@ -466,7 +659,7 @@ def wavelet_select_segment(
     wavelet_name: str = "cmor1.5-1.0",
     n_scales: int = 60,
     detrend_method: str = "poly",
-    detrend_degree: int = 2,
+    detrend_degree: int = 1,
     edge_fraction: float = 0.12,
     ridge_penalty: float = 0.18,
 ) -> tuple[bool, list[tuple[float, float]], dict[str, Any]]:
@@ -746,6 +939,7 @@ def analyze_tracked_segment_with_wavelet(
                 "wave_y_arcsec": np.array([], dtype=np.float64),
                 "wave_y_detr_arcsec": np.array([], dtype=np.float64),
                 "wave_model_arcsec": np.array([], dtype=np.float64),
+                "wave_model_detr_arcsec": np.array([], dtype=np.float64),
                 "rms_amp_ratio": float("nan"),
                 "fit_point_count": 0,
                 "interp_point_count": 0,
@@ -778,6 +972,12 @@ def analyze_tracked_segment_with_wavelet(
         mode_mean_power = float(mode.get("mean_power", mean_power))
         mode_power_ratio = float(mode.get("power_ratio", power_ratio))
         mode_is_wave = bool(mode.get("is_wave_like", is_wave))
+        mode_trend = np.asarray(mode.get("trend", diag.get("trend", [])), dtype=np.float64)
+        mode_y_detr = np.asarray(mode.get("y_detr", diag.get("y_detr", [])), dtype=np.float64)
+        mode_ridge_periods = np.asarray(
+            mode.get("ridge_periods", diag.get("ridge_periods", [])),
+            dtype=np.float64,
+        )
         for wseg_id, (t_start, t_end) in enumerate(mode.get("segments_time") or []):
             wave_mask = (t_seg >= t_start) & (t_seg <= t_end)
             wave_t_idx = t_idx_seg[wave_mask]
@@ -785,6 +985,16 @@ def analyze_tracked_segment_with_wavelet(
             wave_t_s = t_seg[wave_mask]
             wave_y_arc = y_arc[wave_mask]
             wave_fit_mask = fit_mask[wave_mask]
+            wave_ridge_periods = (
+                np.asarray(mode_ridge_periods[wave_mask], dtype=np.float64)
+                if mode_ridge_periods.size == t_seg.size
+                else np.array([], dtype=np.float64)
+            )
+            wave_trend = (
+                mode_trend[wave_mask]
+                if mode_trend.size == t_seg.size
+                else np.zeros_like(wave_y_arc, dtype=np.float64)
+            )
             has_segment = wave_t_idx.size > 0
             duration_s = float(t_end - t_start) if has_segment else float("nan")
             fit_point_count = int(np.count_nonzero(wave_fit_mask))
@@ -794,15 +1004,27 @@ def analyze_tracked_segment_with_wavelet(
             accepted = False
             wave_y_detr = np.array([], dtype=np.float64)
             wave_model = np.array([], dtype=np.float64)
+            wave_model_detr = np.array([], dtype=np.float64)
             rms_amp_ratio = float("nan")
             decision_warnings: list[str] = []
+            if has_segment:
+                if mode_y_detr.size == t_seg.size:
+                    wave_y_detr = np.asarray(mode_y_detr[wave_mask], dtype=np.float64)
+                else:
+                    baseline = np.full_like(wave_y_arc, float(np.nanmedian(wave_y_arc)), dtype=np.float64)
+                    wave_y_detr = wave_y_arc - baseline
             fit_params = compute_segment_physical_params(
                 wave_t_s if has_segment else np.array([], dtype=np.float64),
-                wave_y_arc if has_segment else np.array([], dtype=np.float64),
+                wave_y_detr if has_segment else np.array([], dtype=np.float64),
                 mode_peak_period,
                 km_per_arcsec,
                 density_kg_m3=density_kg_m3,
                 phase_speed_km_s=phase_speed_km_s,
+                ridge_periods=(
+                    wave_ridge_periods
+                    if wave_ridge_periods.size == wave_t_s.size
+                    else None
+                ),
                 fit_mask=wave_fit_mask if has_segment else None,
             )
             fit_amp_arcsec = float(fit_params.get("fit_amp_arcsec", float("nan")))
@@ -810,22 +1032,6 @@ def analyze_tracked_segment_with_wavelet(
             span_amp_arcsec = float("nan")
             if has_segment and fit_point_count >= 3:
                 try:
-                    fit_t = wave_t_s[wave_fit_mask]
-                    fit_y = wave_y_arc[wave_fit_mask]
-                    wave_y_detr, trend = _apply_detrend(
-                        fit_t,
-                        fit_y,
-                        method="poly",
-                        degree=2,
-                    )
-                    trend = np.interp(
-                        wave_t_s,
-                        fit_t,
-                        trend,
-                        left=float(trend[0]),
-                        right=float(trend[-1]),
-                    )
-                    wave_y_detr = wave_y_arc - trend
                     span_amp_arcsec = 0.5 * (
                         float(np.nanmax(wave_y_detr[wave_fit_mask]))
                         - float(np.nanmin(wave_y_detr[wave_fit_mask]))
@@ -835,28 +1041,43 @@ def analyze_tracked_segment_with_wavelet(
                     )
                     amp = float(amp_metric)
                     if np.isfinite(mode_peak_period) and mode_peak_period > 0.0:
-                        wave_model, _, _ = fit_sine_with_trend(
+                        wave_model_detr, _, _ = fit_wavelet_guided_oscillation(
                             wave_t_s,
-                            wave_y_arc,
+                            wave_y_detr,
                             mode_peak_period,
+                            ridge_periods=(
+                                wave_ridge_periods
+                                if wave_ridge_periods.size == wave_t_s.size
+                                else None
+                            ),
                             fit_mask=wave_fit_mask,
+                            baseline_degree=0,
                         )
+                        wave_model = wave_model_detr + wave_trend
                 except Exception:
                     amp = 0.0
                     wave_y_detr = np.array([], dtype=np.float64)
                     wave_model = np.array([], dtype=np.float64)
+                    wave_model_detr = np.array([], dtype=np.float64)
                     span_amp_arcsec = float("nan")
-                    decision_warnings.append("detrend failed")
+                    decision_warnings.append("segment fit failed")
 
                 if np.isfinite(mode_peak_period) and mode_peak_period > 0.0:
                     try:
-                        wave_model, fit_amp, _ = fit_sine_with_trend(
+                        wave_model_detr, fit_amp, _ = fit_wavelet_guided_oscillation(
                             wave_t_s,
-                            wave_y_arc,
+                            wave_y_detr,
                             mode_peak_period,
+                            ridge_periods=(
+                                wave_ridge_periods
+                                if wave_ridge_periods.size == wave_t_s.size
+                                else None
+                            ),
                             fit_mask=wave_fit_mask,
+                            baseline_degree=0,
                         )
-                        residuals = wave_y_arc[wave_fit_mask] - wave_model[wave_fit_mask]
+                        wave_model = wave_model_detr + wave_trend
+                        residuals = wave_y_detr[wave_fit_mask] - wave_model_detr[wave_fit_mask]
                         fit_rms = float(np.sqrt(np.mean(residuals**2)))
                         rms_amp_ratio = (
                             fit_rms / fit_amp
@@ -896,6 +1117,11 @@ def analyze_tracked_segment_with_wavelet(
                     "amp_arcsec": float(amp),
                     "span_amp_arcsec": float(span_amp_arcsec),
                     "amplitude_method": "fit",
+                    "fit_model": (
+                        "wavelet-guided"
+                        if wave_ridge_periods.size == wave_t_s.size
+                        else "sine"
+                    ),
                     "peak_period_s": mode_peak_period,
                     "power_ratio": mode_power_ratio,
                     "peak_power": mode_peak_power,
@@ -907,6 +1133,7 @@ def analyze_tracked_segment_with_wavelet(
                     "wave_y_arcsec": np.asarray(wave_y_arc, dtype=np.float64),
                     "wave_y_detr_arcsec": np.asarray(wave_y_detr, dtype=np.float64),
                     "wave_model_arcsec": np.asarray(wave_model, dtype=np.float64),
+                    "wave_model_detr_arcsec": np.asarray(wave_model_detr, dtype=np.float64),
                     "rms_amp_ratio": rms_amp_ratio,
                     "fit_point_count": fit_point_count,
                     "interp_point_count": interp_point_count,
@@ -1019,6 +1246,7 @@ __all__ = [
     "analyze_tracked_threads_with_wavelets",
     "analyze_tracked_segment_with_wavelet",
     "compute_segment_physical_params",
+    "fit_wavelet_guided_oscillation",
     "fit_sine_with_trend",
     "split_thread_on_jumps",
     "wavelet_select_segment",

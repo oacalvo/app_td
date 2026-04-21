@@ -8709,6 +8709,26 @@ class TDMosaicApp:
         state["td_cache_meta"] = meta
         return td, meta
 
+    def _wavelet_event_overlay_samples(
+        self,
+        event: dict[str, Any],
+        *,
+        allow_source_fallback: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        self._ensure_wavelet_event_fields(event)
+        analysis = event.get("analysis") or {}
+        wave_t_idx = np.asarray(analysis.get("wave_t_idx", []), dtype=np.float64)
+        wave_y_idx = np.asarray(analysis.get("wave_y_idx", []), dtype=np.float64)
+        if wave_t_idx.size >= 2 and wave_y_idx.size == wave_t_idx.size:
+            return wave_t_idx, wave_y_idx
+        if not allow_source_fallback:
+            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+        source_t_idx = np.asarray(event.get("source_t_idx", []), dtype=np.float64)
+        source_y_idx = np.asarray(event.get("source_y_idx", []), dtype=np.float64)
+        if source_t_idx.size >= 2 and source_y_idx.size == source_t_idx.size:
+            return source_t_idx, source_y_idx
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
     def _draw_cut_analysis_overlay(
         self, ax: Any, cut_id: int, meta: dict[str, Any] | None, *, selected_event_id: int | None = None
     ) -> None:
@@ -8747,9 +8767,11 @@ class TDMosaicApp:
         dist_hi = dist_index[-1]
         for event in events:
             self._ensure_wavelet_event_fields(event)
-            analysis = event.get("analysis") or {}
-            wave_t_idx = np.asarray(analysis.get("wave_t_idx", []), dtype=np.float64)
-            wave_y_idx = np.asarray(analysis.get("wave_y_idx", []), dtype=np.float64)
+            is_selected = int(event.get("event_id", -1)) == int(selected_event_id or -1)
+            wave_t_idx, wave_y_idx = self._wavelet_event_overlay_samples(
+                event,
+                allow_source_fallback=is_selected,
+            )
             if wave_t_idx.size < 2 or wave_y_idx.size != wave_t_idx.size:
                 continue
             mask = np.isfinite(wave_y_idx) & (wave_y_idx >= 0.0) & (wave_y_idx <= dist_hi + 1e-9)
@@ -8767,7 +8789,7 @@ class TDMosaicApp:
                 color = "darkorange"
             linewidth = 2.2 if self._td_window_wavelet_event_is_counted(event) else 1.4
             alpha = 0.9 if self._td_window_wavelet_event_is_counted(event) else 0.5
-            if int(event.get("event_id", -1)) == int(selected_event_id or -1):
+            if is_selected:
                 color = "gold"
                 linewidth = 3.0
                 alpha = 1.0
@@ -9302,6 +9324,13 @@ class TDMosaicApp:
         ):
             current_tree.heading(column, text=label)
             current_tree.column(column, width=width, stretch=(column in {"group", "qa"}))
+        current_tree.tag_configure("auto_accepted", foreground="green4")
+        current_tree.tag_configure("auto_rejected", foreground="firebrick")
+        current_tree.tag_configure("custom_accepted", foreground="darkcyan")
+        current_tree.tag_configure("custom_rejected", foreground="darkorange")
+        current_tree.tag_configure("manual_accepted", foreground="dodgerblue4")
+        current_tree.tag_configure("manual_rejected", foreground="red4")
+        current_tree.tag_configure("split_parent", foreground="gray45")
         current_tree.bind(
             "<<TreeviewSelect>>", lambda _event, bid=browser_id: self._on_stack_browser_tree_select(bid, "current")
         )
@@ -9603,6 +9632,7 @@ class TDMosaicApp:
                     "end",
                     iid=f"{key}-{int(event.get('event_id', -1))}",
                     values=self._stack_browser_event_row(event),
+                    tags=(self._td_window_wavelet_table_tag(event),),
                 )
             selected_event_id = preferred_selected_event_id
             if selected_event_id not in visible_ids:
@@ -15344,8 +15374,8 @@ class TDMosaicApp:
         wave_y_arc = np.asarray(analysis.get("wave_y_arcsec", []), dtype=np.float64)
         wave_y_detr = np.asarray(analysis.get("wave_y_detr_arcsec", []), dtype=np.float64)
         wave_model = np.asarray(analysis.get("wave_model_arcsec", []), dtype=np.float64)
-        model_detr = np.array([], dtype=np.float64)
-        if wave_model.size == wave_y_arc.size == wave_y_detr.size and wave_model.size > 0:
+        model_detr = np.asarray(analysis.get("wave_model_detr_arcsec", []), dtype=np.float64)
+        if model_detr.size == 0 and wave_model.size == wave_y_arc.size == wave_y_detr.size and wave_model.size > 0:
             model_detr = wave_model - (wave_y_arc - wave_y_detr)
 
         existing["wavelet_selected_var"].set(
@@ -15402,7 +15432,7 @@ class TDMosaicApp:
         if wave_t.size and wave_y_detr.size == wave_t.size:
             detr_ax.plot(wave_t, wave_y_detr, color="tab:blue", linewidth=1.5, label="selected")
         if wave_t.size and model_detr.size == wave_t.size:
-            detr_ax.plot(wave_t, model_detr, color="tab:red", linewidth=1.2, label="sine fit")
+            detr_ax.plot(wave_t, model_detr, color="tab:red", linewidth=1.2, label="oscillation fit")
         if interaction and interaction.get("mode") == "trim":
             detr_ax.axvspan(left, right, color="gold", alpha=0.18)
 
@@ -16135,11 +16165,13 @@ class TDMosaicApp:
         if events:
             selected_event_id = existing.get("wavelet_selected_event_id")
             for event in events:
-                if not self._td_window_wavelet_event_is_counted(event):
+                is_selected = int(event.get("event_id", -1)) == int(selected_event_id or -1)
+                if not self._td_window_wavelet_event_is_counted(event) and not is_selected:
                     continue
-                analysis = event.get("analysis") or {}
-                wave_t_idx = np.asarray(analysis.get("wave_t_idx", []), dtype=np.float64)
-                wave_y_idx = np.asarray(analysis.get("wave_y_idx", []), dtype=np.float64)
+                wave_t_idx, wave_y_idx = self._wavelet_event_overlay_samples(
+                    event,
+                    allow_source_fallback=is_selected,
+                )
                 if wave_t_idx.size < 2 or wave_y_idx.size != wave_t_idx.size:
                     continue
                 mask = np.isfinite(wave_y_idx) & (wave_y_idx >= 0.0) & (wave_y_idx <= dist_hi + 1e-9)
@@ -16153,9 +16185,11 @@ class TDMosaicApp:
                     color = "deepskyblue"
                 elif status == "custom accepted":
                     color = "cyan"
-                linewidth = 2.6
-                alpha = 0.95
-                if int(event.get("event_id", -1)) == int(selected_event_id or -1):
+                elif status not in {"auto accepted", "custom accepted", "manual accepted"}:
+                    color = "darkorange"
+                linewidth = 2.6 if self._td_window_wavelet_event_is_counted(event) else 1.6
+                alpha = 0.95 if self._td_window_wavelet_event_is_counted(event) else 0.65
+                if is_selected:
                     color = "gold"
                     linewidth = 3.0
                     alpha = 1.0
