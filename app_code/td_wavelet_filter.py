@@ -174,6 +174,122 @@ def _spectrum_peak_indices(
     return selected
 
 
+def _smooth_masked_series(
+    values: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    window: int = 5,
+) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(arr)
+    if arr.size == 0:
+        return np.array([], dtype=np.float64)
+
+    smoothed = np.full(arr.shape, float("nan"), dtype=np.float64)
+    valid_count = int(np.count_nonzero(valid))
+    if valid_count == 0:
+        return smoothed
+    if valid_count == 1:
+        smoothed[valid] = arr[valid]
+        return smoothed
+
+    valid_idx = np.flatnonzero(valid)
+    filled = np.interp(
+        np.arange(arr.size, dtype=np.float64),
+        valid_idx.astype(np.float64),
+        arr[valid_idx],
+        left=float(arr[valid_idx[0]]),
+        right=float(arr[valid_idx[-1]]),
+    )
+    smooth_window = min(max(int(window), 1), arr.size)
+    if smooth_window % 2 == 0:
+        smooth_window -= 1
+    if smooth_window < 3:
+        smoothed = np.asarray(filled, dtype=np.float64)
+    else:
+        kernel = np.ones(smooth_window, dtype=np.float64) / float(smooth_window)
+        pad = smooth_window // 2
+        padded = np.pad(filled, pad, mode="edge")
+        smoothed = np.asarray(np.convolve(padded, kernel, mode="valid"), dtype=np.float64)
+    smoothed[~valid] = float("nan")
+    return smoothed
+
+
+def _bridge_short_false_gaps(mask: np.ndarray, *, max_gap: int) -> np.ndarray:
+    bridged = np.asarray(mask, dtype=bool).copy()
+    if bridged.size == 0 or max_gap <= 0:
+        return bridged
+
+    true_idx = np.flatnonzero(bridged)
+    if true_idx.size < 2:
+        return bridged
+
+    prev = int(true_idx[0])
+    for current_idx in true_idx[1:]:
+        gap = int(current_idx) - prev - 1
+        if 0 < gap <= int(max_gap):
+            bridged[prev + 1 : int(current_idx)] = True
+        prev = int(current_idx)
+    return bridged
+
+
+def _segments_from_active_mask(
+    mask: np.ndarray,
+    *,
+    min_points: int,
+) -> list[tuple[int, int]]:
+    active_idx = np.flatnonzero(np.asarray(mask, dtype=bool))
+    if active_idx.size < max(int(min_points), 1):
+        return []
+
+    segments: list[tuple[int, int]] = []
+    start = int(active_idx[0])
+    prev = int(active_idx[0])
+    for idx in active_idx[1:]:
+        idx = int(idx)
+        if idx != prev + 1:
+            if (prev - start + 1) >= int(min_points):
+                segments.append((start, prev))
+            start = idx
+        prev = idx
+    if (prev - start + 1) >= int(min_points):
+        segments.append((start, prev))
+    return segments
+
+
+def _ridge_power_segments(
+    t: np.ndarray,
+    ridge_power: np.ndarray,
+    ridge_valid: np.ndarray,
+    *,
+    segment_power_frac: float,
+    min_points_segment: int,
+) -> tuple[list[tuple[int, int]], list[tuple[float, float]], float, np.ndarray]:
+    power_time = np.asarray(ridge_power, dtype=np.float64)
+    valid = np.asarray(ridge_valid, dtype=bool) & np.isfinite(power_time)
+    if power_time.size == 0 or np.count_nonzero(valid) == 0:
+        return [], [], float("nan"), np.array([], dtype=np.float64)
+
+    power_smooth = _smooth_masked_series(power_time, valid, window=5)
+    threshold_source = power_smooth
+    source_valid = valid & np.isfinite(threshold_source)
+    if np.count_nonzero(source_valid) == 0:
+        threshold_source = power_time
+        source_valid = valid
+
+    threshold = float(segment_power_frac) * float(np.nanmax(threshold_source[source_valid]))
+    active_mask = valid & np.isfinite(threshold_source) & (threshold_source >= threshold)
+    max_gap = max(1, min(2, int(max(min_points_segment, 1)) // 6))
+    active_mask = _bridge_short_false_gaps(active_mask, max_gap=max_gap)
+    segments_idx = _segments_from_active_mask(
+        active_mask,
+        min_points=max(int(min_points_segment), 1),
+    )
+    t_arr = np.asarray(t, dtype=np.float64)
+    segments_time = [(float(t_arr[i0]), float(t_arr[i1])) for (i0, i1) in segments_idx]
+    return segments_idx, segments_time, threshold, power_smooth
+
+
 def _mode_segments_from_peak(
     t: np.ndarray,
     freq_grid: np.ndarray,
@@ -216,27 +332,13 @@ def _mode_segments_from_peak(
     power_time = ridge_power
     ridge_valid = mode_valid[ridge_idx, np.arange(t.size)]
 
-    segments_idx: list[tuple[int, int]] = []
-    segments_time: list[tuple[float, float]] = []
-    threshold = float("nan")
-    if np.any(ridge_valid & np.isfinite(power_time)):
-        threshold = float(segment_power_frac) * float(
-            np.nanmax(power_time[ridge_valid & np.isfinite(power_time)])
-        )
-        idx = np.where(ridge_valid & np.isfinite(power_time) & (power_time >= threshold))[0]
-        if idx.size >= min_points_segment:
-            start = int(idx[0])
-            for pos in range(1, idx.size):
-                if idx[pos] != idx[pos - 1] + 1:
-                    segments_idx.append((start, int(idx[pos - 1])))
-                    start = int(idx[pos])
-            segments_idx.append((start, int(idx[-1])))
-            segments_idx = [
-                (i0, i1)
-                for (i0, i1) in segments_idx
-                if (i1 - i0 + 1) >= min_points_segment
-            ]
-            segments_time = [(float(t[i0]), float(t[i1])) for (i0, i1) in segments_idx]
+    segments_idx, segments_time, threshold, power_time_smooth = _ridge_power_segments(
+        t,
+        power_time,
+        ridge_valid,
+        segment_power_frac=segment_power_frac,
+        min_points_segment=min_points_segment,
+    )
 
     return {
         "mode_rank": int(mode_rank),
@@ -248,6 +350,7 @@ def _mode_segments_from_peak(
         "power_ratio": float(power_ratio),
         "is_wave_like": bool(power_ratio >= power_ratio_thresh) if np.isfinite(power_ratio) else False,
         "power_time": power_time,
+        "power_time_smooth": power_time_smooth,
         "power_threshold": threshold,
         "ridge_periods": ridge_periods,
         "ridge_power": ridge_power,
@@ -433,6 +536,25 @@ def _smooth_positive_periods(periods: np.ndarray) -> np.ndarray:
     return np.asarray(np.convolve(padded, kernel, mode="valid"), dtype=np.float64)
 
 
+def _wavelet_seed_period(
+    ridge_periods: np.ndarray,
+    valid_mask: np.ndarray | None = None,
+) -> float:
+    ridge_smoothed = _smooth_positive_periods(ridge_periods)
+    if ridge_smoothed.size == 0:
+        return float("nan")
+
+    usable = np.isfinite(ridge_smoothed) & (ridge_smoothed > 0.0)
+    if valid_mask is not None:
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        if valid_mask.size != ridge_smoothed.size:
+            raise ValueError("valid_mask must match ridge_periods")
+        usable &= valid_mask
+    if np.count_nonzero(usable) == 0:
+        return float("nan")
+    return float(np.nanmedian(ridge_smoothed[usable]))
+
+
 def fit_wavelet_guided_oscillation(
     t: np.ndarray,
     y: np.ndarray,
@@ -468,73 +590,27 @@ def fit_wavelet_guided_oscillation(
     if t.size == 0 or y.size != t.size:
         raise ValueError("t and y must have the same non-zero length")
 
-    ridge_smoothed = _smooth_positive_periods(ridge_periods)
-    if ridge_smoothed.size != t.size:
-        return fit_sine_with_trend(
-            t,
-            y,
-            period_guess,
-            fit_mask=fit_mask,
-            weights=weights,
-            baseline_degree=baseline_degree,
-        )
-
-    t_centered = t - np.mean(t)
-    valid = np.isfinite(t_centered) & np.isfinite(y)
+    valid = np.isfinite(t) & np.isfinite(y)
     if fit_mask is not None:
         fit_mask = np.asarray(fit_mask, dtype=bool)
         if fit_mask.size != t.size:
             raise ValueError("fit_mask must match t and y")
         valid &= fit_mask
-    baseline_degree = max(int(baseline_degree), 0)
-    min_required = baseline_degree + 3
-    if np.count_nonzero(valid) < min_required:
-        raise ValueError(f"at least {min_required} valid samples are required")
 
-    weights_arr = None
-    if weights is not None:
-        weights_arr = np.asarray(weights, dtype=np.float64)
-        if weights_arr.size != t.size:
-            raise ValueError("weights must match t and y")
-        positive = np.isfinite(weights_arr[valid]) & (weights_arr[valid] > 0.0)
-        if np.count_nonzero(positive) < min_required:
-            raise ValueError(f"at least {min_required} positively weighted samples are required")
+    seed_period = _wavelet_seed_period(ridge_periods, valid_mask=valid)
+    if not np.isfinite(seed_period) or seed_period <= 0.0:
+        seed_period = float(period_guess)
 
-    omega_inst = 2.0 * np.pi / np.maximum(ridge_smoothed, 1e-12)
-    dt = np.diff(t)
-    phase = np.zeros_like(t_centered, dtype=np.float64)
-    if t.size > 1:
-        phase[1:] = np.cumsum(
-            0.5 * (omega_inst[1:] + omega_inst[:-1]) * np.where(np.isfinite(dt), dt, 0.0)
-        )
-    phase -= float(np.nanmean(phase[valid]))
-
-    basis = [
-        np.sin(phase),
-        np.cos(phase),
-    ]
-    basis.extend(t_centered**power for power in range(baseline_degree + 1))
-    design = np.column_stack(basis)
-    design_fit = design[valid]
-    y_fit = y[valid]
-    if weights_arr is not None:
-        w_fit = weights_arr[valid]
-        positive = np.isfinite(w_fit) & (w_fit > 0.0)
-        scale = np.sqrt(w_fit[positive])[:, None]
-        beta, _, _, _ = np.linalg.lstsq(
-            design_fit[positive] * scale,
-            y_fit[positive] * scale[:, 0],
-            rcond=None,
-        )
-    else:
-        beta, _, _, _ = np.linalg.lstsq(design_fit, y_fit, rcond=None)
-    y_model = design @ beta
-    amp = float(np.hypot(beta[0], beta[1]))
-    fit_period = float(np.nanmedian(ridge_smoothed[valid]))
-    omega = float(2.0 * np.pi / fit_period) if np.isfinite(fit_period) and fit_period > 0.0 else float(
-        2.0 * np.pi / max(float(period_guess), 1e-12)
+    # Use the wavelet ridge only as a period seed; the final model is a simple
+    # sinusoid with at least a linear trend over the selected segment.
+    return fit_sine_with_trend(
+        t,
+        y,
+        seed_period,
+        fit_mask=fit_mask,
+        weights=weights,
+        baseline_degree=max(int(baseline_degree), 1),
     )
-    return y_model, amp, omega
 
 
 def compute_segment_physical_params(
@@ -822,21 +898,48 @@ def _candidate_decision(
     rms_amp_ratio: float,
     rms_amp_ratio_max: float,
     point_count: int,
+    duration_s: float = float("nan"),
+    peak_period_s: float = float("nan"),
 ) -> tuple[bool, str, list[str]]:
     if not has_segment:
         return False, "no wavelet segment", []
     if point_count < 3:
         return False, "too few points", []
+    if np.isfinite(min_amp_arcsec) and min_amp_arcsec > 0.0:
+        if (not np.isfinite(amp_arcsec)) or amp_arcsec < min_amp_arcsec:
+            return False, "low amplitude", []
 
     warnings: list[str] = []
     soft_power_floor = max(float(power_ratio_thresh) * 0.8, 1.15)
+    hard_power_floor = 0.45
+    strong_fit_support = (
+        point_count >= 8
+        and np.isfinite(duration_s)
+        and np.isfinite(peak_period_s)
+        and peak_period_s > 0.0
+        and (duration_s / peak_period_s) >= 0.75
+        and np.isfinite(amp_arcsec)
+        and (
+            (not np.isfinite(min_amp_arcsec))
+            or min_amp_arcsec <= 0.0
+            or amp_arcsec >= min_amp_arcsec
+        )
+        and np.isfinite(rms_amp_ratio)
+        and np.isfinite(rms_amp_ratio_max)
+        and rms_amp_ratio_max > 0.0
+        and rms_amp_ratio <= (0.8 * rms_amp_ratio_max)
+    )
     if (not np.isfinite(power_ratio)) or power_ratio < soft_power_floor:
-        return False, "low power ratio", warnings
+        if (
+            np.isfinite(power_ratio)
+            and power_ratio >= hard_power_floor
+            and strong_fit_support
+        ):
+            warnings.append("low power ratio")
+        else:
+            return False, "low power ratio", warnings
     if (not is_wave_like) or power_ratio < power_ratio_thresh:
         warnings.append("borderline power ratio")
-    if np.isfinite(min_amp_arcsec) and min_amp_arcsec > 0.0:
-        if (not np.isfinite(amp_arcsec)) or amp_arcsec < min_amp_arcsec:
-            warnings.append("low amplitude")
     if (
         np.isfinite(rms_amp_ratio)
         and np.isfinite(rms_amp_ratio_max)
@@ -1098,6 +1201,8 @@ def analyze_tracked_segment_with_wavelet(
                 rms_amp_ratio=rms_amp_ratio,
                 rms_amp_ratio_max=rms_amp_ratio_max,
                 point_count=fit_point_count,
+                duration_s=duration_s,
+                peak_period_s=mode_peak_period,
             )
             decision_warnings.extend(hard_warnings)
             if decision_warnings:
@@ -1118,7 +1223,7 @@ def analyze_tracked_segment_with_wavelet(
                     "span_amp_arcsec": float(span_amp_arcsec),
                     "amplitude_method": "fit",
                     "fit_model": (
-                        "wavelet-guided"
+                        "wavelet-seeded-sine"
                         if wave_ridge_periods.size == wave_t_s.size
                         else "sine"
                     ),

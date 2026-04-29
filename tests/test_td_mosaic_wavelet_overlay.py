@@ -39,6 +39,121 @@ class _FakeAxis:
 
 
 class TDMosaicWaveletOverlayTests(unittest.TestCase):
+    def test_hidden_advanced_wavelet_filters_no_longer_apply_from_stale_state(self) -> None:
+        app = TDMosaicApp.__new__(TDMosaicApp)
+        app.nt = 8
+        app.panels = []
+        app.cuts = {}
+        app.td_windows = {}
+        app.panel_analysis_state = {
+            3: {
+                "wavelet_advanced_filters": {
+                    "qa": "clean",
+                    "score_min": "95",
+                    "period_min": "20",
+                }
+            }
+        }
+
+        filters = app._td_window_wavelet_advanced_filter_values(3)
+
+        self.assertEqual(filters["qa"], "all")
+        self.assertEqual(filters["locked"], "all")
+        self.assertEqual(filters["linked"], "all")
+        self.assertTrue(np.isnan(filters["score_min"]))
+        self.assertTrue(np.isnan(filters["period_min"]))
+
+    def test_best_wavelet_segment_prefers_cleaner_fit_over_higher_power_ratio(self) -> None:
+        app = TDMosaicApp.__new__(TDMosaicApp)
+        params = {
+            "power_ratio_thresh": 1.75,
+            "min_points_segment": 5,
+            "rms_amp_ratio_max": 1.1,
+        }
+        cleaner = {
+            "accepted": True,
+            "power_ratio": 2.4,
+            "duration_s": 42.0,
+            "peak_period_s": 18.0,
+            "fit_amp_arcsec": 0.055,
+            "fit_rms_over_amp": 0.22,
+            "fit_point_count": 11,
+            "mode_rank": 1,
+        }
+        noisier = {
+            "accepted": True,
+            "power_ratio": 3.9,
+            "duration_s": 42.0,
+            "peak_period_s": 18.0,
+            "fit_amp_arcsec": 0.055,
+            "fit_rms_over_amp": 1.05,
+            "fit_point_count": 11,
+            "mode_rank": 0,
+        }
+
+        best = app._best_wavelet_segment([noisier, cleaner], params=params)
+
+        self.assertIs(best, cleaner)
+
+    def test_wavelet_rerun_replaces_previous_events_instead_of_appending(self) -> None:
+        app = TDMosaicApp.__new__(TDMosaicApp)
+        app.panels = []
+        app.td_windows = {}
+        app.panel_analysis_state = {
+            3: {
+                "wavelet_filter_result": {"segment_count": 4},
+                "wavelet_events": [
+                    {
+                        "event_id": 7,
+                        "review_locked": True,
+                        "analysis": {
+                            "thread_index": 9,
+                            "seg_id": 9,
+                            "wseg_id": 9,
+                        },
+                    }
+                ],
+                "wavelet_next_event_id": 8,
+                "wavelet_selected_event_id": 7,
+            }
+        }
+        app._record_session_change = lambda: None
+        app._set_status = lambda _text: None
+        params = {
+            "power_ratio_thresh": 1.75,
+            "min_points_segment": 3,
+            "rms_amp_ratio_max": 1.1,
+        }
+        segment = {
+            "thread_index": 0,
+            "seg_id": 0,
+            "wseg_id": 1,
+            "accepted": True,
+            "has_segment": True,
+            "mode_rank": 0,
+            "duration_s": 24.0,
+            "peak_period_s": 12.0,
+            "fit_amp_arcsec": 0.05,
+            "fit_amp_km": 36.0,
+            "fit_rms_over_amp": 0.25,
+            "power_ratio": 2.2,
+            "freq_mhz": 83.3,
+            "velocity_amp_km_s": 1.4,
+            "source_t_idx": np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64),
+            "source_y_idx": np.array([0.0, 0.8, 0.1, -0.7], dtype=np.float64),
+            "wave_t_idx": np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64),
+            "wave_y_idx": np.array([0.0, 0.8, 0.1, -0.7], dtype=np.float64),
+        }
+
+        app._apply_background_wavelet_results(3, [segment], params, "P3")
+
+        state = app.panel_analysis_state[3]
+        self.assertEqual(len(state["wavelet_events"]), 1)
+        self.assertEqual(state["wavelet_events"][0]["event_id"], 1)
+        self.assertFalse(state["wavelet_events"][0]["review_locked"])
+        self.assertEqual(state["wavelet_next_event_id"], 2)
+        self.assertEqual(state["wavelet_selected_event_id"], 1)
+
     def test_overlay_segment_uses_wave_points_when_available(self) -> None:
         app = TDMosaicApp.__new__(TDMosaicApp)
         event = {

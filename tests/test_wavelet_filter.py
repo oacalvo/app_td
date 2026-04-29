@@ -8,6 +8,7 @@ from app_code.td_wavelet_filter import (
     DEFAULT_WAVELET_FILTER,
     _candidate_decision,
     _apply_detrend,
+    _ridge_power_segments,
     analyze_tracked_segment_with_wavelet,
     fit_sine_with_trend,
     fit_wavelet_guided_oscillation,
@@ -15,6 +16,30 @@ from app_code.td_wavelet_filter import (
 
 
 class WaveletFilterTests(unittest.TestCase):
+    def test_ridge_power_segments_ignore_isolated_spike_when_cutting_segment(self) -> None:
+        t_idx = np.arange(24, dtype=np.float64)
+        ridge_power = np.full(t_idx.shape, 0.45, dtype=np.float64)
+        ridge_power[6:18] = 4.0
+        ridge_power[11] = 20.0
+        ridge_valid = np.ones(t_idx.shape, dtype=bool)
+
+        segments_idx, segments_time, threshold, power_smooth = _ridge_power_segments(
+            t_idx,
+            ridge_power,
+            ridge_valid,
+            segment_power_frac=DEFAULT_WAVELET_FILTER["segment_power_frac"],
+            min_points_segment=5,
+        )
+
+        self.assertEqual(len(segments_idx), 1)
+        start, end = segments_idx[0]
+        self.assertLessEqual(start, 7)
+        self.assertGreaterEqual(end, 16)
+        self.assertEqual(segments_time[0], (float(t_idx[start]), float(t_idx[end])))
+        self.assertTrue(np.isfinite(threshold))
+        self.assertLess(threshold, 4.0)
+        self.assertLess(float(np.nanmax(power_smooth)), 10.0)
+
     def test_candidate_rejects_only_when_support_or_power_is_too_low(self) -> None:
         accepted, reason, warnings = _candidate_decision(
             has_segment=True,
@@ -32,7 +57,7 @@ class WaveletFilterTests(unittest.TestCase):
         self.assertEqual(reason, "low power ratio")
         self.assertEqual(warnings, [])
 
-    def test_candidate_keeps_low_amplitude_and_residual_as_warnings(self) -> None:
+    def test_candidate_rejects_low_amplitude_even_with_good_power(self) -> None:
         accepted, reason, warnings = _candidate_decision(
             has_segment=True,
             is_wave_like=True,
@@ -45,10 +70,9 @@ class WaveletFilterTests(unittest.TestCase):
             point_count=18,
         )
 
-        self.assertTrue(accepted)
-        self.assertEqual(reason, "accepted")
-        self.assertIn("low amplitude", warnings)
-        self.assertIn("high fit residual", warnings)
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "low amplitude")
+        self.assertEqual(warnings, [])
 
     def test_candidate_accepts_borderline_power_with_warning(self) -> None:
         accepted, reason, warnings = _candidate_decision(
@@ -65,6 +89,26 @@ class WaveletFilterTests(unittest.TestCase):
 
         self.assertTrue(accepted)
         self.assertEqual(reason, "accepted")
+        self.assertIn("borderline power ratio", warnings)
+
+    def test_candidate_keeps_strong_temporal_fit_despite_low_power_ratio(self) -> None:
+        accepted, reason, warnings = _candidate_decision(
+            has_segment=True,
+            is_wave_like=False,
+            power_ratio=0.50,
+            power_ratio_thresh=DEFAULT_WAVELET_FILTER["power_ratio_thresh"],
+            amp_arcsec=0.036,
+            min_amp_arcsec=DEFAULT_WAVELET_FILTER["min_amp_arcsec"],
+            rms_amp_ratio=0.50,
+            rms_amp_ratio_max=DEFAULT_WAVELET_FILTER["rms_amp_ratio_max"],
+            point_count=18,
+            duration_s=28.0,
+            peak_period_s=20.0,
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(reason, "accepted")
+        self.assertIn("low power ratio", warnings)
         self.assertIn("borderline power ratio", warnings)
 
     def test_clear_sine_wave_is_detected_with_default_filter(self) -> None:
@@ -174,34 +218,42 @@ class WaveletFilterTests(unittest.TestCase):
         self.assertGreater(recovered_amp, 1.35)
         self.assertLess(trend_error, 0.20)
 
-    def test_wavelet_guided_oscillation_beats_rigid_sine_for_variable_period(self) -> None:
-        t_idx = np.arange(90, dtype=np.float64)
-        ridge_periods = 16.0 + 8.0 * (t_idx / float(t_idx[-1]))
-        omega_inst = 2.0 * np.pi / ridge_periods
-        phase = np.zeros_like(t_idx)
-        phase[1:] = np.cumsum(0.5 * (omega_inst[1:] + omega_inst[:-1]) * np.diff(t_idx))
-        y_idx = 1.4 * np.sin(phase + 0.35)
+    def test_wavelet_guided_oscillation_uses_ridge_seed_and_linear_trend(self) -> None:
+        rng = np.random.default_rng(29)
+        t_idx = np.arange(60, dtype=np.float64)
+        true_period = 42.0
+        ridge_periods = true_period + 1.5 * np.sin(2.0 * np.pi * t_idx / float(t_idx[-1]))
+        centered = t_idx - np.mean(t_idx)
+        y_idx = (
+            1.6 * np.sin(2.0 * np.pi * centered / true_period + 0.4)
+            + 0.035 * centered
+            + 0.04 * rng.normal(size=t_idx.size)
+        )
 
-        guided_model, guided_amp, _ = fit_wavelet_guided_oscillation(
+        guided_model, guided_amp, guided_omega = fit_wavelet_guided_oscillation(
             t_idx,
             y_idx,
-            float(np.nanmedian(ridge_periods)),
+            14.0,
             ridge_periods=ridge_periods,
             baseline_degree=0,
         )
-        rigid_model, rigid_amp, _ = fit_sine_with_trend(
+        rigid_model, rigid_amp, rigid_omega = fit_sine_with_trend(
             t_idx,
             y_idx,
-            float(np.nanmedian(ridge_periods)),
+            14.0,
             baseline_degree=0,
         )
 
+        guided_period = (2.0 * np.pi) / abs(guided_omega)
+        rigid_period = (2.0 * np.pi) / abs(rigid_omega)
         guided_mse = float(np.mean((y_idx - guided_model) ** 2))
         rigid_mse = float(np.mean((y_idx - rigid_model) ** 2))
 
-        self.assertGreater(guided_amp, 1.0)
-        self.assertGreater(rigid_amp, 0.2)
-        self.assertLess(guided_mse, rigid_mse * 0.35)
+        self.assertGreater(guided_amp, 1.1)
+        self.assertLess(rigid_amp, 0.2)
+        self.assertAlmostEqual(guided_period, true_period, delta=3.0)
+        self.assertLess(rigid_period, 35.5)
+        self.assertLess(guided_mse, rigid_mse * 0.3)
 
 
 if __name__ == "__main__":

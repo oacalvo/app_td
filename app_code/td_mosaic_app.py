@@ -889,6 +889,20 @@ class TDMosaicApp:
             "dynamic_keyframes": {},
         }
 
+    def _default_wavelet_advanced_filters(self) -> dict[str, str]:
+        return {
+            "qa": "all",
+            "locked": "all",
+            "linked": "all",
+            "score_min": "",
+            "period_min": "",
+            "period_max": "",
+            "amp_min": "",
+            "amp_max": "",
+            "energy_min": "",
+            "energy_max": "",
+        }
+
     def _merge_crest_and_wavelet_params(
         self,
         crest_source: dict[str, Any] | None,
@@ -3468,13 +3482,13 @@ class TDMosaicApp:
     def _matching_parameter_preset_name(
         self, crest_params: dict[str, Any], wavelet_params: dict[str, Any]
     ) -> str:
+        _ = crest_params
         for preset_name, preset in PARAMETER_PRESETS.items():
             if preset_name == "custom":
                 continue
             if self._wavelet_params_match_preset(
-                crest_params, dict(DEFAULT_CREST_TRACKING) | dict(preset.get("crest") or {})
-            ) and self._wavelet_params_match_preset(
-                wavelet_params, dict(DEFAULT_WAVELET_FILTER) | dict(preset.get("wavelet") or {})
+                wavelet_params,
+                dict(DEFAULT_WAVELET_FILTER) | dict(preset.get("wavelet") or {}),
             ):
                 return preset_name
         return "custom"
@@ -3606,18 +3620,9 @@ class TDMosaicApp:
             self._set_status(f"Unknown parameter preset '{preset_name}'.")
             return
 
-        crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
-            preset.get("crest"), preset.get("wavelet")
-        )
-
-        existing["crest_cad_var"].set(f"{float(crest_params['cad']):.2f}")
-        existing["crest_res_var"].set(f"{float(crest_params['res']):.2f}")
-        existing["crest_grad_var"].set(f"{float(crest_params['grad']):.2f}")
-        existing["crest_min_tlen_var"].set(str(int(crest_params["min_tlen"])))
-        existing["crest_max_dist_jump_var"].set(str(int(crest_params["max_dist_jump"])))
-        existing["crest_max_time_skip_var"].set(str(int(crest_params["max_time_skip"])))
-        existing["crest_invert_var"].set(bool(crest_params["invert"]))
-        existing["crest_gauss_var"].set(bool(crest_params["gauss"]))
+        crest_params, _current_wavelet_params = self._current_parameter_payloads(panel_id)
+        wavelet_params = dict(DEFAULT_WAVELET_FILTER)
+        wavelet_params.update(dict(preset.get("wavelet") or {}))
 
         existing["wavelet_p_min_var"].set(f"{float(wavelet_params['p_min']):.2f}")
         existing["wavelet_p_max_var"].set(f"{float(wavelet_params['p_max']):.2f}")
@@ -3677,7 +3682,7 @@ class TDMosaicApp:
         state["crest_params"] = dict(crest_params)
         state["wavelet_params"] = dict(wavelet_params)
         self._record_session_change()
-        self._set_status(f"Applied preset '{preset_name}' to {panel.name}.")
+        self._set_status(f"Applied wavelet preset '{preset_name}' to {panel.name}.")
 
     def _apply_td_window_advanced_filters(self, panel_id: int) -> None:
         if panel_id not in self.td_windows:
@@ -3792,18 +3797,7 @@ class TDMosaicApp:
         snapshot["wavelet_events_filter"] = str(
             existing["wavelet_events_filter_var"].get() or "accepted"
         )
-        snapshot["wavelet_advanced_filters"] = {
-            "qa": str(existing["wavelet_filter_qa_var"].get() or "all"),
-            "locked": str(existing["wavelet_filter_locked_var"].get() or "all"),
-            "linked": str(existing["wavelet_filter_linked_var"].get() or "all"),
-            "score_min": str(existing["wavelet_filter_score_min_var"].get()),
-            "period_min": str(existing["wavelet_filter_period_min_var"].get()),
-            "period_max": str(existing["wavelet_filter_period_max_var"].get()),
-            "amp_min": str(existing["wavelet_filter_amp_min_var"].get()),
-            "amp_max": str(existing["wavelet_filter_amp_max_var"].get()),
-            "energy_min": str(existing["wavelet_filter_energy_min_var"].get()),
-            "energy_max": str(existing["wavelet_filter_energy_max_var"].get()),
-        }
+        snapshot["wavelet_advanced_filters"] = self._default_wavelet_advanced_filters()
         snapshot["wavelet_undo_stack"] = self._clone_wavelet_payload(
             existing.get("wavelet_undo_stack") or []
         )
@@ -3848,10 +3842,7 @@ class TDMosaicApp:
         crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
             normalized.get("crest_params"), normalized.get("wavelet_params")
         )
-        advanced_filters = {
-            **dict(default_state["wavelet_advanced_filters"]),
-            **dict(normalized.get("wavelet_advanced_filters") or {}),
-        }
+        advanced_filters = self._default_wavelet_advanced_filters()
         return {
             "td_params": {
                 "t_ini": int(td_params["t_ini"]),
@@ -4305,10 +4296,7 @@ class TDMosaicApp:
             )
             state["crest_params"] = crest_params
             state["wavelet_params"] = wavelet_params
-            state["wavelet_advanced_filters"] = {
-                **dict(self._make_default_panel_analysis_state()["wavelet_advanced_filters"]),
-                **dict(loaded_state.get("wavelet_advanced_filters") or {}),
-            }
+            state["wavelet_advanced_filters"] = self._default_wavelet_advanced_filters()
             for event in state.get("wavelet_events") or []:
                 self._ensure_wavelet_event_fields(event)
                 self._wavelet_event_confidence_details(event)
@@ -4329,10 +4317,7 @@ class TDMosaicApp:
                 )
                 state["crest_params"] = crest_params
                 state["wavelet_params"] = wavelet_params
-                state["wavelet_advanced_filters"] = {
-                    **dict(self._make_default_panel_analysis_state()["wavelet_advanced_filters"]),
-                    **dict(loaded_state.get("wavelet_advanced_filters") or {}),
-                }
+                state["wavelet_advanced_filters"] = self._default_wavelet_advanced_filters()
                 for event in state.get("wavelet_events") or []:
                     self._ensure_wavelet_event_fields(event)
                     self._wavelet_event_confidence_details(event)
@@ -4606,7 +4591,7 @@ class TDMosaicApp:
                 self._update_wavelet_job_widgets(int(job.get("panel_id", 0)))
                 if job["message"]:
                     self._set_status(job["message"])
-            elif job.get("kind") == "batch":
+            elif job.get("kind") == "stack":
                 self._set_status(job["message"])
             return
 
@@ -4631,8 +4616,8 @@ class TDMosaicApp:
                 self.background_jobs.pop(job_id, None)
                 if panel_id:
                     self._update_wavelet_job_widgets(panel_id)
-            elif job.get("kind") == "batch":
-                self._apply_background_batch_results(
+            elif job.get("kind") == "stack":
+                self._apply_background_stack_results(
                     message.get("results") or {},
                     str(message.get("summary", "")),
                 )
@@ -4654,8 +4639,8 @@ class TDMosaicApp:
             if job.get("kind") == "wavelet" and panel_id:
                 self._update_wavelet_job_widgets(panel_id)
                 self._set_status(f"Wavelet background job cancelled for {panel_name}.")
-            elif job.get("kind") == "batch":
-                self._set_status("Batch pipeline cancelled.")
+            elif job.get("kind") == "stack":
+                self._set_status("Stack wavelet run cancelled.")
             elif job.get("kind") == "experiment":
                 experiment_id = int(job.get("experiment_id", 0) or 0)
                 experiment = self.experiments.get(experiment_id)
@@ -4682,8 +4667,8 @@ class TDMosaicApp:
                     self._update_wavelet_job_widgets(panel_id)
                     self._refresh_td_window(panel_id)
                 self._set_status(f"Wavelet filter failed for {panel_name}.")
-            elif job.get("kind") == "batch":
-                self._set_status(f"Batch pipeline failed: {error_text}")
+            elif job.get("kind") == "stack":
+                self._set_status(f"Stack wavelet failed: {error_text}")
             elif job.get("kind") == "experiment":
                 experiment_id = int(job.get("experiment_id", 0) or 0)
                 experiment = self.experiments.get(experiment_id)
@@ -5061,15 +5046,6 @@ class TDMosaicApp:
             f"Cancelling wavelet background job for {job.get('panel_name', f'P{panel_id}')}"
         )
 
-    def _preserved_locked_wavelet_events(self, panel_id: int) -> list[dict[str, Any]]:
-        preserved: list[dict[str, Any]] = []
-        for event in self._panel_wavelet_events_snapshot(panel_id):
-            self._ensure_wavelet_event_fields(event)
-            if bool(event.get("review_locked")):
-                preserved.append(self._clone_wavelet_payload(event))
-        preserved.sort(key=lambda item: int(item.get("event_id", -1)))
-        return preserved
-
     def _apply_background_wavelet_results(
         self,
         panel_id: int,
@@ -5082,57 +5058,29 @@ class TDMosaicApp:
             f"apply_background_wavelet_results start panel={panel_id} segments={len(segments)} warnings={len(warnings or [])}"
         )
         existing = self.td_windows.get(panel_id)
-        warning_messages = [str(item) for item in (warnings or []) if str(item)]
-        preserved_locked_events = self._preserved_locked_wavelet_events(panel_id)
-        filtered_segments = [
-            segment
-            for segment in segments
-            if not any(
-                self._wavelet_segment_matches_locked_event(segment, locked_event)
-                for locked_event in preserved_locked_events
-            )
-        ]
+        payload = self._replacement_wavelet_run_payload(
+            segments,
+            params,
+            warnings=warnings,
+        )
+        filtered_segments = payload["filtered_segments"]
+        events = payload["events"]
+        next_event_id = int(payload["next_event_id"])
+        best_segment = payload["best_segment"]
+        best_event_id = payload["best_event_id"]
+        accepted_count = int(payload["accepted_count"])
+        with_segment_count = int(payload["with_segment_count"])
+        warning_messages = list(payload["warnings"])
         _trace_stack_wavelet(
-            f"apply_background_wavelet_results filtered panel={panel_id} filtered_segments={len(filtered_segments)} preserved_locked={len(preserved_locked_events)}"
+            f"apply_background_wavelet_results filtered panel={panel_id} filtered_segments={len(filtered_segments)}"
         )
-        accepted_count = sum(1 for segment in filtered_segments if segment.get("accepted"))
-        with_segment_count = sum(
-            1 for segment in filtered_segments if segment.get("has_segment")
-        )
-        used_ids = {int(event.get("event_id", -1)) for event in preserved_locked_events}
-        next_event_id = max(used_ids, default=0) + 1
-        events = self._clone_wavelet_payload(preserved_locked_events)
-        for segment in filtered_segments:
-            new_event = self._make_td_window_wavelet_event(next_event_id, segment, params)
-            events.append(new_event)
-            next_event_id += 1
         _trace_stack_wavelet(
             f"apply_background_wavelet_results events_built panel={panel_id} events={len(events)}"
         )
-        best_segment = self._best_wavelet_segment(filtered_segments)
-        best_event_id = None
-        if best_segment is not None:
-            for event in events:
-                analysis = event.get("analysis") or {}
-                if (
-                    int(analysis.get("thread_index", -999)) == int(best_segment.get("thread_index", -1))
-                    and int(analysis.get("seg_id", -999)) == int(best_segment.get("seg_id", -1))
-                    and int(analysis.get("wseg_id", -999)) == int(best_segment.get("wseg_id", -1))
-                ):
-                    best_event_id = int(event["event_id"])
-                    break
 
         state = self._panel_analysis(panel_id)
         _trace_stack_wavelet(f"apply_background_wavelet_results state_assign panel={panel_id}")
-        state["wavelet_filter_result"] = self._lightweight_wavelet_filter_result(
-            segments=filtered_segments,
-            params=params,
-            best_segment=best_segment,
-            preserved_locked_event_ids=[
-                int(event.get("event_id", -1)) for event in preserved_locked_events
-            ],
-            warnings=warning_messages,
-        )
+        state["wavelet_filter_result"] = dict(payload["result"])
         state["wavelet_events"] = self._clone_wavelet_payload(events)
         state["wavelet_next_event_id"] = next_event_id
         state["wavelet_selected_event_id"] = best_event_id or (
@@ -5148,8 +5096,7 @@ class TDMosaicApp:
             existing["wavelet_selected_event_id"] = state["wavelet_selected_event_id"]
             existing["wavelet_summary_var"].set(
                 f"Wavelet accepted {accepted_count}/{len(filtered_segments)} segment(s). "
-                f"Selected by wavelet: {with_segment_count}. "
-                f"Locked preserved: {len(preserved_locked_events)}."
+                f"Selected by wavelet: {with_segment_count}."
                 + (f" Warnings: {len(warning_messages)}." if warning_messages else "")
             )
             self._update_wavelet_job_widgets(panel_id)
@@ -5165,61 +5112,82 @@ class TDMosaicApp:
             + (f" First warning: {warning_messages[0]}" if warning_messages else "")
         )
 
-    def _run_batch_pipeline(self) -> None:
+    def _run_stack_wavelet(self) -> None:
         for job in self.background_jobs.values():
-            if job.get("kind") in {"batch", "wavelet"}:
+            if job.get("kind") in {"stack", "wavelet", "experiment"}:
                 self._set_status(
-                    "Wait for the current background wavelet/batch job to finish first."
+                    "Wait for the current background wavelet/stack/study job to finish first."
                 )
                 return
 
         self._sync_all_panel_analysis_state_from_windows()
-        panel_specs: list[dict[str, Any]] = []
-        for panel in self.panels:
-            if panel.cut_id is None or panel.cut_id not in self.cuts:
-                continue
-            cut = self.cuts[panel.cut_id]
-            state = self._panel_analysis_snapshot(panel.panel_id)
-            crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
-                state.get("crest_params"), state.get("wavelet_params")
-            )
-            panel_specs.append(
+        stack = self._selected_stack()
+        if stack is None:
+            self._set_status("Select a stack first.")
+            return
+        cut_ids = self._selected_stack_cut_ids()
+        if not cut_ids:
+            self._set_status(f"{stack['name']} has no valid cuts.")
+            return
+        template_cut_id = self._stack_template_cut_id(cut_ids)
+        if template_cut_id is None or template_cut_id not in self.cuts:
+            self._set_status("Could not resolve a template cut for the selected stack.")
+            return
+
+        template_state = self._cut_analysis_snapshot(template_cut_id)
+        td_params = dict(self._cut_td_params(template_cut_id))
+        crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
+            template_state.get("crest_params"),
+            template_state.get("wavelet_params"),
+        )
+        template_cut = self.cuts[int(template_cut_id)]
+        if not self.messagebox.askyesno(
+            "Run Stack Wavelet",
+            f"Run NUWT + Wavelet for all {len(cut_ids)} cut(s) in stack '{stack['name']}' "
+            f"using the parameters from '{template_cut.name}'?\n\n"
+            "This will replace existing wavelet events and crest tracking results in those cuts.",
+            parent=self.root,
+        ):
+            return
+
+        cut_specs: list[dict[str, Any]] = []
+        for cut_id in cut_ids:
+            cut = self.cuts[int(cut_id)]
+            cut_specs.append(
                 {
-                    "panel_id": panel.panel_id,
-                    "panel_name": panel.name,
-                    "cut_id": cut.cut_id,
-                    "cut_name": cut.name,
+                    "cut_id": int(cut.cut_id),
+                    "cut_name": str(cut.name),
                     "cut_p0": [float(cut.p0[0]), float(cut.p0[1])],
                     "cut_p1": [float(cut.p1[0]), float(cut.p1[1])],
-                    "t_ini": int(panel.t_ini),
-                    "t_fin": int(panel.t_fin),
-                    "stride": int(panel.stride),
-                    "width": int(panel.width),
-                    "weighting": str(panel.weighting),
-                    "crest_params": crest_params,
-                    "wavelet_params": wavelet_params,
+                    "td_params": dict(td_params),
+                    "crest_params": dict(crest_params),
+                    "wavelet_params": dict(wavelet_params),
                 }
             )
 
-        if not panel_specs:
-            self._set_status("Assign at least one cut to a panel before running batch mode.")
-            return
-
-        job_id, job = self._new_background_job(kind="batch", panel_name="batch")
-        job["message"] = f"Queued batch pipeline for {len(panel_specs)} panel(s)."
+        job_id, job = self._new_background_job(kind="stack", panel_name="stack")
+        job["stack_id"] = int(stack["stack_id"])
+        job["stack_name"] = str(stack["name"])
+        job["template_cut_id"] = int(template_cut_id)
+        job["message"] = (
+            f"{stack['name']}: queued stack wavelet run for {len(cut_specs)} cut(s) "
+            f"using {template_cut.name}."
+        )
         thread = threading.Thread(
-            target=self._batch_pipeline_worker,
-            args=(job_id, panel_specs, job["cancel_event"]),
+            target=self._stack_wavelet_worker,
+            args=(job_id, cut_specs, job["cancel_event"]),
             daemon=True,
         )
         job["thread"] = thread
         thread.start()
-        self._set_status(f"Running batch pipeline for {len(panel_specs)} panel(s)...")
+        self._set_status(
+            f"Running stack wavelet for {stack['name']} ({len(cut_specs)} cut(s), template={template_cut.name})..."
+        )
 
-    def _batch_pipeline_worker(
+    def _stack_wavelet_worker(
         self,
         job_id: str,
-        panel_specs: list[dict[str, Any]],
+        cut_specs: list[dict[str, Any]],
         cancel_event: threading.Event,
     ) -> None:
         nuwt_api, nuwt_error = load_local_nuwt_api()
@@ -5237,9 +5205,9 @@ class TDMosaicApp:
             return
 
         results: dict[str, Any] = {}
-        total = max(len(panel_specs), 1)
+        total = max(len(cut_specs), 1)
         try:
-            for index, spec in enumerate(panel_specs, start=1):
+            for index, spec in enumerate(cut_specs, start=1):
                 if cancel_event.is_set():
                     self.background_queue.put({"type": "cancelled", "job_id": job_id})
                     return
@@ -5253,16 +5221,16 @@ class TDMosaicApp:
                 td, meta = compute_td(
                     self.cube,
                     cut,
-                    int(spec["t_ini"]),
-                    int(spec["t_fin"]),
-                    int(spec["stride"]),
-                    int(spec["width"]),
-                    str(spec["weighting"]),
+                    int(spec["td_params"]["t_ini"]),
+                    int(spec["td_params"]["t_fin"]),
+                    int(spec["td_params"]["stride"]),
+                    int(spec["td_params"]["width"]),
+                    str(spec["td_params"]["weighting"]),
                 )
                 td_nuwt = np.asarray(td, dtype=np.float64).T
                 finite = np.isfinite(td_nuwt)
                 if not np.any(finite):
-                    raise ValueError(f"{spec['panel_name']} has no finite TD values.")
+                    raise ValueError(f"{spec['cut_name']} has no finite TD values.")
                 fill_value = float(np.nanmin(td_nuwt[finite]))
                 if not np.all(finite):
                     td_nuwt = np.where(finite, td_nuwt, fill_value)
@@ -5307,7 +5275,9 @@ class TDMosaicApp:
                 located_count = int(np.count_nonzero(np.asarray(located["errs"]) > 0))
                 thread_count = len(threads)
                 longest = max((int(th.get("length", 0)) for th in threads), default=0)
-                results[str(spec["panel_id"])] = {
+                results[str(spec["cut_id"])] = {
+                    "td_params": dict(spec["td_params"]),
+                    "crest_params": dict(crest_params),
                     "crest_tracking_result": {
                         "located": located,
                         "threads": threads,
@@ -5319,11 +5289,11 @@ class TDMosaicApp:
                         round(float(spec["cut_p0"][1]), 3),
                         round(float(spec["cut_p1"][0]), 3),
                         round(float(spec["cut_p1"][1]), 3),
-                        int(spec["t_ini"]),
-                        int(spec["t_fin"]),
-                        int(spec["stride"]),
-                        int(spec["width"]),
-                        str(spec["weighting"]),
+                        int(spec["td_params"]["t_ini"]),
+                        int(spec["td_params"]["t_fin"]),
+                        int(spec["td_params"]["stride"]),
+                        int(spec["td_params"]["width"]),
+                        str(spec["td_params"]["weighting"]),
                     ),
                     "crest_summary": (
                         f"Located {located_count} crest bins. "
@@ -5340,10 +5310,10 @@ class TDMosaicApp:
                     {
                         "type": "progress",
                         "job_id": job_id,
-                        "stage": "batch",
+                        "stage": "stack",
                         "current": index,
                         "total": total,
-                        "message": f"Batch pipeline: {spec['panel_name']} ({index}/{total})",
+                        "message": f"Stack wavelet: {spec['cut_name']} ({index}/{total})",
                     }
                 )
         except Exception as exc:
@@ -5361,72 +5331,59 @@ class TDMosaicApp:
                 "type": "done",
                 "job_id": job_id,
                 "results": results,
-                "summary": f"Batch pipeline completed for {len(panel_specs)} panel(s).",
+                "summary": f"Stack wavelet completed for {len(cut_specs)} cut(s).",
             }
         )
 
-    def _apply_background_batch_results(
+    def _apply_background_stack_results(
         self, results: dict[str, Any], summary: str
     ) -> None:
-        for panel_id_text, payload in results.items():
-            panel_id = int(panel_id_text)
-            state = self._panel_analysis(panel_id)
+        for cut_id_text, payload in results.items():
+            cut_id = int(cut_id_text)
+            if cut_id not in self.cuts:
+                continue
+            state = self._cut_analysis(cut_id)
+            state["td_cache_key"] = None
+            state["td_cache_td"] = None
+            state["td_cache_meta"] = None
+            state["td_params"] = dict(payload.get("td_params") or state.get("td_params") or {})
+            self._sync_panels_from_cut_td_params(cut_id)
+            crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
+                payload.get("crest_params"),
+                payload.get("wavelet_params"),
+            )
+            state["crest_params"] = dict(crest_params)
+            state["wavelet_params"] = dict(wavelet_params)
             state["crest_tracking_result"] = self._clone_wavelet_payload(
                 payload.get("crest_tracking_result")
             )
             state["crest_tracking_td_key"] = self._clone_wavelet_payload(
                 payload.get("crest_tracking_td_key")
             )
-            params = dict(payload.get("wavelet_params") or {})
-            segments = payload.get("wavelet_segments") or []
-            preserved_locked_events = self._preserved_locked_wavelet_events(panel_id)
-            filtered_segments = [
-                segment
-                for segment in segments
-                if not any(
-                    self._wavelet_segment_matches_locked_event(segment, locked_event)
-                    for locked_event in preserved_locked_events
-                )
-            ]
-            used_ids = {
-                int(event.get("event_id", -1)) for event in preserved_locked_events
+            params = {
+                "cad": float(crest_params["cad"]),
+                "res": float(crest_params["res"]),
+                **dict(wavelet_params),
             }
-            next_event_id = max(used_ids, default=0) + 1
-            events = self._clone_wavelet_payload(preserved_locked_events)
-            for segment in filtered_segments:
-                events.append(
-                    self._make_td_window_wavelet_event(next_event_id, segment, params)
-                )
-                next_event_id += 1
-            best_segment = self._best_wavelet_segment(filtered_segments)
-            best_event_id = None
-            if best_segment is not None:
-                for event in events:
-                    analysis = event.get("analysis") or {}
-                    if (
-                        int(analysis.get("thread_index", -999)) == int(best_segment.get("thread_index", -1))
-                        and int(analysis.get("seg_id", -999)) == int(best_segment.get("seg_id", -1))
-                        and int(analysis.get("wseg_id", -999)) == int(best_segment.get("wseg_id", -1))
-                    ):
-                        best_event_id = int(event["event_id"])
-                        break
-            state["wavelet_filter_result"] = self._lightweight_wavelet_filter_result(
-                segments=filtered_segments,
-                params=params,
-                best_segment=best_segment,
-                preserved_locked_event_ids=[
-                    int(event.get("event_id", -1)) for event in preserved_locked_events
-                ],
-                warnings=[],
+            run_payload = self._replacement_wavelet_run_payload(
+                payload.get("wavelet_segments") or [],
+                params,
             )
+            filtered_segments = run_payload["filtered_segments"]
+            events = run_payload["events"]
+            next_event_id = int(run_payload["next_event_id"])
+            best_event_id = run_payload["best_event_id"]
             state["wavelet_events"] = self._clone_wavelet_payload(events)
             state["wavelet_next_event_id"] = next_event_id
+            state["wavelet_filter_result"] = dict(run_payload["result"])
             state["wavelet_selected_event_id"] = best_event_id or (
                 int(events[0]["event_id"]) if events else None
             )
 
-            existing = self.td_windows.get(panel_id)
-            if existing is not None:
+            for panel in self._panels_for_cut(cut_id):
+                existing = self.td_windows.get(panel.panel_id)
+                if existing is None:
+                    continue
                 existing["crest_tracking_result"] = self._clone_wavelet_payload(
                     state["crest_tracking_result"]
                 )
@@ -5440,22 +5397,15 @@ class TDMosaicApp:
                 existing["crest_summary_var"].set(
                     str(payload.get("crest_summary", "Crest tracking completed."))
                 )
-                accepted_count = sum(
-                    1 for segment in filtered_segments if segment.get("accepted")
-                )
-                with_segment_count = sum(
-                    1 for segment in filtered_segments if segment.get("has_segment")
-                )
                 existing["wavelet_summary_var"].set(
-                    f"Wavelet accepted {accepted_count}/{len(filtered_segments)} segment(s). "
-                    f"Selected by wavelet: {with_segment_count}. "
-                    f"Locked preserved: {len(preserved_locked_events)}."
+                    f"Wavelet accepted {int(run_payload['accepted_count'])}/{len(filtered_segments)} segment(s). "
+                    f"Selected by wavelet: {int(run_payload['with_segment_count'])}."
                 )
-                self._refresh_td_window_wavelet_views(panel_id, redraw_td=True)
+                self._refresh_td_window(panel.panel_id)
 
         self._record_session_change()
         self.refresh_td_views()
-        self._set_status(summary or "Batch pipeline completed.")
+        self._set_status(summary or "Stack wavelet run completed.")
 
     def _run_selected_experiment(self) -> None:
         _existing_job_id, existing_job = self._background_experiment_job()
@@ -5464,8 +5414,8 @@ class TDMosaicApp:
             self._update_experiment_job_widgets()
             return
         for job in self.background_jobs.values():
-            if job.get("kind") in {"batch", "wavelet"}:
-                self._set_status("Wait for the current batch/wavelet job to finish first.")
+            if job.get("kind") in {"stack", "wavelet"}:
+                self._set_status("Wait for the current stack/wavelet job to finish first.")
                 return
 
         experiment = self._selected_experiment()
@@ -5904,15 +5854,6 @@ class TDMosaicApp:
                 }
             )
 
-    def _preserved_locked_wavelet_events_for_cut(self, cut_id: int) -> list[dict[str, Any]]:
-        preserved: list[dict[str, Any]] = []
-        for event in self._cut_analysis(cut_id).get("wavelet_events") or []:
-            self._ensure_wavelet_event_fields(event)
-            if bool(event.get("review_locked")):
-                preserved.append(self._clone_wavelet_payload(event))
-        preserved.sort(key=lambda item: int(item.get("event_id", -1)))
-        return preserved
-
     def _apply_background_experiment_cell_result(self, payload: dict[str, Any]) -> None:
         experiment_id = int(payload.get("experiment_id", 0) or 0)
         cut_id = int(payload.get("cut_id", 0) or 0)
@@ -5930,47 +5871,15 @@ class TDMosaicApp:
             payload.get("crest_tracking_td_key")
         )
         params = dict(payload.get("wavelet_params") or {})
-        segments = payload.get("wavelet_segments") or []
-        preserved_locked_events = self._preserved_locked_wavelet_events_for_cut(cut_id)
-        filtered_segments = [
-            segment
-            for segment in segments
-            if not any(
-                self._wavelet_segment_matches_locked_event(segment, locked_event)
-                for locked_event in preserved_locked_events
-            )
-        ]
-        used_ids = {
-            int(event.get("event_id", -1)) for event in preserved_locked_events
-        }
-        next_event_id = max(used_ids, default=0) + 1
-        events = self._clone_wavelet_payload(preserved_locked_events)
-        for segment in filtered_segments:
-            events.append(
-                self._make_td_window_wavelet_event(next_event_id, segment, params)
-            )
-            next_event_id += 1
-        best_segment = self._best_wavelet_segment(filtered_segments)
-        best_event_id = None
-        if best_segment is not None:
-            for event in events:
-                analysis = event.get("analysis") or {}
-                if (
-                    int(analysis.get("thread_index", -999)) == int(best_segment.get("thread_index", -1))
-                    and int(analysis.get("seg_id", -999)) == int(best_segment.get("seg_id", -1))
-                    and int(analysis.get("wseg_id", -999)) == int(best_segment.get("wseg_id", -1))
-                ):
-                    best_event_id = int(event["event_id"])
-                    break
-        state["wavelet_filter_result"] = self._lightweight_wavelet_filter_result(
-            segments=filtered_segments,
-            params=params,
-            best_segment=best_segment,
-            preserved_locked_event_ids=[
-                int(event.get("event_id", -1)) for event in preserved_locked_events
-            ],
-            warnings=[],
+        run_payload = self._replacement_wavelet_run_payload(
+            payload.get("wavelet_segments") or [],
+            params,
         )
+        filtered_segments = run_payload["filtered_segments"]
+        events = run_payload["events"]
+        next_event_id = int(run_payload["next_event_id"])
+        best_event_id = run_payload["best_event_id"]
+        state["wavelet_filter_result"] = dict(run_payload["result"])
         state["wavelet_events"] = self._clone_wavelet_payload(events)
         state["wavelet_next_event_id"] = next_event_id
         state["wavelet_selected_event_id"] = best_event_id or (
@@ -9887,7 +9796,6 @@ class TDMosaicApp:
             ("Export Report", self._export_curated_report),
             ("Link Groups", self._open_link_groups_window),
             ("Propagation", self._open_propagation_window),
-            ("Batch Pipeline", self._run_batch_pipeline),
             ("Saved FITS", self._open_saved_fits_browser),
             ("Open Cube", self._choose_input_cube_and_restart),
         ]
@@ -10576,6 +10484,9 @@ class TDMosaicApp:
         self.ttk.Button(
             stack_button_row, text="Delete", command=self._delete_selected_stack
         ).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
+        self.ttk.Button(
+            stack_button_row, text="Run Stack", command=self._run_stack_wavelet
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         members_box = self.ttk.LabelFrame(
             self.sidebar_stacks_tab, text="Stack Members", padding=8
@@ -11656,6 +11567,32 @@ class TDMosaicApp:
             self._set_status(f"{stack['name']} already contains all cuts.")
         else:
             self._set_status(f"Added {added} cut(s) to {stack['name']}.")
+
+    def _selected_stack_cut_ids(self) -> list[int]:
+        stack = self._selected_stack()
+        if stack is None:
+            return []
+        cut_ids = [
+            int(cut_id)
+            for cut_id in (stack.get("cut_ids") or [])
+            if int(cut_id) in self.cuts
+        ]
+        stack["cut_ids"] = cut_ids
+        return cut_ids
+
+    def _stack_template_cut_id(self, cut_ids: list[int]) -> int | None:
+        normalized = [int(cut_id) for cut_id in cut_ids if int(cut_id) in self.cuts]
+        if not normalized:
+            return None
+        preferred = [
+            self.selected_stack_cut_id,
+            self.selected_cut_id,
+            self.active_panel.cut_id if getattr(self, "panels", None) else None,
+        ]
+        for candidate in preferred:
+            if candidate is not None and int(candidate) in normalized:
+                return int(candidate)
+        return int(normalized[0])
 
     def _remove_selected_cut_from_stack(self) -> None:
         stack = self._selected_stack()
@@ -14285,6 +14222,64 @@ class TDMosaicApp:
         score, _label = self._wavelet_event_confidence_details(event)
         return score
 
+    def _wavelet_segment_confidence_score(
+        self, segment: dict[str, Any], params: dict[str, Any] | None = None
+    ) -> float:
+        analysis = segment or {}
+        ranking_params = dict(DEFAULT_WAVELET_FILTER)
+        if params:
+            ranking_params.update(params)
+
+        score = 45.0
+        power_ratio = float(analysis.get("power_ratio", float("nan")))
+        thresh = max(float(ranking_params.get("power_ratio_thresh", 1.0)), 1e-6)
+        if np.isfinite(power_ratio):
+            score += min(max((power_ratio - thresh) / thresh, 0.0), 2.0) * 15.0
+        point_count = int(
+            analysis.get(
+                "fit_point_count",
+                np.asarray(analysis.get("wave_t_idx", []), dtype=np.float64).size,
+            )
+        )
+        target_points = max(int(ranking_params.get("min_points_segment", 3)), 3)
+        score += min(point_count / target_points, 2.0) * 8.0
+        peak_period = float(analysis.get("peak_period_s", float("nan")))
+        duration = float(analysis.get("duration_s", float("nan")))
+        if np.isfinite(duration) and np.isfinite(peak_period) and peak_period > 0.0:
+            score += min(duration / (2.0 * peak_period), 1.5) * 8.0
+        residual = float(
+            analysis.get(
+                "fit_rms_over_amp",
+                analysis.get("rms_amp_ratio", float("nan")),
+            )
+        )
+        rms_limit = float(ranking_params.get("rms_amp_ratio_max", float("nan")))
+        if np.isfinite(residual):
+            if np.isfinite(rms_limit) and rms_limit > 0.0:
+                score -= min(residual / rms_limit, 2.0) * 20.0
+            else:
+                score -= min(residual, 2.0) * 16.0
+        if not bool(analysis.get("accepted")):
+            score -= 15.0
+
+        warnings = {
+            str(item).strip()
+            for item in (analysis.get("decision_warnings") or [])
+            if str(item).strip()
+        }
+        if "low power ratio" in warnings:
+            score -= 6.0
+        if "borderline power ratio" in warnings:
+            score -= 4.0
+        if "high fit residual" in warnings:
+            score -= 18.0
+        if "segment fit failed" in warnings:
+            score -= 20.0
+        if "fit check unavailable" in warnings:
+            score -= 6.0
+
+        return float(max(0.0, min(100.0, score)))
+
     def _wavelet_event_link_refs(
         self, event: dict[str, Any]
     ) -> list[dict[str, Any]]:
@@ -14399,7 +14394,7 @@ class TDMosaicApp:
         self._set_status(f"Redid wavelet edit for P{panel_id}.")
 
     def _best_wavelet_segment(
-        self, segments: list[dict[str, Any]]
+        self, segments: list[dict[str, Any]], params: dict[str, Any] | None = None
     ) -> dict[str, Any] | None:
         if not segments:
             return None
@@ -14408,9 +14403,11 @@ class TDMosaicApp:
         best = max(
             pool,
             key=lambda segment: (
-                float(segment.get("power_ratio", float("-inf"))),
+                self._wavelet_segment_confidence_score(segment, params),
                 float(segment.get("duration_s", float("-inf"))),
                 float(segment.get("fit_amp_arcsec", float("-inf"))),
+                float(segment.get("power_ratio", float("-inf"))),
+                -float(segment.get("mode_rank", float("inf"))),
             ),
         )
         return best
@@ -14446,6 +14443,56 @@ class TDMosaicApp:
                 int(event_id) for event_id in preserved_locked_event_ids
             ],
             "segments": [],
+        }
+
+    def _replacement_wavelet_run_payload(
+        self,
+        segments: list[dict[str, Any]],
+        params: dict[str, Any],
+        *,
+        warnings: list[str] | None = None,
+    ) -> dict[str, Any]:
+        warning_messages = [str(item) for item in (warnings or []) if str(item)]
+        filtered_segments = [
+            self._clone_wavelet_payload(segment) for segment in (segments or [])
+        ]
+        next_event_id = 1
+        events: list[dict[str, Any]] = []
+        for segment in filtered_segments:
+            events.append(self._make_td_window_wavelet_event(next_event_id, segment, params))
+            next_event_id += 1
+        best_segment = self._best_wavelet_segment(filtered_segments, params=params)
+        best_event_id = None
+        if best_segment is not None:
+            for event in events:
+                analysis = event.get("analysis") or {}
+                if (
+                    int(analysis.get("thread_index", -999)) == int(best_segment.get("thread_index", -1))
+                    and int(analysis.get("seg_id", -999)) == int(best_segment.get("seg_id", -1))
+                    and int(analysis.get("wseg_id", -999)) == int(best_segment.get("wseg_id", -1))
+                ):
+                    best_event_id = int(event["event_id"])
+                    break
+        return {
+            "filtered_segments": filtered_segments,
+            "events": events,
+            "next_event_id": next_event_id,
+            "best_segment": best_segment,
+            "best_event_id": best_event_id,
+            "accepted_count": int(
+                sum(1 for segment in filtered_segments if segment.get("accepted"))
+            ),
+            "with_segment_count": int(
+                sum(1 for segment in filtered_segments if segment.get("has_segment"))
+            ),
+            "result": self._lightweight_wavelet_filter_result(
+                segments=filtered_segments,
+                params=params,
+                best_segment=best_segment,
+                preserved_locked_event_ids=[],
+                warnings=warning_messages,
+            ),
+            "warnings": warning_messages,
         }
 
     def _make_td_window_wavelet_event(
@@ -14957,34 +15004,18 @@ class TDMosaicApp:
     def _td_window_wavelet_advanced_filter_values(
         self, panel_id: int
     ) -> dict[str, Any]:
-        existing = self.td_windows.get(panel_id)
-        if existing is None:
-            values = dict(
-                (self._panel_analysis(panel_id).get("wavelet_advanced_filters") or {})
-            )
-            return {
-                "qa": str(values.get("qa", "all")),
-                "locked": str(values.get("locked", "all")),
-                "linked": str(values.get("linked", "all")),
-                "score_min": self._safe_float_text(values.get("score_min", ""), float("nan")),
-                "period_min": self._safe_float_text(values.get("period_min", ""), float("nan")),
-                "period_max": self._safe_float_text(values.get("period_max", ""), float("nan")),
-                "amp_min": self._safe_float_text(values.get("amp_min", ""), float("nan")),
-                "amp_max": self._safe_float_text(values.get("amp_max", ""), float("nan")),
-                "energy_min": self._safe_float_text(values.get("energy_min", ""), float("nan")),
-                "energy_max": self._safe_float_text(values.get("energy_max", ""), float("nan")),
-            }
+        defaults = self._default_wavelet_advanced_filters()
         return {
-            "qa": str(existing["wavelet_filter_qa_var"].get() or "all"),
-            "locked": str(existing["wavelet_filter_locked_var"].get() or "all"),
-            "linked": str(existing["wavelet_filter_linked_var"].get() or "all"),
-            "score_min": self._safe_float_text(existing["wavelet_filter_score_min_var"].get(), float("nan")),
-            "period_min": self._safe_float_text(existing["wavelet_filter_period_min_var"].get(), float("nan")),
-            "period_max": self._safe_float_text(existing["wavelet_filter_period_max_var"].get(), float("nan")),
-            "amp_min": self._safe_float_text(existing["wavelet_filter_amp_min_var"].get(), float("nan")),
-            "amp_max": self._safe_float_text(existing["wavelet_filter_amp_max_var"].get(), float("nan")),
-            "energy_min": self._safe_float_text(existing["wavelet_filter_energy_min_var"].get(), float("nan")),
-            "energy_max": self._safe_float_text(existing["wavelet_filter_energy_max_var"].get(), float("nan")),
+            "qa": str(defaults["qa"]),
+            "locked": str(defaults["locked"]),
+            "linked": str(defaults["linked"]),
+            "score_min": self._safe_float_text(defaults["score_min"], float("nan")),
+            "period_min": self._safe_float_text(defaults["period_min"], float("nan")),
+            "period_max": self._safe_float_text(defaults["period_max"], float("nan")),
+            "amp_min": self._safe_float_text(defaults["amp_min"], float("nan")),
+            "amp_max": self._safe_float_text(defaults["amp_max"], float("nan")),
+            "energy_min": self._safe_float_text(defaults["energy_min"], float("nan")),
+            "energy_max": self._safe_float_text(defaults["energy_max"], float("nan")),
         }
 
     def _td_window_wavelet_advanced_filter_match(
@@ -15160,7 +15191,10 @@ class TDMosaicApp:
                 f"Wavelet analysis failed for {panel.name}: {type(exc).__name__}: {exc}"
             )
             return None
-        selected = self._best_wavelet_segment(analysis.get("candidates", []))
+        selected = self._best_wavelet_segment(
+            analysis.get("candidates", []),
+            params=params,
+        )
         if selected is None:
             return None
         return {
@@ -15562,8 +15596,9 @@ class TDMosaicApp:
             best_event = max(
                 counted_events,
                 key=lambda event: (
-                    float((event.get("analysis") or {}).get("power_ratio", float("-inf"))),
+                    self._wavelet_event_confidence_score(event),
                     float((event.get("analysis") or {}).get("duration_s", float("-inf"))),
+                    float((event.get("analysis") or {}).get("fit_amp_arcsec", float("-inf"))),
                 ),
             )
             existing["wavelet_physics_var"].set(
@@ -15574,7 +15609,8 @@ class TDMosaicApp:
             )
         else:
             best_segment = self._best_wavelet_segment(
-                [event.get("analysis") or {} for event in events]
+                [event.get("analysis") or {} for event in events],
+                params=params,
             )
             existing["wavelet_physics_var"].set(
                 self._format_wavelet_segment_physics(best_segment, "Best candidate:")
@@ -17285,10 +17321,7 @@ class TDMosaicApp:
         wavelet_events_filter_var = self.tk.StringVar(
             value=str(panel_state.get("wavelet_events_filter", "accepted"))
         )
-        advanced_filters = dict(
-            self._make_default_panel_analysis_state()["wavelet_advanced_filters"]
-        )
-        advanced_filters.update(panel_state.get("wavelet_advanced_filters") or {})
+        advanced_filters = self._default_wavelet_advanced_filters()
         wavelet_filter_qa_var = self.tk.StringVar(
             value=str(advanced_filters.get("qa", "all"))
         )
@@ -17643,7 +17676,9 @@ class TDMosaicApp:
             row=2, column=4, sticky="w", pady=(8, 0)
         )
         wavelet_power_ratio_entry = self.ttk.Entry(
-            wavelet_frame, textvariable=wavelet_power_ratio_var, width=8
+            wavelet_frame,
+            textvariable=wavelet_power_ratio_var,
+            width=8,
         )
         wavelet_power_ratio_entry.grid(
             row=2, column=5, sticky="ew", padx=(6, 8), pady=(8, 0)
@@ -17704,96 +17739,14 @@ class TDMosaicApp:
         wavelet_rms_amp_ratio_entry.grid(
             row=4, column=1, sticky="ew", padx=(6, 8), pady=(8, 0)
         )
-        self.ttk.Label(wavelet_frame, text="km / arcsec").grid(
-            row=4, column=2, sticky="w", pady=(8, 0)
-        )
-        wavelet_km_per_arcsec_entry = self.ttk.Entry(
-            wavelet_frame, textvariable=wavelet_km_per_arcsec_var, width=8
-        )
-        wavelet_km_per_arcsec_entry.grid(
-            row=4, column=3, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
-        self.ttk.Label(wavelet_frame, text="min SNR").grid(
-            row=4, column=4, sticky="w", pady=(8, 0)
-        )
-        wavelet_min_snr_entry = self.ttk.Entry(
-            wavelet_frame, textvariable=wavelet_min_snr_var, width=8
-        )
-        wavelet_min_snr_entry.grid(
-            row=4, column=5, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
-        self.ttk.Label(wavelet_frame, text="min prominence").grid(
-            row=4, column=6, sticky="w", pady=(8, 0)
-        )
-        wavelet_min_prominence_entry = self.ttk.Entry(
-            wavelet_frame, textvariable=wavelet_min_prominence_var, width=8
-        )
-        wavelet_min_prominence_entry.grid(
-            row=4, column=7, sticky="ew", padx=(6, 0), pady=(8, 0)
-        )
 
-        self.ttk.Label(wavelet_frame, text="continuity w").grid(
-            row=5, column=0, sticky="w", pady=(8, 0)
-        )
-        wavelet_continuity_weight_entry = self.ttk.Entry(
-            wavelet_frame, textvariable=wavelet_continuity_weight_var, width=8
-        )
-        wavelet_continuity_weight_entry.grid(
-            row=5, column=1, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
-        self.ttk.Label(wavelet_frame, text="time w").grid(
-            row=5, column=2, sticky="w", pady=(8, 0)
-        )
-        wavelet_time_weight_entry = self.ttk.Entry(
-            wavelet_frame, textvariable=wavelet_time_weight_var, width=8
-        )
-        wavelet_time_weight_entry.grid(
-            row=5, column=3, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
-        self.ttk.Label(wavelet_frame, text="quality w").grid(
-            row=5, column=4, sticky="w", pady=(8, 0)
-        )
-        wavelet_quality_weight_entry = self.ttk.Entry(
-            wavelet_frame, textvariable=wavelet_quality_weight_var, width=8
-        )
-        wavelet_quality_weight_entry.grid(
-            row=5, column=5, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
-        self.ttk.Label(wavelet_frame, text="error w").grid(
-            row=5, column=6, sticky="w", pady=(8, 0)
-        )
-        wavelet_error_weight_entry = self.ttk.Entry(
-            wavelet_frame, textvariable=wavelet_error_weight_var, width=8
-        )
-        wavelet_error_weight_entry.grid(
-            row=5, column=7, sticky="ew", padx=(6, 0), pady=(8, 0)
-        )
-
-        self.ttk.Label(wavelet_frame, text="density [kg/m3]").grid(
-            row=6, column=0, sticky="w", pady=(8, 0)
-        )
-        wavelet_density_entry = self.ttk.Entry(
-            wavelet_frame, textvariable=wavelet_density_var, width=10
-        )
-        wavelet_density_entry.grid(
-            row=6, column=1, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
-        self.ttk.Label(wavelet_frame, text="phase speed [km/s]").grid(
-            row=6, column=2, sticky="w", pady=(8, 0)
-        )
-        wavelet_phase_speed_entry = self.ttk.Entry(
-            wavelet_frame, textvariable=wavelet_phase_speed_var, width=10
-        )
-        wavelet_phase_speed_entry.grid(
-            row=6, column=3, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
         wavelet_run_button = self.ttk.Button(
             wavelet_frame,
             text="Run wavelet filter",
             command=lambda pid=panel_id: self._run_td_window_wavelet_filter(pid),
         )
         wavelet_run_button.grid(
-            row=6, column=4, columnspan=2, sticky="ew", pady=(8, 0), padx=(0, 4)
+            row=4, column=2, columnspan=2, sticky="ew", pady=(8, 0), padx=(4, 4)
         )
         self.ttk.Button(
             wavelet_frame,
@@ -17801,7 +17754,7 @@ class TDMosaicApp:
             command=lambda pid=panel_id: self._clear_td_window_wavelet_filter(
                 pid, refresh=True
             ),
-        ).grid(row=6, column=6, columnspan=2, sticky="ew", pady=(8, 0), padx=(4, 0))
+        ).grid(row=4, column=4, columnspan=2, sticky="ew", pady=(8, 0), padx=4)
         wavelet_cancel_button = self.ttk.Button(
             wavelet_frame,
             text="Cancel",
@@ -17809,67 +17762,17 @@ class TDMosaicApp:
             state="disabled",
         )
         wavelet_cancel_button.grid(
-            row=7, column=4, columnspan=2, sticky="ew", pady=(8, 0), padx=(0, 4)
+            row=4, column=6, columnspan=2, sticky="ew", pady=(8, 0), padx=(4, 0)
         )
         wavelet_progressbar = self.ttk.Progressbar(
             wavelet_frame, mode="determinate", maximum=1.0, value=0.0
         )
         wavelet_progressbar.grid(
-            row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0), padx=(0, 8)
+            row=5, column=0, columnspan=5, sticky="ew", pady=(8, 0), padx=(0, 8)
         )
         self.ttk.Label(
             wavelet_frame, textvariable=wavelet_progress_var, justify="left"
-        ).grid(row=7, column=6, columnspan=2, sticky="w", pady=(8, 0), padx=(4, 0))
-        self.ttk.Label(wavelet_frame, text="Preset").grid(
-            row=8, column=0, sticky="w", pady=(8, 0)
-        )
-        preset_box = self.ttk.Combobox(
-            wavelet_frame,
-            textvariable=preset_var,
-            values=list(PARAMETER_PRESETS.keys()),
-            state="readonly",
-            width=22,
-        )
-        preset_box.grid(row=8, column=1, columnspan=2, sticky="ew", padx=(6, 8), pady=(8, 0))
-        self.ttk.Button(
-            wavelet_frame,
-            text="Apply preset",
-            command=lambda pid=panel_id: self._apply_td_window_parameter_preset(pid),
-        ).grid(row=8, column=3, columnspan=2, sticky="ew", padx=(0, 4), pady=(8, 0))
-        self.ttk.Button(
-            wavelet_frame,
-            text="Export report",
-            command=self._export_curated_report,
-        ).grid(row=8, column=5, columnspan=3, sticky="ew", padx=(4, 0), pady=(8, 0))
-        self.ttk.Label(wavelet_frame, text="Threads").grid(
-            row=9, column=0, sticky="w", pady=(8, 0)
-        )
-        wavelet_thread_filter_entry = self.ttk.Entry(
-            wavelet_frame, textvariable=wavelet_thread_filter_var, width=14
-        )
-        wavelet_thread_filter_entry.grid(
-            row=9, column=1, columnspan=2, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
-        self.ttk.Button(
-            wavelet_frame,
-            text="Use event thread",
-            command=lambda pid=panel_id: self._set_td_window_selected_event_thread_filter(pid),
-        ).grid(row=9, column=3, columnspan=2, sticky="ew", padx=(0, 4), pady=(8, 0))
-        self.ttk.Button(
-            wavelet_frame,
-            text="Thread -> stack",
-            command=lambda pid=panel_id: self._apply_td_window_selected_event_thread_to_stack(pid),
-        ).grid(row=9, column=5, columnspan=3, sticky="ew", padx=(4, 0), pady=(8, 0))
-        self.ttk.Button(
-            wavelet_frame,
-            text="Scatter stats",
-            command=lambda pid=panel_id: self._open_td_window_metrics(pid, "scatter"),
-        ).grid(row=10, column=0, columnspan=4, sticky="ew", padx=(0, 4), pady=(8, 0))
-        self.ttk.Button(
-            wavelet_frame,
-            text="Bar stats",
-            command=lambda pid=panel_id: self._open_td_window_metrics(pid, "bar"),
-        ).grid(row=10, column=4, columnspan=4, sticky="ew", padx=(4, 0), pady=(8, 0))
+        ).grid(row=5, column=5, columnspan=3, sticky="w", pady=(8, 0), padx=(4, 0))
 
         events_frame = self.ttk.LabelFrame(
             edit_frame, text="Wavelet Events", padding=8
@@ -17896,121 +17799,10 @@ class TDMosaicApp:
         )
         wavelet_filter_box.grid(row=0, column=7, sticky="ew", padx=(6, 0))
 
-        advanced_filter_frame = self.ttk.LabelFrame(
-            events_frame, text="Advanced Filter", padding=6
-        )
-        advanced_filter_frame.grid(
-            row=1, column=0, columnspan=8, sticky="ew", pady=(8, 0)
-        )
-        for idx in range(8):
-            advanced_filter_frame.columnconfigure(idx, weight=1)
-        self.ttk.Label(advanced_filter_frame, text="QA").grid(row=0, column=0, sticky="w")
-        wavelet_filter_qa_box = self.ttk.Combobox(
-            advanced_filter_frame,
-            textvariable=wavelet_filter_qa_var,
-            values=["all", "flagged", "clean", "few_points", "period_edge", "high_residual"],
-            state="readonly",
-            width=12,
-        )
-        wavelet_filter_qa_box.grid(row=0, column=1, sticky="ew", padx=(6, 8))
-        self.ttk.Label(advanced_filter_frame, text="Lock").grid(row=0, column=2, sticky="w")
-        wavelet_filter_locked_box = self.ttk.Combobox(
-            advanced_filter_frame,
-            textvariable=wavelet_filter_locked_var,
-            values=["all", "locked", "unlocked"],
-            state="readonly",
-            width=10,
-        )
-        wavelet_filter_locked_box.grid(row=0, column=3, sticky="ew", padx=(6, 8))
-        self.ttk.Label(advanced_filter_frame, text="Link").grid(row=0, column=4, sticky="w")
-        wavelet_filter_linked_box = self.ttk.Combobox(
-            advanced_filter_frame,
-            textvariable=wavelet_filter_linked_var,
-            values=["all", "linked", "unlinked"],
-            state="readonly",
-            width=10,
-        )
-        wavelet_filter_linked_box.grid(row=0, column=5, sticky="ew", padx=(6, 8))
-        self.ttk.Label(advanced_filter_frame, text="score >=").grid(
-            row=0, column=6, sticky="w"
-        )
-        wavelet_filter_score_min_entry = self.ttk.Entry(
-            advanced_filter_frame, textvariable=wavelet_filter_score_min_var, width=8
-        )
-        wavelet_filter_score_min_entry.grid(
-            row=0, column=7, sticky="ew", padx=(6, 0)
-        )
-
-        self.ttk.Label(advanced_filter_frame, text="P min").grid(
-            row=1, column=0, sticky="w", pady=(8, 0)
-        )
-        wavelet_filter_period_min_entry = self.ttk.Entry(
-            advanced_filter_frame, textvariable=wavelet_filter_period_min_var, width=8
-        )
-        wavelet_filter_period_min_entry.grid(
-            row=1, column=1, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
-        self.ttk.Label(advanced_filter_frame, text="P max").grid(
-            row=1, column=2, sticky="w", pady=(8, 0)
-        )
-        wavelet_filter_period_max_entry = self.ttk.Entry(
-            advanced_filter_frame, textvariable=wavelet_filter_period_max_var, width=8
-        )
-        wavelet_filter_period_max_entry.grid(
-            row=1, column=3, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
-        self.ttk.Label(advanced_filter_frame, text="A min").grid(
-            row=1, column=4, sticky="w", pady=(8, 0)
-        )
-        wavelet_filter_amp_min_entry = self.ttk.Entry(
-            advanced_filter_frame, textvariable=wavelet_filter_amp_min_var, width=8
-        )
-        wavelet_filter_amp_min_entry.grid(
-            row=1, column=5, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
-        self.ttk.Label(advanced_filter_frame, text="A max").grid(
-            row=1, column=6, sticky="w", pady=(8, 0)
-        )
-        wavelet_filter_amp_max_entry = self.ttk.Entry(
-            advanced_filter_frame, textvariable=wavelet_filter_amp_max_var, width=8
-        )
-        wavelet_filter_amp_max_entry.grid(
-            row=1, column=7, sticky="ew", padx=(6, 0), pady=(8, 0)
-        )
-
-        self.ttk.Label(advanced_filter_frame, text="E min").grid(
-            row=2, column=0, sticky="w", pady=(8, 0)
-        )
-        wavelet_filter_energy_min_entry = self.ttk.Entry(
-            advanced_filter_frame, textvariable=wavelet_filter_energy_min_var, width=8
-        )
-        wavelet_filter_energy_min_entry.grid(
-            row=2, column=1, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
-        self.ttk.Label(advanced_filter_frame, text="E max").grid(
-            row=2, column=2, sticky="w", pady=(8, 0)
-        )
-        wavelet_filter_energy_max_entry = self.ttk.Entry(
-            advanced_filter_frame, textvariable=wavelet_filter_energy_max_var, width=8
-        )
-        wavelet_filter_energy_max_entry.grid(
-            row=2, column=3, sticky="ew", padx=(6, 8), pady=(8, 0)
-        )
-        self.ttk.Button(
-            advanced_filter_frame,
-            text="Apply filters",
-            command=lambda pid=panel_id: self._apply_td_window_advanced_filters(pid),
-        ).grid(row=2, column=4, columnspan=2, sticky="ew", padx=(4, 4), pady=(8, 0))
-        self.ttk.Button(
-            advanced_filter_frame,
-            text="Clear filters",
-            command=lambda pid=panel_id: self._clear_td_window_advanced_filters(pid),
-        ).grid(row=2, column=6, columnspan=2, sticky="ew", padx=(4, 0), pady=(8, 0))
-
         detail_frame = self.ttk.LabelFrame(
             events_frame, text="Selected event detail", padding=6
         )
-        detail_frame.grid(row=2, column=0, columnspan=8, sticky="ew", pady=(8, 0))
+        detail_frame.grid(row=1, column=0, columnspan=8, sticky="ew", pady=(8, 0))
         detail_frame.rowconfigure(0, weight=1)
         detail_frame.columnconfigure(0, weight=1)
         wavelet_detail_text = self.tk.Text(
@@ -18024,10 +17816,10 @@ class TDMosaicApp:
         wavelet_detail_y.grid(row=0, column=1, sticky="ns")
 
         tree_frame = self.ttk.Frame(events_frame)
-        tree_frame.grid(row=3, column=0, columnspan=8, sticky="nsew", pady=(8, 0))
+        tree_frame.grid(row=2, column=0, columnspan=8, sticky="nsew", pady=(8, 0))
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
-        events_frame.rowconfigure(3, weight=1)
+        events_frame.rowconfigure(2, weight=1)
         wavelet_events_tree = self.ttk.Treeview(
             tree_frame,
             columns=WAVELET_EVENT_TABLE_COLUMNS,
@@ -18060,7 +17852,7 @@ class TDMosaicApp:
         wavelet_events_tree.tag_configure("split_parent", foreground="gray45")
 
         actions_frame = self.ttk.Frame(events_frame)
-        actions_frame.grid(row=4, column=0, columnspan=8, sticky="ew", pady=(8, 0))
+        actions_frame.grid(row=3, column=0, columnspan=8, sticky="ew", pady=(8, 0))
         for idx in range(10):
             actions_frame.columnconfigure(idx, weight=1)
         self.ttk.Button(
@@ -18266,54 +18058,15 @@ class TDMosaicApp:
             wavelet_max_jump_entry,
             wavelet_min_points_cut_entry,
             wavelet_rms_amp_ratio_entry,
-            wavelet_km_per_arcsec_entry,
-            wavelet_density_entry,
-            wavelet_phase_speed_entry,
-            wavelet_min_snr_entry,
-            wavelet_min_prominence_entry,
-            wavelet_continuity_weight_entry,
-            wavelet_time_weight_entry,
-            wavelet_quality_weight_entry,
-            wavelet_error_weight_entry,
         ):
             widget.bind(
                 "<Return>",
                 lambda _event, pid=panel_id: self._run_td_window_wavelet_filter(pid),
             )
-        preset_box.bind(
-            "<<ComboboxSelected>>",
-            lambda _event, pid=panel_id: self._apply_td_window_parameter_preset(pid),
-        )
         wavelet_filter_box.bind(
             "<<ComboboxSelected>>",
             lambda _event, pid=panel_id: self._on_td_window_wavelet_filter_mode_change(pid),
         )
-        for widget in (
-            wavelet_filter_qa_box,
-            wavelet_filter_locked_box,
-            wavelet_filter_linked_box,
-        ):
-            widget.bind(
-                "<<ComboboxSelected>>",
-                lambda _event, pid=panel_id: self._apply_td_window_advanced_filters(pid),
-            )
-        for widget in (
-            wavelet_filter_score_min_entry,
-            wavelet_filter_period_min_entry,
-            wavelet_filter_period_max_entry,
-            wavelet_filter_amp_min_entry,
-            wavelet_filter_amp_max_entry,
-            wavelet_filter_energy_min_entry,
-            wavelet_filter_energy_max_entry,
-        ):
-            widget.bind(
-                "<Return>",
-                lambda _event, pid=panel_id: self._apply_td_window_advanced_filters(pid),
-            )
-            widget.bind(
-                "<FocusOut>",
-                lambda _event, pid=panel_id: self._apply_td_window_advanced_filters(pid),
-            )
         wavelet_events_tree.bind(
             "<<TreeviewSelect>>",
             lambda _event, pid=panel_id: self._on_td_window_wavelet_event_select(pid),
