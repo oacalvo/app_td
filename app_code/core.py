@@ -35,6 +35,15 @@ class Cut:
     p1: tuple[float, float]
     visible: bool = True
     locked: bool = False
+    mode: str = "line"
+    curve_fit: str = "line"
+    curve_points: list[tuple[float, float]] = field(default_factory=list)
+    function_expr: str = ""
+    function_x_start: float = 0.0
+    function_x_end: float = 0.0
+    function_point_count: int = 0
+    function_control_points: list[tuple[float, float]] = field(default_factory=list)
+    function_params: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -116,11 +125,36 @@ def distance(p0: tuple[float, float], p1: tuple[float, float]) -> float:
     return float(math.hypot(p1[0] - p0[0], p1[1] - p0[1]))
 
 
+def cut_polyline_points(cut: Cut) -> list[tuple[float, float]]:
+    if str(getattr(cut, "mode", "line")) == "curve":
+        raw_points = list(getattr(cut, "curve_points", []) or [])
+        normalized: list[tuple[float, float]] = []
+        for point in raw_points:
+            try:
+                normalized.append((float(point[0]), float(point[1])))
+            except Exception:
+                continue
+        if len(normalized) >= 2:
+            return normalized
+    return [
+        (float(cut.p0[0]), float(cut.p0[1])),
+        (float(cut.p1[0]), float(cut.p1[1])),
+    ]
+
+
 def cut_center(cut: Cut) -> tuple[float, float]:
+    points = cut_polyline_points(cut)
+    if len(points) >= 2 and str(getattr(cut, "mode", "line")) == "curve":
+        arc_lengths = polyline_arc_lengths(points)
+        total_length = 0.0 if len(arc_lengths) == 0 else float(arc_lengths[-1])
+        if total_length > 1e-9:
+            return polyline_point_at_length(points, arc_lengths, 0.5 * total_length)
     return ((cut.p0[0] + cut.p1[0]) / 2.0, (cut.p0[1] + cut.p1[1]) / 2.0)
 
 
 def cut_length(cut: Cut) -> float:
+    if str(getattr(cut, "mode", "line")) == "curve":
+        return polyline_length(cut_polyline_points(cut))
     return distance(cut.p0, cut.p1)
 
 
@@ -546,6 +580,79 @@ def line_geometry_from_points(
     return xs, ys, distances, perp, length
 
 
+def sampled_cut_geometry(
+    cut: Cut,
+    *,
+    n_samples: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    if str(getattr(cut, "mode", "line")) != "curve":
+        xs, ys, distances, perp, length = line_geometry(cut)
+        perp_x = np.full(xs.shape, float(perp[0]), dtype=np.float32)
+        perp_y = np.full(xs.shape, float(perp[1]), dtype=np.float32)
+        if n_samples is not None and int(n_samples) != len(xs):
+            p0 = (float(cut.p0[0]), float(cut.p0[1]))
+            p1 = (float(cut.p1[0]), float(cut.p1[1]))
+            xs, ys, distances, perp, length = line_geometry_from_points(
+                p0,
+                p1,
+                n_samples=int(n_samples),
+            )
+            perp_x = np.full(xs.shape, float(perp[0]), dtype=np.float32)
+            perp_y = np.full(xs.shape, float(perp[1]), dtype=np.float32)
+        return xs, ys, distances, perp_x, perp_y, float(length)
+
+    points = cut_polyline_points(cut)
+    if len(points) < 2:
+        raise ValueError("Curved cut is too short; add more points.")
+    arc_lengths = polyline_arc_lengths(points)
+    total_length = 0.0 if len(arc_lengths) == 0 else float(arc_lengths[-1])
+    if total_length < 1.0:
+        raise ValueError("Curved cut is too short; add more separated points.")
+
+    sample_count = (
+        max(int(round(total_length)) + 1, 2)
+        if n_samples is None
+        else max(int(n_samples), 2)
+    )
+    distances = np.linspace(0.0, total_length, sample_count, dtype=np.float32)
+    xs = np.empty(sample_count, dtype=np.float32)
+    ys = np.empty(sample_count, dtype=np.float32)
+    perp_x = np.empty(sample_count, dtype=np.float32)
+    perp_y = np.empty(sample_count, dtype=np.float32)
+    delta = max(total_length / max(sample_count * 4, 16), 1e-3)
+    for index, distance_value in enumerate(distances):
+        point = polyline_point_at_length(points, arc_lengths, float(distance_value))
+        tx, ty = polyline_tangent_at_length(
+            points,
+            arc_lengths,
+            float(distance_value),
+            delta=delta,
+        )
+        xs[index] = float(point[0])
+        ys[index] = float(point[1])
+        perp_x[index] = float(-ty)
+        perp_y[index] = float(tx)
+    return xs, ys, distances, perp_x, perp_y, float(total_length)
+
+
+def cut_point_at_distance(cut: Cut, distance_value: float) -> tuple[float, float]:
+    points = cut_polyline_points(cut)
+    if len(points) < 2:
+        return (float(cut.p0[0]), float(cut.p0[1]))
+    if str(getattr(cut, "mode", "line")) != "curve":
+        length = max(distance(cut.p0, cut.p1), 1e-9)
+        alpha = clamp_value(float(distance_value) / length, 0.0, 1.0)
+        return (
+            float((1.0 - alpha) * cut.p0[0] + alpha * cut.p1[0]),
+            float((1.0 - alpha) * cut.p0[1] + alpha * cut.p1[1]),
+        )
+    arc_lengths = polyline_arc_lengths(points)
+    total_length = 0.0 if len(arc_lengths) == 0 else float(arc_lengths[-1])
+    if total_length <= 1e-9:
+        return (float(points[0][0]), float(points[0][1]))
+    return polyline_point_at_length(points, arc_lengths, float(distance_value))
+
+
 def compute_td(
     cube: np.ndarray,
     cut: Cut,
@@ -560,6 +667,9 @@ def compute_td(
     t_indices = np.arange(t_ini, t_fin + 1, stride, dtype=np.int32)
     offsets, weights = width_offsets_and_weights(width, weighting)
     dynamic_geometry = dynamic_geometry or {}
+
+    if dynamic_geometry and str(getattr(cut, "mode", "line")) == "curve":
+        raise ValueError("Dynamic geometry is not available for curved cuts yet.")
 
     if dynamic_geometry:
         geometries = [dynamic_geometry.get(int(t), (cut.p0, cut.p1)) for t in t_indices]
@@ -613,15 +723,15 @@ def compute_td(
             "frame_lengths": np.asarray(lengths, dtype=np.float32),
         }
 
-    xs, ys, distances, perp, cut_length_value = line_geometry(cut)
+    xs, ys, distances, perp_x, perp_y, cut_length_value = sampled_cut_geometry(cut)
 
     td = np.empty((len(t_indices), len(xs)), dtype=np.float32)
 
     for i, t in enumerate(t_indices):
         samples = []
         for offset in offsets:
-            x_off = xs + offset * perp[0]
-            y_off = ys + offset * perp[1]
+            x_off = xs + offset * perp_x
+            y_off = ys + offset * perp_y
             samples.append(bilinear_sample(cube[t], x_off, y_off))
 
         stack = np.stack(samples, axis=0)
@@ -710,6 +820,15 @@ def cut_cache_key(cut: Cut, panel: TDPanel | dict[str, Any]) -> tuple[Any, ...]:
         round(cut.p0[1], 3),
         round(cut.p1[0], 3),
         round(cut.p1[1], 3),
+        str(getattr(cut, "mode", "line")),
+        str(getattr(cut, "curve_fit", "line")),
+        tuple(
+            (
+                round(float(point[0]), 3),
+                round(float(point[1]), 3),
+            )
+            for point in (getattr(cut, "curve_points", []) or [])
+        ),
         t_ini,
         t_fin,
         stride,
@@ -745,5 +864,3 @@ def make_default_panels(nt: int) -> list[TDPanel]:
 
 def clamp_int(value: int, lo: int, hi: int) -> int:
     return min(max(int(value), lo), hi)
-
-

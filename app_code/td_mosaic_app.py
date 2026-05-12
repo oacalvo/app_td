@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
 import math
 import multiprocessing as mp
 import os
 import queue
+import re
 import sys
 import threading
 import time
+import traceback
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +22,7 @@ from typing import Any
 import numpy as np
 from astropy.io import fits
 from scipy.ndimage import zoom as ndimage_zoom
+from scipy.optimize import least_squares
 
 try:
     from .core import (
@@ -33,6 +37,8 @@ try:
         clamp_point,
         clamp_value,
         compute_td,
+        cut_point_at_distance,
+        cut_polyline_points,
         cube_axis_order_display_label,
         cube_axis_order_numeric_label,
         cut_cache_key,
@@ -83,6 +89,8 @@ except ImportError:
         clamp_point,
         clamp_value,
         compute_td,
+        cut_point_at_distance,
+        cut_polyline_points,
         cube_axis_order_display_label,
         cube_axis_order_numeric_label,
         cut_cache_key,
@@ -122,11 +130,16 @@ except ImportError:
     )
 
 MAX_FEATURE_AXIS_CUTS = 600
-MAX_EXPERIMENT_CUTS = 1600
+MAX_EXPERIMENT_CUTS_WARN = 1600
+MAX_EXPERIMENT_CUTS_HARD = 5000
+MAX_MAP_STACK_PREVIEW_CUTS = 30
+MIN_EXPERIMENT_CUT_LENGTH_PX = 5.0
 EXPERIMENT_IMPORTANT_CONFIDENCE_MIN = 0.55
 EXPERIMENT_NOVEL_PERIOD_FRAC = 0.20
 EXPERIMENT_NOVEL_TIME_FRAMES = 3
 EXPERIMENT_NEIGHBOR_RADIUS = 1
+MAX_EXPERIMENT_TRACE_BUNDLE_ROWS = 500000
+MAX_EXPERIMENT_AUTO_IMPORTANT_IMAGE_SOURCE_ROWS = 600
 LAYOUT_PRESETS = {
     "1x1": (1, 1),
     "2x1": (2, 1),
@@ -236,7 +249,7 @@ WAVELET_EDITABLE_TRACKING_KEYS = (
     "error_weight",
 )
 
-SESSION_VERSION = 6
+SESSION_VERSION = 9
 DEFAULT_AUTOSAVE_EVERY = 10
 WAVELET_QA_EDGE_FRACTION = 0.1
 WAVELET_QA_RESIDUAL_WARN_FRAC = 0.85
@@ -711,6 +724,12 @@ class TDMosaicApp:
         self.force_new_cut = False
         self.pending_point: tuple[float, float] | None = None
         self.hover_point: tuple[float, float] | None = None
+        self.curve_cut_draw_mode = False
+        self.curve_cut_pending_points: list[tuple[float, float]] = []
+        self.curve_cut_hover_point: tuple[float, float] | None = None
+        self.function_cut_draw_mode = False
+        self.function_cut_pending_points: list[tuple[float, float]] = []
+        self.function_cut_hover_point: tuple[float, float] | None = None
         self.feature_draw_mode: str | None = None
         self.feature_pending_points: list[tuple[float, float]] = []
         self.feature_hover_point: tuple[float, float] | None = None
@@ -718,6 +737,8 @@ class TDMosaicApp:
         self.control_update_guard = False
         self.geometry_update_guard = False
         self.panel_selector_update_guard = False
+        self.function_param_vars: dict[str, Any] = {}
+        self.selected_function_point_index: int | None = None
         self.status_var = tk.StringVar(
             value="Click twice on the map to create a cut. Click a TD panel to edit it."
         )
@@ -739,6 +760,13 @@ class TDMosaicApp:
         self.geometry_y1_var = tk.StringVar(value="")
         self.geometry_x2_var = tk.StringVar(value="")
         self.geometry_y2_var = tk.StringVar(value="")
+        self.function_cut_mode_var = tk.StringVar(value="Selected curve: none")
+        self.function_fit_points_var = tk.StringVar(value="Fit points: 0")
+        self.function_cut_expression_var = tk.StringVar(value="")
+        self.function_cut_points_var = tk.StringVar(value="160")
+        self.function_point_summary_var = tk.StringVar(value="Function points: none")
+        self.function_point_x_var = tk.StringVar(value="")
+        self.function_point_y_var = tk.StringVar(value="")
         self.dynamic_cut_enabled_var = tk.BooleanVar(value=False)
         self.dynamic_reference_frame_var = tk.StringVar(value="")
         self.dynamic_keyframe_summary_var = tk.StringVar(value="Dynamic geometry disabled.")
@@ -806,18 +834,26 @@ class TDMosaicApp:
         self.export_write_png_var = tk.BooleanVar(value=True)
         self.export_split_dirs_var = tk.BooleanVar(value=True)
         self.experiment_name_var = tk.StringVar(value="")
+        self.experiment_output_dir_var = tk.StringVar(value=str(self.cube_path.parent))
+        self.experiment_output_info_var = tk.StringVar(
+            value=f"Output: {self.cube_path.parent}"
+        )
         self.experiment_displacement_step_var = tk.StringVar(value="8.0")
-        self.experiment_displacement_limit_var = tk.StringVar(value="40.0")
+        self.experiment_displacement_min_var = tk.StringVar(value="-40.0")
+        self.experiment_displacement_max_var = tk.StringVar(value="40.0")
+        self.experiment_full_sweep_var = tk.BooleanVar(value=False)
         self.experiment_angle_min_var = tk.StringVar(value="-90.0")
         self.experiment_angle_max_var = tk.StringVar(value="90.0")
         self.experiment_angle_step_var = tk.StringVar(value="5.0")
+        self.experiment_width_var = tk.StringVar(value="1")
+        self.experiment_weighting_var = tk.StringVar(value="uniform")
         self.experiment_save_td_fits_var = tk.BooleanVar(value=True)
-        self.experiment_save_cell_json_var = tk.BooleanVar(value=True)
+        self.experiment_save_stack_json_var = tk.BooleanVar(value=True)
         self.experiment_save_important_images_var = tk.BooleanVar(value=True)
         self.experiment_view_mode_var = tk.StringVar(value="displacement")
         self.experiment_progress_global_var = tk.StringVar(value="Idle.")
-        self.experiment_progress_outer_var = tk.StringVar(value="Displacements: 0/0")
-        self.experiment_progress_inner_var = tk.StringVar(value="Angles: 0/0")
+        self.experiment_progress_outer_var = tk.StringVar(value="Stacks: 0/0")
+        self.experiment_progress_inner_var = tk.StringVar(value="Members: 0/0")
         self.experiment_progress_stage_var = tk.StringVar(value="Stage: idle")
         self.autosave_path = (
             Path(__file__).resolve().parent.parent
@@ -884,6 +920,9 @@ class TDMosaicApp:
             "roi_d_span": "",
             "roi_center_t": None,
             "roi_center_d": None,
+            "velocity_traces": [],
+            "velocity_next_trace_id": 1,
+            "velocity_selected_trace_id": None,
             "dynamic_enabled": False,
             "dynamic_reference_frame": 0,
             "dynamic_keyframes": {},
@@ -953,14 +992,23 @@ class TDMosaicApp:
             "base_angle_deg": float("nan"),
             "base_length_px": float("nan"),
             "displacement_step": float("nan"),
+            "displacement_min": float("nan"),
+            "displacement_max": float("nan"),
             "displacement_limit": float("nan"),
+            "full_sweep": False,
+            "full_cube_angles": False,
             "offset_values": [],
             "angle_min": float("nan"),
             "angle_max": float("nan"),
             "angle_step": float("nan"),
             "angle_values": [],
+            "td_width": 1,
+            "td_weighting": "uniform",
+            "dynamic_length": False,
+            "min_cut_length_px": float(MIN_EXPERIMENT_CUT_LENGTH_PX),
             "cut_ids": [],
             "cells": [],
+            "stack_group_mode": "displacement",
             "displacement_stack_ids": [],
             "rotation_stack_ids": [],
             "view_mode": "displacement",
@@ -972,15 +1020,168 @@ class TDMosaicApp:
             "status_path": "",
             "manifest_path": "",
             "last_run_summary": "",
+            "nuwt_status": "pending",
+            "wavelet_status": "pending",
+            "tables_status": "pending",
+            "study_td_params": {
+                "t_ini": 0,
+                "t_fin": self.nt - 1,
+                "stride": 1,
+                "width": 1,
+                "weighting": "uniform",
+            },
+            "study_crest_params": dict(DEFAULT_CREST_TRACKING),
+            "study_wavelet_params": dict(DEFAULT_WAVELET_FILTER),
+            "stack_outputs": {},
             "save_options": {
                 "save_td_fits": True,
-                "save_cell_json": True,
+                "save_stack_json": True,
                 "save_important_images": True,
             },
             "important_zone_rules": {
                 "confidence_min": EXPERIMENT_IMPORTANT_CONFIDENCE_MIN,
             },
         }
+
+    def _experiment_study_td_params(
+        self, experiment: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        default_td = dict(self._make_default_panel_analysis_state()["td_params"])
+        payload = dict(default_td)
+        if experiment is not None:
+            payload.update(dict(experiment.get("study_td_params") or {}))
+        payload["t_ini"] = clamp_int(int(payload.get("t_ini", 0)), 0, self.nt - 1)
+        payload["t_fin"] = clamp_int(
+            int(payload.get("t_fin", self.nt - 1)),
+            int(payload["t_ini"]),
+            self.nt - 1,
+        )
+        payload["stride"] = max(int(payload.get("stride", 1)), 1)
+        payload["width"] = max(int(payload.get("width", 1)), 1)
+        payload["weighting"] = (
+            "gaussian" if str(payload.get("weighting") or "") == "gaussian" else "uniform"
+        )
+        return payload
+
+    def _experiment_study_crest_params(
+        self, experiment: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        crest_params = dict(DEFAULT_CREST_TRACKING)
+        if experiment is not None:
+            crest_params.update(dict(experiment.get("study_crest_params") or {}))
+        return crest_params
+
+    def _experiment_study_wavelet_params(
+        self, experiment: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        wavelet_params = dict(DEFAULT_WAVELET_FILTER)
+        if experiment is not None:
+            wavelet_params.update(dict(experiment.get("study_wavelet_params") or {}))
+        return wavelet_params
+
+    def _experiment_next_stage(self, experiment: dict[str, Any] | None) -> str:
+        if experiment is None:
+            return "nuwt"
+        if str(experiment.get("nuwt_status") or "pending") != "completed":
+            return "nuwt"
+        if str(experiment.get("wavelet_status") or "pending") != "completed":
+            return "wavelet"
+        return "tables"
+
+    def _experiment_stack_folder_name(self, experiment: dict[str, Any] | None) -> str:
+        return (
+            "rotates"
+            if self._experiment_stack_mode(experiment) == "rotation"
+            else "displacements"
+        )
+
+    def _experiment_stack_ids_for_processing(
+        self, experiment: dict[str, Any] | None
+    ) -> list[int]:
+        if experiment is None:
+            return []
+        key = (
+            "rotation_stack_ids"
+            if self._experiment_stack_mode(experiment) == "rotation"
+            else "displacement_stack_ids"
+        )
+        return [
+            int(stack_id)
+            for stack_id in (experiment.get(key) or [])
+            if int(stack_id) in self.stacks
+        ]
+
+    def _experiment_stack_specs(
+        self, experiment: dict[str, Any] | None
+    ) -> list[dict[str, Any]]:
+        if experiment is None:
+            return []
+        stack_kind = self._experiment_stack_mode(experiment)
+        cell_lookup = {
+            int(cell.get("cut_id", -1)): dict(cell)
+            for cell in self._experiment_cells(experiment)
+            if int(cell.get("cut_id", -1)) in self.cuts
+        }
+        specs: list[dict[str, Any]] = []
+        for stack_id in self._experiment_stack_ids_for_processing(experiment):
+            stack = self.stacks.get(int(stack_id))
+            if stack is None:
+                continue
+            members: list[dict[str, Any]] = []
+            for cut_id in stack.get("cut_ids") or []:
+                normalized_cut_id = int(cut_id)
+                if normalized_cut_id not in self.cuts:
+                    continue
+                cell = cell_lookup.get(normalized_cut_id)
+                if cell is None:
+                    continue
+                members.append(dict(cell))
+            if not members:
+                continue
+            specs.append(
+                {
+                    "stack_id": int(stack["stack_id"]),
+                    "stack_name": str(stack.get("name") or f"stack_{int(stack_id):03d}"),
+                    "stack_kind": str(stack_kind),
+                    "cells": members,
+                }
+            )
+        return specs
+
+    def _experiment_stack_base_path(
+        self, root_dir: Path, stack_id: int, stack_name: str, stack_kind: str
+    ) -> Path:
+        folder_name = "rotates" if str(stack_kind) == "rotation" else "displacements"
+        slug = self._safe_export_slug(str(stack_name))
+        return root_dir / folder_name / f"stack_{int(stack_id):03d}_{slug}"
+
+    def _apply_experiment_params_to_cuts(self, experiment: dict[str, Any]) -> None:
+        td_params = self._experiment_study_td_params(experiment)
+        crest_params = self._experiment_study_crest_params(experiment)
+        wavelet_params = self._experiment_study_wavelet_params(experiment)
+        for cut_id in experiment.get("cut_ids") or []:
+            normalized_cut_id = int(cut_id)
+            if normalized_cut_id not in self.cuts:
+                continue
+            state = self._cut_analysis(normalized_cut_id)
+            state["td_params"] = {
+                **dict(state.get("td_params") or {}),
+                **dict(td_params),
+            }
+            state["crest_params"] = dict(crest_params)
+            state["wavelet_params"] = dict(wavelet_params)
+            state["td_cache_key"] = None
+            state["td_cache_td"] = None
+            state["td_cache_meta"] = None
+
+    def _write_json_file(self, path: Path, payload: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(self._json_safe(payload), handle, indent=2)
+
+    def _read_json_file(self, path: Path) -> Any:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
 
     def _experiment_cells(self, experiment: dict[str, Any] | None) -> list[dict[str, Any]]:
         if experiment is None:
@@ -1008,6 +1209,391 @@ class TDMosaicApp:
         if self.active_experiment_id is None:
             return None
         return self.experiments.get(self.active_experiment_id)
+
+    def _normalize_experiment_stack_mode(self, mode: Any) -> str:
+        return "rotation" if str(mode) == "rotation" else "displacement"
+
+    def _experiment_available_stack_modes(
+        self, experiment: dict[str, Any] | None
+    ) -> list[str]:
+        if experiment is None:
+            return []
+        modes: list[str] = []
+        if any(
+            int(stack_id) in self.stacks
+            for stack_id in (experiment.get("displacement_stack_ids") or [])
+        ):
+            modes.append("displacement")
+        if any(
+            int(stack_id) in self.stacks
+            for stack_id in (experiment.get("rotation_stack_ids") or [])
+        ):
+            modes.append("rotation")
+        return modes
+
+    def _experiment_stack_mode(self, experiment: dict[str, Any] | None) -> str:
+        available_modes = self._experiment_available_stack_modes(experiment)
+        preferred = self._normalize_experiment_stack_mode(
+            None
+            if experiment is None
+            else experiment.get("stack_group_mode", experiment.get("view_mode"))
+        )
+        if preferred in available_modes:
+            return preferred
+        if available_modes:
+            return str(available_modes[0])
+        return preferred
+
+    def _prompt_experiment_stack_mode(
+        self,
+        study_name: str,
+        displacement_count: int,
+        angle_count: int,
+    ) -> str | None:
+        top = self.tk.Toplevel(self.root)
+        top.title("Study Stack Layout")
+        top.transient(self.root)
+        top.grab_set()
+        top.resizable(False, False)
+
+        choice: dict[str, str | None] = {"mode": None}
+
+        def close_with(mode: str | None) -> None:
+            choice["mode"] = mode
+            if top.winfo_exists():
+                top.destroy()
+
+        frame = self.ttk.Frame(top, padding=14)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+
+        self.ttk.Label(
+            frame,
+            text=f"Como quieres separar los stacks de '{study_name}'?",
+            justify="left",
+            wraplength=360,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        self.ttk.Label(
+            frame,
+            text=(
+                f"Por desplazamiento: {displacement_count} stack(s), "
+                f"{angle_count} TDs por stack\n"
+                f"Por angulo: {angle_count} stack(s), "
+                f"{displacement_count} TDs por stack"
+            ),
+            justify="left",
+            wraplength=360,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        self.ttk.Button(
+            frame,
+            text="Por desplazamiento",
+            command=lambda: close_with("displacement"),
+        ).grid(row=2, column=0, sticky="ew", padx=(0, 6), pady=(12, 0))
+        self.ttk.Button(
+            frame,
+            text="Por angulo",
+            command=lambda: close_with("rotation"),
+        ).grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=(12, 0))
+        self.ttk.Button(
+            frame,
+            text="Cancelar",
+            command=lambda: close_with(None),
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        top.protocol("WM_DELETE_WINDOW", lambda: close_with(None))
+        top.bind("<Escape>", lambda _event: close_with(None))
+        top.bind("<Return>", lambda _event: close_with("displacement"))
+        top.update_idletasks()
+        top.focus_set()
+        self.root.wait_window(top)
+        return choice["mode"]
+
+    def _warn_experiment_full_cube_angles(self, study_name: str) -> bool | None:
+        answer = self.messagebox.askyesnocancel(
+            "Full Cube Study",
+            (
+                f"Generate '{study_name}' as a full-cube angular study?\n\n"
+                "Yes = for every angle, rebuild the complete family of parallel cuts across the whole cube/frame.\n"
+                "This means angles like 90 deg will create many parallel cuts separated by d step, not a single rotated cut.\n"
+                "This mode is exported/viewed by angle.\n\n"
+                "No = keep the standard study geometry (shift first, then rotate each member).\n"
+                "Cancel = abort generation."
+            ),
+            parent=self.root,
+        )
+        if answer is None:
+            return None
+        return bool(answer)
+
+    def _line_segment_through_frame(
+        self,
+        point_on_line: tuple[float, float],
+        angle_deg: float,
+    ) -> tuple[tuple[float, float], tuple[float, float], float] | None:
+        ux, uy = vector_from_vertical_angle(angle_deg)
+        ox, oy = float(point_on_line[0]), float(point_on_line[1])
+        intersections: list[tuple[float, tuple[float, float]]] = []
+
+        def add_intersection(t_value: float, x_value: float, y_value: float) -> None:
+            if not (
+                -1e-6 <= x_value <= (self.nx - 1.0) + 1e-6
+                and -1e-6 <= y_value <= (self.ny - 1.0) + 1e-6
+            ):
+                return
+            clamped = (
+                clamp_value(float(x_value), 0.0, self.nx - 1.0),
+                clamp_value(float(y_value), 0.0, self.ny - 1.0),
+            )
+            for _existing_t, existing_point in intersections:
+                if distance(existing_point, clamped) <= 1e-6:
+                    return
+            intersections.append((float(t_value), clamped))
+
+        if abs(ux) > 1e-9:
+            for x_edge in (0.0, self.nx - 1.0):
+                t_value = (x_edge - ox) / ux
+                add_intersection(t_value, x_edge, oy + t_value * uy)
+        if abs(uy) > 1e-9:
+            for y_edge in (0.0, self.ny - 1.0):
+                t_value = (y_edge - oy) / uy
+                add_intersection(t_value, ox + t_value * ux, y_edge)
+
+        if len(intersections) < 2:
+            return None
+
+        intersections.sort(key=lambda item: item[0])
+        p0 = intersections[0][1]
+        p1 = intersections[-1][1]
+        length_value = distance(p0, p1)
+        if length_value < 1.0:
+            return None
+        return p0, p1, float(length_value)
+
+    def _full_cube_angle_offset_values(
+        self,
+        reference_center: tuple[float, float],
+        angle_deg: float,
+        step_value: float,
+    ) -> list[float]:
+        ux, uy = vector_from_vertical_angle(angle_deg)
+        normal_x = -uy
+        normal_y = ux
+        projections = [
+            (corner_x - float(reference_center[0])) * normal_x
+            + (corner_y - float(reference_center[1])) * normal_y
+            for corner_x, corner_y in (
+                (0.0, 0.0),
+                (self.nx - 1.0, 0.0),
+                (0.0, self.ny - 1.0),
+                (self.nx - 1.0, self.ny - 1.0),
+            )
+        ]
+        if not projections:
+            return [0.0]
+        return self._offset_series(
+            float(min(projections)),
+            float(max(projections)),
+            step_value,
+        )
+
+    def _build_experiment_cut_segment(
+        self,
+        center: tuple[float, float],
+        angle_deg: float,
+        base_length: float,
+        dynamic_length: bool,
+    ) -> tuple[tuple[float, float], tuple[float, float], float]:
+        if dynamic_length:
+            ux, uy = vector_from_vertical_angle(angle_deg)
+            backward = ray_limit(center, (-ux, -uy), self.nx, self.ny)
+            forward = ray_limit(center, (ux, uy), self.nx, self.ny)
+            p0 = (center[0] - backward * ux, center[1] - backward * uy)
+            p1 = (center[0] + forward * ux, center[1] + forward * uy)
+            return p0, p1, distance(p0, p1)
+        return segment_from_angle_length(
+            angle_deg,
+            base_length,
+            "center",
+            None,
+            center,
+            self.nx,
+            self.ny,
+        )
+
+    def _warn_experiment_full_frame_rotations(self, study_name: str) -> bool | None:
+        answer = self.messagebox.askyesnocancel(
+            "Full Frame Rotations",
+            (
+                f"Enable full-frame rotations for '{study_name}'?\n\n"
+                "Yes = each rotated cut is extended from its center until it reaches the cube/frame edges.\n"
+                "If a border needs extra straight length, it is added automatically.\n\n"
+                "No = keep the base cut length.\n"
+                "Cancel = abort generation."
+            ),
+            parent=self.root,
+        )
+        if answer is None:
+            return None
+        return bool(answer)
+
+    def _experiment_generated_cut_ids(self) -> set[int]:
+        cut_ids: set[int] = set()
+        for experiment in self.experiments.values():
+            for cut_id in experiment.get("cut_ids") or []:
+                try:
+                    normalized = int(cut_id)
+                except Exception:
+                    continue
+                if normalized in self.cuts:
+                    cut_ids.add(normalized)
+        return cut_ids
+
+    def _sample_cut_ids_for_map_preview(
+        self,
+        cut_ids: list[int],
+        max_count: int,
+        preferred_ids: list[int] | None = None,
+    ) -> list[int]:
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for cut_id in cut_ids:
+            current = int(cut_id)
+            if current in self.cuts and current not in seen:
+                seen.add(current)
+                normalized.append(current)
+        if max_count <= 0 or len(normalized) <= max_count:
+            return normalized
+
+        anchors: list[int] = []
+        if preferred_ids:
+            anchors.extend(
+                int(cut_id)
+                for cut_id in preferred_ids
+                if cut_id is not None and int(cut_id) in seen
+            )
+        anchors.extend([normalized[0], normalized[-1]])
+
+        selected: list[int] = []
+        selected_lookup: set[int] = set()
+
+        def add_cut(cut_id: int) -> None:
+            if len(selected) >= max_count:
+                return
+            current = int(cut_id)
+            if current in seen and current not in selected_lookup:
+                selected_lookup.add(current)
+                selected.append(current)
+
+        for cut_id in anchors:
+            add_cut(cut_id)
+
+        remaining_slots = max(max_count - len(selected), 0)
+        if remaining_slots == 1:
+            add_cut(normalized[len(normalized) // 2])
+        elif remaining_slots > 1:
+            for slot in range(remaining_slots):
+                index = int(
+                    round(
+                        slot * (len(normalized) - 1) / max(remaining_slots - 1, 1)
+                    )
+                )
+                add_cut(normalized[index])
+
+        if len(selected) < max_count:
+            for cut_id in normalized:
+                add_cut(cut_id)
+                if len(selected) >= max_count:
+                    break
+
+        return [cut_id for cut_id in normalized if cut_id in selected_lookup]
+
+    def _active_experiment_map_stack(
+        self, experiment: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        stack_ids = (
+            experiment.get("rotation_stack_ids")
+            if str(experiment.get("view_mode") or "displacement") == "rotation"
+            else experiment.get("displacement_stack_ids")
+        ) or []
+        valid_stack_ids = [
+            int(stack_id) for stack_id in stack_ids if int(stack_id) in self.stacks
+        ]
+        if not valid_stack_ids:
+            return None
+        if self.active_stack_id in valid_stack_ids:
+            return self.stacks.get(int(self.active_stack_id))
+        return self.stacks.get(int(valid_stack_ids[0]))
+
+    def _main_map_cut_ids(self) -> tuple[list[int], str]:
+        visible_cut_ids = [
+            int(cut.cut_id) for cut in self.cuts.values() if bool(cut.visible)
+        ]
+        experiment = self._selected_experiment()
+        if experiment is None:
+            return visible_cut_ids, ""
+
+        experiment_cut_ids = self._experiment_generated_cut_ids()
+        if not experiment_cut_ids:
+            return visible_cut_ids, ""
+
+        out: list[int] = []
+        out_lookup: set[int] = set()
+
+        def add_cut(cut_id: int | None) -> None:
+            if cut_id is None:
+                return
+            current = int(cut_id)
+            cut = self.cuts.get(current)
+            if cut is None or not cut.visible or current in out_lookup:
+                return
+            out_lookup.add(current)
+            out.append(current)
+
+        stack = self._active_experiment_map_stack(experiment)
+        stack_cut_ids: list[int] = []
+        if stack is not None:
+            stack_cut_ids = [
+                int(cut_id)
+                for cut_id in (stack.get("cut_ids") or [])
+                if int(cut_id) in self.cuts
+                and bool(self.cuts[int(cut_id)].visible)
+                and int(cut_id) in experiment_cut_ids
+            ]
+
+        preview_cut_ids = self._sample_cut_ids_for_map_preview(
+            stack_cut_ids,
+            MAX_MAP_STACK_PREVIEW_CUTS,
+            preferred_ids=[
+                self.selected_cut_id,
+                self.selected_stack_cut_id,
+                experiment.get("base_cut_id"),
+            ],
+        )
+
+        for cut_id in visible_cut_ids:
+            if cut_id not in experiment_cut_ids:
+                add_cut(cut_id)
+        for cut_id in preview_cut_ids:
+            add_cut(cut_id)
+        add_cut(experiment.get("base_cut_id"))
+        add_cut(self.selected_cut_id)
+
+        stack_note = ""
+        if stack is not None and stack_cut_ids:
+            stack_name = str(
+                stack.get("name") or f"Stack {int(stack.get('stack_id') or 0)}"
+            )
+            if len(preview_cut_ids) < len(stack_cut_ids):
+                stack_note = (
+                    f" | stack preview {len(preview_cut_ids)}/{len(stack_cut_ids)}"
+                    f" ({stack_name})"
+                )
+            else:
+                stack_note = f" | stack {len(stack_cut_ids)} ({stack_name})"
+
+        return out, stack_note
 
     def _experiment_cut_lookup(
         self, experiment: dict[str, Any] | None
@@ -1044,9 +1630,21 @@ class TDMosaicApp:
         offsets = len(experiment.get("offset_values") or [])
         angles = len(experiment.get("angle_values") or [])
         status = str(experiment.get("status") or "created")
+        td_width = max(int(experiment.get("td_width", 1)), 1)
+        td_weighting = str(experiment.get("td_weighting") or "uniform")
+        sweep_tag = " full-sweep" if bool(experiment.get("full_sweep")) else ""
+        cube_tag = " full-cube" if bool(experiment.get("full_cube_angles", False)) else ""
+        stack_mode = self._experiment_stack_mode(experiment)
+        length_tag = "frame" if bool(experiment.get("dynamic_length", False)) else "base"
+        coverage_text = (
+            f"varyx{angles}"
+            if bool(experiment.get("full_cube_angles", False))
+            else f"{offsets}x{angles}"
+        )
         return (
             f"{int(experiment['experiment_id']):02d} | {str(experiment.get('name') or 'Study')} "
-            f"| {offsets}x{angles} | cells={cells} | {status}"
+            f"| {coverage_text}{sweep_tag}{cube_tag} | by={stack_mode} | "
+            f"len={length_tag} | w={td_width} {td_weighting} | cells={cells} | {status}"
         )
 
     def _cut_analysis(self, cut_id: int) -> dict[str, Any]:
@@ -1303,6 +1901,27 @@ class TDMosaicApp:
             p1=p1,
             visible=cut.visible,
             locked=cut.locked,
+            mode=str(getattr(cut, "mode", "line")),
+            curve_fit=str(getattr(cut, "curve_fit", "line")),
+            curve_points=[
+                (float(point[0]), float(point[1]))
+                for point in (getattr(cut, "curve_points", []) or [])
+            ],
+            function_expr=str(getattr(cut, "function_expr", "") or ""),
+            function_x_start=float(getattr(cut, "function_x_start", cut.p0[0])),
+            function_x_end=float(getattr(cut, "function_x_end", cut.p1[0])),
+            function_point_count=max(
+                int(getattr(cut, "function_point_count", 0) or 0),
+                0,
+            ),
+            function_control_points=[
+                (float(point[0]), float(point[1]))
+                for point in (getattr(cut, "function_control_points", []) or [])
+            ],
+            function_params={
+                str(key): float(value)
+                for key, value in dict(getattr(cut, "function_params", {}) or {}).items()
+            },
         )
 
     def _dynamic_cut_geometry_samples(
@@ -1484,11 +2103,25 @@ class TDMosaicApp:
             float((1.0 - alpha) * p0[1] + alpha * p1[1]),
         )
 
+    def _point_on_cut_distance(
+        self,
+        cut_id: int,
+        frame_idx: int,
+        dist_px: float,
+    ) -> tuple[float, float]:
+        preview_cut = self._cut_preview(cut_id, frame_idx)
+        if preview_cut is None:
+            return 0.0, 0.0
+        if self._cut_is_curve(preview_cut):
+            return cut_point_at_distance(preview_cut, float(dist_px))
+        return self._point_on_segment_distance(preview_cut.p0, preview_cut.p1, dist_px)
+
     def _current_map_cut_rows(self, frame_idx: int) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for cut_id in sorted(self.cuts.keys()):
             cut = self.cuts[cut_id]
-            p0, p1 = self._cut_geometry_for_frame(cut_id, frame_idx)
+            preview_cut = self._cut_preview(cut_id, frame_idx) or cut
+            p0, p1 = preview_cut.p0, preview_cut.p1
             memberships = self._stack_memberships_for_cut(cut_id)
             rows.append(
                 {
@@ -1498,7 +2131,7 @@ class TDMosaicApp:
                     "y1": float(p0[1]),
                     "x2": float(p1[0]),
                     "y2": float(p1[1]),
-                    "length_px": float(distance(p0, p1)),
+                    "length_px": float(cut_length(preview_cut)),
                     "dynamic": bool(self._cut_dynamic_enabled(cut_id)),
                     "selected": bool(int(cut_id) == int(self.selected_cut_id or -1)),
                     "stack_names": ",".join(
@@ -1513,7 +2146,10 @@ class TDMosaicApp:
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for t_idx in np.asarray(t_indices, dtype=np.int64):
-            p0, p1 = self._cut_geometry_for_frame(cut_id, int(t_idx))
+            preview_cut = self._cut_preview(cut_id, int(t_idx))
+            if preview_cut is None:
+                continue
+            p0, p1 = preview_cut.p0, preview_cut.p1
             rows.append(
                 {
                     "t_index": int(t_idx),
@@ -1521,7 +2157,7 @@ class TDMosaicApp:
                     "y1": float(p0[1]),
                     "x2": float(p1[0]),
                     "y2": float(p1[1]),
-                    "length_px": float(distance(p0, p1)),
+                    "length_px": float(cut_length(preview_cut)),
                 }
             )
         return rows
@@ -1576,7 +2212,7 @@ class TDMosaicApp:
                 dist_px = float(np.interp(dist_idx, dist_index, distances))
                 frame_idx = clamp_int(int(round(float(t_value))), 0, self.nt - 1)
                 p0, p1 = self._cut_geometry_for_frame(cut_id, frame_idx)
-                map_x, map_y = self._point_on_segment_distance(p0, p1, dist_px)
+                map_x, map_y = self._point_on_cut_distance(cut_id, frame_idx, dist_px)
                 rows.append(
                     {
                         "series": series_name,
@@ -1594,6 +2230,123 @@ class TDMosaicApp:
                     }
                 )
         rows.sort(key=lambda row: (str(row["series"]), float(row["t_idx"]), int(row["point_index"])))
+        return rows
+
+    def _thread_trace_rows(
+        self,
+        cut_id: int,
+        threads: list[dict[str, Any]] | None,
+        meta: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if cut_id not in self.cuts:
+            return []
+        if meta is None:
+            _td, meta = self._cut_td(cut_id)
+        distances = np.asarray((meta or {}).get("distances", []), dtype=np.float64)
+        t_indices = np.asarray((meta or {}).get("t_indices", []), dtype=np.float64)
+        dist_index = np.arange(distances.size, dtype=np.float64)
+        rows: list[dict[str, Any]] = []
+        fallback_max_y = 0.0
+        max_point_count = 0
+        for thread in threads or []:
+            if not isinstance(thread, dict):
+                continue
+            pos = np.asarray(thread.get("pos", []), dtype=np.float64)
+            if pos.size:
+                finite_pos = pos[np.isfinite(pos) & (pos >= 0.0)]
+                if finite_pos.size:
+                    fallback_max_y = max(fallback_max_y, float(np.nanmax(finite_pos)))
+            max_point_count = max(max_point_count, int(pos.size))
+        if t_indices.size == 0 and max_point_count > 0:
+            t_indices = np.arange(max_point_count, dtype=np.float64)
+        if distances.size == 0:
+            sample_count = max(int(math.ceil(fallback_max_y)) + 1, 2)
+            length_px = max(float(cut_length(self.cuts[cut_id])), 1.0)
+            distances = np.linspace(0.0, length_px, sample_count, dtype=np.float64)
+            dist_index = np.arange(distances.size, dtype=np.float64)
+        max_dist_index = float(dist_index[-1]) if dist_index.size else 0.0
+        for thread_index, thread in enumerate(threads or []):
+            if not isinstance(thread, dict):
+                continue
+            pos = np.asarray(thread.get("pos", []), dtype=np.float64)
+            err_pos = np.asarray(thread.get("err_pos", []), dtype=np.float64)
+            bin_flags = np.asarray(thread.get("bin_flags", []), dtype=np.float64)
+            interp_mask = np.asarray(thread.get("interp_mask", []), dtype=bool)
+            point_total = int(pos.size)
+            if point_total <= 0:
+                continue
+            for point_index in range(point_total):
+                y_value = float(pos[point_index])
+                if not np.isfinite(y_value) or y_value < 0.0:
+                    continue
+                t_value = (
+                    float(t_indices[point_index])
+                    if t_indices.size > point_index
+                    else float(point_index)
+                )
+                if not np.isfinite(t_value):
+                    continue
+                dist_idx = clamp_value(y_value, 0.0, max_dist_index)
+                dist_px = float(np.interp(dist_idx, dist_index, distances))
+                frame_idx = clamp_int(int(round(t_value)), 0, self.nt - 1)
+                p0, p1 = self._cut_geometry_for_frame(cut_id, frame_idx)
+                map_x, map_y = self._point_on_cut_distance(cut_id, frame_idx, dist_px)
+                err_dist_idx = float("nan")
+                err_dist_px = float("nan")
+                if (
+                    err_pos.size > point_index
+                    and np.isfinite(float(err_pos[point_index]))
+                    and float(err_pos[point_index]) >= 0.0
+                ):
+                    err_dist_idx = clamp_value(
+                        float(err_pos[point_index]), 0.0, max_dist_index
+                    )
+                    err_dist_px = float(
+                        np.interp(err_dist_idx, dist_index, distances)
+                    )
+                rows.append(
+                    {
+                        "series": "thread",
+                        "thread_index": int(thread_index),
+                        "point_index": int(point_index + 1),
+                        "t_idx": float(t_value),
+                        "frame_idx": int(frame_idx),
+                        "dist_idx": float(dist_idx),
+                        "dist_px": float(dist_px),
+                        "err_dist_idx": float(err_dist_idx),
+                        "err_dist_px": float(err_dist_px),
+                        "interp": bool(
+                            interp_mask[point_index]
+                            if interp_mask.size > point_index
+                            else False
+                        ),
+                        "bin_flag": (
+                            int(bin_flags[point_index])
+                            if bin_flags.size > point_index
+                            and np.isfinite(float(bin_flags[point_index]))
+                            else None
+                        ),
+                        "thread_length": int(thread.get("length", 0) or 0),
+                        "start_bin": int(thread.get("start_bin", -1) or -1),
+                        "end_bin": int(thread.get("end_bin", -1) or -1),
+                        "interp_fraction": float(
+                            thread.get("interp_fraction", float("nan"))
+                        ),
+                        "map_x": float(map_x),
+                        "map_y": float(map_y),
+                        "cut_x1": float(p0[0]),
+                        "cut_y1": float(p0[1]),
+                        "cut_x2": float(p1[0]),
+                        "cut_y2": float(p1[1]),
+                    }
+                )
+        rows.sort(
+            key=lambda row: (
+                int(row.get("thread_index", -1)),
+                float(row.get("t_idx", float("nan"))),
+                int(row.get("point_index", 0)),
+            )
+        )
         return rows
 
     def _event_summary_rows_for_cut(
@@ -3812,6 +4565,15 @@ class TDMosaicApp:
         snapshot["roi_d_span"] = str(existing["roi_d_span_var"].get())
         snapshot["roi_center_t"] = existing.get("roi_center_t")
         snapshot["roi_center_d"] = existing.get("roi_center_d")
+        snapshot["velocity_traces"] = self._clone_wavelet_payload(
+            existing.get("velocity_traces") or []
+        )
+        snapshot["velocity_next_trace_id"] = int(
+            existing.get("velocity_next_trace_id", 1)
+        )
+        snapshot["velocity_selected_trace_id"] = existing.get(
+            "velocity_selected_trace_id"
+        )
         return snapshot
 
     def _sync_panel_analysis_state_from_window(self, panel_id: int) -> None:
@@ -3901,6 +4663,15 @@ class TDMosaicApp:
             "roi_center_d": self._clone_wavelet_payload(
                 normalized.get("roi_center_d")
             ),
+            "velocity_traces": self._clone_wavelet_payload(
+                normalized.get("velocity_traces") or []
+            ),
+            "velocity_next_trace_id": int(
+                normalized.get("velocity_next_trace_id", 1)
+            ),
+            "velocity_selected_trace_id": normalized.get(
+                "velocity_selected_trace_id"
+            ),
         }
 
     def _json_safe(self, value: Any) -> Any:
@@ -3969,6 +4740,33 @@ class TDMosaicApp:
                     "p1": [round(cut.p1[0], 4), round(cut.p1[1], 4)],
                     "visible": cut.visible,
                     "locked": cut.locked,
+                    "mode": str(getattr(cut, "mode", "line")),
+                    "curve_fit": str(getattr(cut, "curve_fit", "line")),
+                    "curve_points": [
+                        [round(point[0], 4), round(point[1], 4)]
+                        for point in (getattr(cut, "curve_points", []) or [])
+                    ],
+                    "function_expr": str(getattr(cut, "function_expr", "") or ""),
+                    "function_x_start": round(
+                        float(getattr(cut, "function_x_start", cut.p0[0])),
+                        4,
+                    ),
+                    "function_x_end": round(
+                        float(getattr(cut, "function_x_end", cut.p1[0])),
+                        4,
+                    ),
+                    "function_point_count": max(
+                        int(getattr(cut, "function_point_count", 0) or 0),
+                        0,
+                    ),
+                    "function_control_points": [
+                        [round(point[0], 4), round(point[1], 4)]
+                        for point in (getattr(cut, "function_control_points", []) or [])
+                    ],
+                    "function_params": {
+                        str(key): round(float(value), 8)
+                        for key, value in dict(getattr(cut, "function_params", {}) or {}).items()
+                    },
                 }
                 for cut in self.cuts.values()
             ],
@@ -4182,24 +4980,76 @@ class TDMosaicApp:
         self.feature_axes = {}
         self.next_feature_axis_id = 1
         self.selected_feature_axis_id = None
+        self.curve_cut_draw_mode = False
+        self.curve_cut_pending_points = []
+        self.curve_cut_hover_point = None
+        self.function_cut_draw_mode = False
+        self.function_cut_pending_points = []
+        self.function_cut_hover_point = None
         self.feature_draw_mode = None
         self.feature_pending_points = []
         self.feature_hover_point = None
         for cut_payload in payload.get("cuts", []):
+            raw_curve_points = cut_payload.get("curve_points") or []
+            curve_points: list[tuple[float, float]] = []
+            for point in raw_curve_points:
+                try:
+                    curve_points.append(
+                        clamp_point((float(point[0]), float(point[1])), self.nx, self.ny)
+                    )
+                except Exception:
+                    continue
+            mode = "curve" if str(cut_payload.get("mode", "line")) == "curve" and len(curve_points) >= 2 else "line"
+            p0_value = (
+                curve_points[0]
+                if mode == "curve"
+                else (
+                    float((cut_payload.get("p0") or [0.0, 0.0])[0]),
+                    float((cut_payload.get("p0") or [0.0, 0.0])[1]),
+                )
+            )
+            p1_value = (
+                curve_points[-1]
+                if mode == "curve"
+                else (
+                    float((cut_payload.get("p1") or [1.0, 1.0])[0]),
+                    float((cut_payload.get("p1") or [1.0, 1.0])[1]),
+                )
+            )
+            raw_function_control_points = cut_payload.get("function_control_points") or []
+            function_control_points: list[tuple[float, float]] = []
+            for point in raw_function_control_points:
+                try:
+                    function_control_points.append(
+                        clamp_point((float(point[0]), float(point[1])), self.nx, self.ny)
+                    )
+                except Exception:
+                    continue
+            raw_function_params = cut_payload.get("function_params") or {}
+            function_params: dict[str, float] = {}
+            if isinstance(raw_function_params, dict):
+                for key, value in raw_function_params.items():
+                    try:
+                        function_params[str(key)] = float(value)
+                    except Exception:
+                        continue
             cut = Cut(
                 cut_id=int(cut_payload["cut_id"]),
                 name=str(cut_payload.get("name", f"Cut {cut_payload['cut_id']}")),
                 color=str(cut_payload.get("color", COLOR_CYCLE[(int(cut_payload["cut_id"]) - 1) % len(COLOR_CYCLE)])),
-                p0=(
-                    float((cut_payload.get("p0") or [0.0, 0.0])[0]),
-                    float((cut_payload.get("p0") or [0.0, 0.0])[1]),
-                ),
-                p1=(
-                    float((cut_payload.get("p1") or [1.0, 1.0])[0]),
-                    float((cut_payload.get("p1") or [1.0, 1.0])[1]),
-                ),
+                p0=p0_value,
+                p1=p1_value,
                 visible=bool(cut_payload.get("visible", True)),
                 locked=bool(cut_payload.get("locked", False)),
+                mode=mode,
+                curve_fit=str(cut_payload.get("curve_fit", "line" if mode == "line" else "polyline")),
+                curve_points=curve_points if mode == "curve" else [],
+                function_expr=str(cut_payload.get("function_expr", "") or ""),
+                function_x_start=float(cut_payload.get("function_x_start", p0_value[0])),
+                function_x_end=float(cut_payload.get("function_x_end", p1_value[0])),
+                function_point_count=max(int(cut_payload.get("function_point_count", 0) or 0), 0),
+                function_control_points=function_control_points,
+                function_params=function_params,
             )
             self.cuts[cut.cut_id] = cut
             self.next_cut_id = max(self.next_cut_id, cut.cut_id + 1)
@@ -4429,19 +5279,103 @@ class TDMosaicApp:
             experiment_state["angle_values"] = [
                 float(value) for value in (experiment_state.get("angle_values") or [])
             ]
+            legacy_limit = experiment_state.get("displacement_limit", float("nan"))
+            if np.isfinite(float(experiment_state.get("displacement_min", float("nan")))):
+                experiment_state["displacement_min"] = float(experiment_state["displacement_min"])
+            else:
+                limit_value = abs(float(legacy_limit)) if np.isfinite(float(legacy_limit)) else 0.0
+                experiment_state["displacement_min"] = -limit_value
+            if np.isfinite(float(experiment_state.get("displacement_max", float("nan")))):
+                experiment_state["displacement_max"] = float(experiment_state["displacement_max"])
+            else:
+                limit_value = abs(float(legacy_limit)) if np.isfinite(float(legacy_limit)) else 0.0
+                experiment_state["displacement_max"] = limit_value
+            experiment_state["displacement_limit"] = max(
+                abs(float(experiment_state["displacement_min"])),
+                abs(float(experiment_state["displacement_max"])),
+            )
+            experiment_state["full_sweep"] = bool(experiment_state.get("full_sweep", False))
+            experiment_state["full_cube_angles"] = bool(
+                experiment_state.get("full_cube_angles", False)
+            )
+            experiment_state["td_width"] = max(
+                int(experiment_state.get("td_width", 1)),
+                1,
+            )
+            experiment_state["td_weighting"] = str(
+                experiment_state.get("td_weighting") or "uniform"
+            )
+            if experiment_state["td_weighting"] not in {"uniform", "gaussian"}:
+                experiment_state["td_weighting"] = "uniform"
+            experiment_state["dynamic_length"] = bool(
+                experiment_state.get("dynamic_length", False)
+            )
+            experiment_state["min_cut_length_px"] = max(
+                float(
+                    experiment_state.get(
+                        "min_cut_length_px",
+                        MIN_EXPERIMENT_CUT_LENGTH_PX,
+                    )
+                ),
+                1.0,
+            )
             save_options = {
                 **dict(self._make_default_experiment_state(experiment_id, "")["save_options"]),
                 **dict(experiment_state.get("save_options") or {}),
             }
             experiment_state["save_options"] = {
                 "save_td_fits": bool(save_options.get("save_td_fits", True)),
-                "save_cell_json": bool(save_options.get("save_cell_json", True)),
+                "save_stack_json": bool(
+                    save_options.get(
+                        "save_stack_json",
+                        save_options.get("save_cell_json", True),
+                    )
+                ),
                 "save_important_images": bool(save_options.get("save_important_images", True)),
             }
+            experiment_state["nuwt_status"] = str(
+                experiment_state.get("nuwt_status") or "pending"
+            )
+            experiment_state["wavelet_status"] = str(
+                experiment_state.get("wavelet_status") or "pending"
+            )
+            experiment_state["tables_status"] = str(
+                experiment_state.get("tables_status") or "pending"
+            )
+            experiment_state["study_td_params"] = self._experiment_study_td_params(
+                experiment_state
+            )
+            experiment_state["study_crest_params"] = self._experiment_study_crest_params(
+                experiment_state
+            )
+            experiment_state["study_wavelet_params"] = self._experiment_study_wavelet_params(
+                experiment_state
+            )
+            experiment_state["stack_outputs"] = dict(
+                experiment_state.get("stack_outputs") or {}
+            )
+            self._sync_experiment_state_from_disk(experiment_state)
             experiment_state["important_zone_rules"] = {
                 **dict(self._make_default_experiment_state(experiment_id, "")["important_zone_rules"]),
                 **dict(experiment_state.get("important_zone_rules") or {}),
             }
+            available_modes: list[str] = []
+            if experiment_state["displacement_stack_ids"]:
+                available_modes.append("displacement")
+            if experiment_state["rotation_stack_ids"]:
+                available_modes.append("rotation")
+            current_view_mode = self._normalize_experiment_stack_mode(
+                experiment_state.get("view_mode", "displacement")
+            )
+            if available_modes and current_view_mode not in available_modes:
+                current_view_mode = str(available_modes[0])
+            experiment_state["view_mode"] = current_view_mode
+            stack_group_mode = self._normalize_experiment_stack_mode(
+                experiment_state.get("stack_group_mode", current_view_mode)
+            )
+            if available_modes and stack_group_mode not in available_modes:
+                stack_group_mode = current_view_mode
+            experiment_state["stack_group_mode"] = stack_group_mode
             self.experiments[experiment_id] = experiment_state
         self.next_experiment_id = max(
             int(payload.get("next_experiment_id", 1)),
@@ -4600,6 +5534,11 @@ class TDMosaicApp:
             self._update_experiment_job_widgets()
             return
 
+        if message_type == "stack_done" and job.get("kind") == "experiment":
+            self._apply_background_experiment_stack_result(message)
+            self._update_experiment_job_widgets()
+            return
+
         if message_type == "done":
             if job.get("kind") == "wavelet":
                 panel_id = int(job.get("panel_id", 0) or 0)
@@ -4624,17 +5563,58 @@ class TDMosaicApp:
                 self.background_jobs.pop(job_id, None)
             elif job.get("kind") == "experiment":
                 experiment_id = int(message.get("experiment_id", 0) or 0)
+                stage_name = str(message.get("stage_name") or job.get("stage_name") or "")
+                experiment = self.experiments.get(experiment_id)
                 self.background_jobs.pop(job_id, None)
-                self._finalize_experiment_outputs(
-                    experiment_id,
-                    summary=str(message.get("summary", "")),
-                )
+                if experiment is not None:
+                    experiment["updated_at"] = self._timestamp_now()
+                    experiment["last_run_summary"] = str(message.get("summary", ""))
+                    if stage_name == "nuwt":
+                        experiment["nuwt_status"] = "completed"
+                        experiment["status"] = "nuwt_completed"
+                    elif stage_name == "wavelet":
+                        experiment["wavelet_status"] = "completed"
+                        experiment["status"] = "wavelet_completed"
+                    elif stage_name == "tables":
+                        experiment["tables_status"] = "completed"
+                        experiment["status"] = "completed"
+                        experiment["completed_at"] = self._timestamp_now()
+                    self._write_experiment_metadata_files(experiment)
+                if stage_name == "wavelet":
+                    queued = self._queue_experiment_tables_job(
+                        experiment_id,
+                        queued_summary=f"Queued tables rebuild for {job.get('panel_name', '')}.",
+                        completion_summary=(
+                            f"Completed wavelet and tables for {job.get('panel_name', '')}."
+                        ),
+                    )
+                    if not queued:
+                        self._finalize_experiment_outputs(
+                            experiment_id,
+                            summary=str(message.get("summary", "")),
+                        )
+                else:
+                    self._record_session_change()
+                    self.refresh_all()
+                    if experiment is not None:
+                        self._set_status(
+                            (
+                                str(message.get("summary", ""))
+                                or "Study stage completed."
+                            )
+                            + f" Folder: {self._experiment_output_display_path(experiment)}"
+                        )
+                    else:
+                        self._set_status(
+                            str(message.get("summary", "")) or "Study stage completed."
+                        )
                 self._update_experiment_job_widgets()
             return
 
         if message_type == "cancelled":
             panel_id = int(job.get("panel_id", 0) or 0)
             panel_name = str(job.get("panel_name", ""))
+            stage_name = str(message.get("stage_name") or job.get("stage_name") or "")
             self.background_jobs.pop(job_id, None)
             if job.get("kind") == "wavelet" and panel_id:
                 self._update_wavelet_job_widgets(panel_id)
@@ -4647,7 +5627,14 @@ class TDMosaicApp:
                 if experiment is not None:
                     experiment["status"] = "cancelled"
                     experiment["updated_at"] = self._timestamp_now()
-                    experiment["last_run_summary"] = "Run cancelled."
+                    experiment["last_run_summary"] = f"{stage_name or 'study'} cancelled."
+                    if stage_name == "nuwt":
+                        experiment["nuwt_status"] = "cancelled"
+                    elif stage_name == "wavelet":
+                        experiment["wavelet_status"] = "cancelled"
+                    elif stage_name == "tables":
+                        experiment["tables_status"] = "cancelled"
+                    self._write_experiment_metadata_files(experiment)
                 self._update_experiment_job_widgets()
                 self._record_session_change()
                 self.refresh_all()
@@ -4657,6 +5644,7 @@ class TDMosaicApp:
         if message_type == "error":
             panel_id = int(job.get("panel_id", 0) or 0)
             panel_name = str(job.get("panel_name", ""))
+            stage_name = str(message.get("stage_name") or job.get("stage_name") or "")
             error_text = str(message.get("error", "Background job failed."))
             self.background_jobs.pop(job_id, None)
             if job.get("kind") == "wavelet" and panel_id:
@@ -4676,6 +5664,13 @@ class TDMosaicApp:
                     experiment["status"] = "failed"
                     experiment["updated_at"] = self._timestamp_now()
                     experiment["last_run_summary"] = error_text
+                    if stage_name == "nuwt":
+                        experiment["nuwt_status"] = "failed"
+                    elif stage_name == "wavelet":
+                        experiment["wavelet_status"] = "failed"
+                    elif stage_name == "tables":
+                        experiment["tables_status"] = "failed"
+                    self._write_experiment_metadata_files(experiment)
                 self._update_experiment_job_widgets()
                 self._record_session_change()
                 self.refresh_all()
@@ -4746,11 +5741,13 @@ class TDMosaicApp:
         self.experiment_progress_global_var.set(
             str(job.get("message") or f"Cells: {int(current)}/{int(total)}")
         )
+        outer_label = str(job.get("outer_label") or "Stacks")
+        inner_label = str(job.get("inner_label") or "Members")
         self.experiment_progress_outer_var.set(
-            f"Displacements: {int(outer_current)}/{int(outer_total)}"
+            f"{outer_label}: {int(outer_current)}/{int(outer_total)}"
         )
         self.experiment_progress_inner_var.set(
-            f"Angles: {int(inner_current)}/{int(inner_total)}"
+            f"{inner_label}: {int(inner_current)}/{int(inner_total)}"
         )
         self.experiment_progress_stage_var.set(
             f"Stage: {str(job.get('stage') or 'running')}"
@@ -5407,7 +6404,7 @@ class TDMosaicApp:
         self.refresh_td_views()
         self._set_status(summary or "Stack wavelet run completed.")
 
-    def _run_selected_experiment(self) -> None:
+    def _run_selected_experiment(self, stage_override: str | None = None) -> None:
         _existing_job_id, existing_job = self._background_experiment_job()
         if existing_job is not None:
             self._set_status("Wait for the current exhaustive study to finish first.")
@@ -5424,77 +6421,104 @@ class TDMosaicApp:
             return
 
         self._sync_all_panel_analysis_state_from_windows()
+        stack_specs = self._experiment_stack_specs(experiment)
+        if not stack_specs:
+            self._set_status("The selected study has no runnable stacks.")
+            return
+
+        requested_stage = str(stage_override or self._experiment_next_stage(experiment)).strip().lower()
+        if requested_stage not in {"nuwt", "wavelet", "tables"}:
+            requested_stage = self._experiment_next_stage(experiment)
+
+        if requested_stage == "tables":
+            if str(experiment.get("wavelet_status") or "pending") != "completed":
+                self._set_status("Complete Wavelet for this study before rebuilding the tables.")
+                return
+            queued = self._queue_experiment_tables_job(
+                int(experiment["experiment_id"]),
+                queued_summary=f"Queued tables rebuild for {experiment['name']}.",
+                completion_summary=f"Rebuilt tables for {experiment['name']}.",
+            )
+            if not queued:
+                self._finalize_experiment_outputs(
+                    int(experiment["experiment_id"]),
+                    summary=f"Rebuilt tables for {experiment['name']}.",
+                )
+            return
+
+        if requested_stage == "nuwt":
+            prompted = self._prompt_experiment_nuwt_settings(experiment)
+            if prompted is None:
+                self._set_status("NUWT study run cancelled before start.")
+                return
+            study_td_params, study_crest_params = prompted
+            experiment["study_td_params"] = dict(study_td_params)
+            experiment["study_crest_params"] = dict(study_crest_params)
+            experiment["td_width"] = int(study_td_params["width"])
+            experiment["td_weighting"] = str(study_td_params["weighting"])
+            experiment["nuwt_status"] = "running"
+            experiment["wavelet_status"] = "pending"
+            experiment["tables_status"] = "pending"
+            experiment["status"] = "nuwt_running"
+            experiment["last_run_summary"] = "Queued NUWT stage."
+        else:
+            if str(experiment.get("nuwt_status") or "pending") != "completed":
+                self._set_status("Complete NUWT for this study before running wavelets.")
+                return
+            prompted_wavelet = self._prompt_experiment_wavelet_settings(experiment)
+            if prompted_wavelet is None:
+                self._set_status("Wavelet study run cancelled before start.")
+                return
+            experiment["study_wavelet_params"] = dict(prompted_wavelet)
+            experiment["wavelet_status"] = "running"
+            experiment["tables_status"] = "pending"
+            experiment["status"] = "wavelet_running"
+            experiment["last_run_summary"] = "Queued wavelet stage."
+
+        self._apply_experiment_params_to_cuts(experiment)
         root_dir = self._experiment_output_root(experiment)
-        cells = self._experiment_cells(experiment)
-        if not cells:
-            self._set_status("The selected study has no valid cells.")
-            return
+        self._ensure_experiment_output_structure(root_dir, experiment)
+        total_cells = int(sum(len(spec.get("cells") or []) for spec in stack_specs))
+        inner_total = max(len(stack_specs[0].get("cells") or []), 1)
 
-        offset_values = [float(value) for value in (experiment.get("offset_values") or [])]
-        angle_values = [float(value) for value in (experiment.get("angle_values") or [])]
-        cell_specs: list[dict[str, Any]] = []
-        for cell in cells:
-            cut_id = int(cell["cut_id"])
-            cut = self.cuts.get(cut_id)
-            if cut is None:
-                continue
-            params = self._cut_td_params(cut_id)
-            state = self._cut_analysis_snapshot(cut_id)
-            crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
-                state.get("crest_params"), state.get("wavelet_params")
-            )
-            cell_specs.append(
-                {
-                    "cell_id": str(cell["cell_id"]),
-                    "cut_id": int(cut_id),
-                    "cut_name": str(cut.name),
-                    "p0": [float(cut.p0[0]), float(cut.p0[1])],
-                    "p1": [float(cut.p1[0]), float(cut.p1[1])],
-                    "t_ini": int(params["t_ini"]),
-                    "t_fin": int(params["t_fin"]),
-                    "stride": int(params["stride"]),
-                    "width": int(params["width"]),
-                    "weighting": str(params["weighting"]),
-                    "crest_params": dict(crest_params),
-                    "wavelet_params": dict(wavelet_params),
-                    "offset_idx": int(cell.get("offset_idx", 0)),
-                    "offset_value": float(cell.get("offset_value", 0.0)),
-                    "angle_idx": int(cell.get("angle_idx", 0)),
-                    "angle_deg": float(cell.get("angle_deg", 0.0)),
-                    "cell_dir": str(root_dir / "cells" / str(cell["cell_id"])),
-                }
-            )
-
-        if not cell_specs:
-            self._set_status("The selected study has no runnable cells.")
-            return
-
-        experiment["status"] = "running"
         experiment["updated_at"] = self._timestamp_now()
-        experiment["last_run_summary"] = "Queued exhaustive run."
+        self._write_experiment_metadata_files(experiment)
+        self._record_session_change()
+
+        td_params = self._experiment_study_td_params(experiment)
+        crest_params = self._experiment_study_crest_params(experiment)
+        wavelet_params = self._experiment_study_wavelet_params(experiment)
+
         job_id, job = self._new_background_job(
             kind="experiment",
             panel_name=str(experiment.get("name") or f"Study {experiment['experiment_id']}"),
         )
         job["experiment_id"] = int(experiment["experiment_id"])
+        job["stage_name"] = str(requested_stage)
         job["current"] = 0
-        job["total"] = max(len(cell_specs), 1)
+        job["total"] = max(total_cells, 1)
         job["outer_current"] = 0
-        job["outer_total"] = max(len(offset_values), 1)
+        job["outer_total"] = max(len(stack_specs), 1)
         job["inner_current"] = 0
-        job["inner_total"] = max(len(angle_values), 1)
-        job["message"] = f"{experiment['name']}: queued exhaustive run."
+        job["inner_total"] = max(inner_total, 1)
+        job["message"] = f"{experiment['name']}: queued {requested_stage} stage."
         thread = threading.Thread(
             target=self._experiment_worker,
             args=(
                 job_id,
                 int(experiment["experiment_id"]),
                 str(experiment["name"]),
+                str(requested_stage),
                 str(root_dir),
-                self._clone_wavelet_payload(cell_specs),
+                self._clone_wavelet_payload(stack_specs),
+                dict(td_params),
+                dict(crest_params),
+                dict(wavelet_params),
                 {
                     "save_td_fits": bool(experiment.get("save_options", {}).get("save_td_fits", True)),
-                    "save_cell_json": bool(experiment.get("save_options", {}).get("save_cell_json", True)),
+                    "save_stack_json": bool(
+                        experiment.get("save_options", {}).get("save_stack_json", True)
+                    ),
                 },
                 job["cancel_event"],
             ),
@@ -5504,7 +6528,78 @@ class TDMosaicApp:
         thread.start()
         self._update_experiment_job_widgets()
         self._refresh_experiment_list()
-        self._set_status(f"Running exhaustive study for {experiment['name']}...")
+        self._set_status(
+            f"Running {requested_stage} stage for {experiment['name']} in {root_dir}..."
+        )
+
+    def _queue_experiment_tables_job(
+        self,
+        experiment_id: int,
+        *,
+        queued_summary: str = "",
+        completion_summary: str = "",
+    ) -> bool:
+        experiment = self.experiments.get(int(experiment_id))
+        if experiment is None:
+            return False
+        stack_outputs = dict(experiment.get("stack_outputs") or {})
+        ordered_stack_ids = self._experiment_stack_ids_for_processing(experiment)
+        if not stack_outputs or not ordered_stack_ids:
+            return False
+
+        root_dir = self._experiment_output_root(experiment)
+        cut_total = max(len(self._experiment_cells(experiment)), 1)
+        stack_total = max(len(ordered_stack_ids), 1)
+        write_steps = stack_total + 9
+        total_steps = max(len(ordered_stack_ids) + cut_total + write_steps + 2, 1)
+
+        experiment["tables_status"] = "running"
+        experiment["status"] = "tables_running"
+        experiment["updated_at"] = self._timestamp_now()
+        experiment["last_run_summary"] = queued_summary or "Queued tables rebuild."
+        self._write_experiment_metadata_files(experiment)
+        self._record_session_change()
+
+        job_id, job = self._new_background_job(
+            kind="experiment",
+            panel_name=str(experiment.get("name") or f"Study {experiment['experiment_id']}"),
+        )
+        job["experiment_id"] = int(experiment["experiment_id"])
+        job["stage_name"] = "tables"
+        job["current"] = 0
+        job["total"] = total_steps
+        job["outer_current"] = 0
+        job["outer_total"] = stack_total
+        job["inner_current"] = 0
+        job["inner_total"] = 1
+        job["outer_label"] = "Stacks"
+        job["inner_label"] = "Items"
+        job["message"] = (
+            queued_summary or f"{experiment['name']}: queued tables rebuild."
+        )
+
+        thread = threading.Thread(
+            target=self._experiment_tables_worker,
+            args=(
+                job_id,
+                int(experiment["experiment_id"]),
+                str(experiment["name"]),
+                str(root_dir),
+                self._json_safe(experiment),
+                [int(stack_id) for stack_id in ordered_stack_ids],
+                str(completion_summary or f"Rebuilt tables for {experiment['name']}."),
+                job["cancel_event"],
+            ),
+            daemon=True,
+        )
+        job["thread"] = thread
+        thread.start()
+        self._update_experiment_job_widgets()
+        self._refresh_experiment_list()
+        self._set_status(
+            f"Running tables stage for {experiment['name']} in {root_dir}..."
+        )
+        return True
 
     def _cancel_running_experiment(self) -> None:
         _job_id, job = self._background_experiment_job()
@@ -5519,6 +6614,1458 @@ class TDMosaicApp:
         )
 
     def _experiment_worker(
+        self,
+        job_id: str,
+        experiment_id: int,
+        experiment_name: str,
+        stage_name: str,
+        export_root: str,
+        stack_specs: list[dict[str, Any]],
+        td_params: dict[str, Any],
+        crest_params: dict[str, Any],
+        wavelet_params: dict[str, Any],
+        save_options: dict[str, bool],
+        cancel_event: threading.Event,
+    ) -> None:
+        nuwt_api, nuwt_error = load_local_nuwt_api()
+        if nuwt_api is None:
+            self.background_queue.put(
+                {"type": "error", "job_id": job_id, "stage_name": stage_name, "error": str(nuwt_error)}
+            )
+            return
+        wavelet_api: dict[str, Any] | None = None
+        if str(stage_name) == "wavelet":
+            wavelet_api, wavelet_error = load_local_wavelet_filter_api()
+            if wavelet_api is None:
+                self.background_queue.put(
+                    {
+                        "type": "error",
+                        "job_id": job_id,
+                        "stage_name": stage_name,
+                        "error": str(wavelet_error),
+                    }
+                )
+                return
+
+        root_dir = Path(export_root).expanduser().resolve()
+        root_dir.mkdir(parents=True, exist_ok=True)
+        run_log_path = root_dir / "run_log.txt"
+        total_cells = max(
+            int(sum(len(spec.get("cells") or []) for spec in stack_specs)),
+            1,
+        )
+
+        def _append_log(line: str) -> None:
+            run_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(run_log_path, "a", encoding="utf-8") as handle:
+                handle.write(line.rstrip() + "\n")
+
+        def _queue_progress(
+            stage_label: str,
+            current: int,
+            stack_index: int,
+            stack_total: int,
+            member_index: int,
+            member_total: int,
+            message: str,
+        ) -> None:
+            self.background_queue.put(
+                {
+                    "type": "progress",
+                    "job_id": job_id,
+                    "stage": stage_label,
+                    "current": int(current),
+                    "total": int(total_cells),
+                    "outer_current": int(stack_index),
+                    "outer_total": max(int(stack_total), 1),
+                    "inner_current": int(member_index),
+                    "inner_total": max(int(member_total), 1),
+                    "message": str(message),
+                }
+            )
+
+        def _write_stack_td_cube(
+            stack_spec: dict[str, Any],
+            member_tds: list[np.ndarray],
+            member_meta: list[dict[str, Any]],
+        ) -> str:
+            if not member_tds:
+                return ""
+            max_t = max((int(td.shape[0]) for td in member_tds), default=0)
+            max_s = max((int(td.shape[1]) for td in member_tds), default=0)
+            cube = np.full((len(member_tds), max_t, max_s), np.nan, dtype=np.float32)
+            for member_idx, td in enumerate(member_tds):
+                cube[member_idx, : td.shape[0], : td.shape[1]] = td
+            stack_base = self._experiment_stack_base_path(
+                root_dir,
+                int(stack_spec["stack_id"]),
+                str(stack_spec["stack_name"]),
+                str(stack_spec["stack_kind"]),
+            )
+            save_path = stack_base.with_name(stack_base.name + "_td.fits")
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            header = fits.Header()
+            header["EXPTYPE"] = ("EXHSTK", "Exhaustive stack TD cube")
+            header["EXPID"] = (int(experiment_id), "Experiment id")
+            header["STACKID"] = (int(stack_spec["stack_id"]), "Stack id")
+            header["STKNAME"] = (str(stack_spec["stack_name"]), "Stack name")
+            header["STKTYP"] = (str(stack_spec["stack_kind"]).upper(), "Stack family")
+            header["NMEMBER"] = (int(len(member_tds)), "Members in stack")
+            header["MAXT"] = (int(max_t), "Padded time axis length")
+            header["MAXS"] = (int(max_s), "Padded distance axis length")
+            header["TDWIDTH"] = (int(td_params["width"]), "TD sampling width")
+            header["WEIGHT"] = (str(td_params["weighting"]), "TD weighting")
+            fits.PrimaryHDU(data=cube, header=header).writeto(save_path, overwrite=True)
+            meta_path = stack_base.with_name(stack_base.name + "_td_members.json")
+            self._write_json_file(
+                meta_path,
+                {
+                    "experiment_id": int(experiment_id),
+                    "experiment_name": str(experiment_name),
+                    "stack_id": int(stack_spec["stack_id"]),
+                    "stack_name": str(stack_spec["stack_name"]),
+                    "stack_kind": str(stack_spec["stack_kind"]),
+                    "members": member_meta,
+                    "td_fits_path": str(save_path),
+                },
+            )
+            return str(save_path)
+
+        try:
+            global_index = 0
+            stack_total = max(len(stack_specs), 1)
+            for stack_index, stack_spec in enumerate(stack_specs, start=1):
+                member_total = max(len(stack_spec.get("cells") or []), 1)
+                stack_ref = {
+                    "stack_id": int(stack_spec["stack_id"]),
+                    "stack_name": str(stack_spec["stack_name"]),
+                    "stack_kind": str(stack_spec["stack_kind"]),
+                }
+                stack_base = self._experiment_stack_base_path(
+                    root_dir,
+                    int(stack_spec["stack_id"]),
+                    str(stack_spec["stack_name"]),
+                    str(stack_spec["stack_kind"]),
+                )
+                stack_cells_rows: list[dict[str, Any]] = []
+                stack_master_rows: list[dict[str, Any]] = []
+                stack_trace_rows: list[dict[str, Any]] = []
+                member_tds: list[np.ndarray] = []
+                member_meta: list[dict[str, Any]] = []
+
+                for member_index, cell in enumerate(stack_spec.get("cells") or [], start=1):
+                    if cancel_event.is_set():
+                        self.background_queue.put(
+                            {
+                                "type": "cancelled",
+                                "job_id": job_id,
+                                "stage_name": stage_name,
+                            }
+                        )
+                        return
+
+                    global_index += 1
+                    cut_id = int(cell["cut_id"])
+                    cut = self.cuts.get(cut_id)
+                    if cut is None:
+                        continue
+                    cell_id = str(cell.get("cell_id") or f"cut_{cut_id:03d}")
+                    cell_dir = Path(
+                        str(cell.get("cell_dir") or root_dir / "cells" / cell_id)
+                    ).expanduser().resolve()
+                    cell_dir.mkdir(parents=True, exist_ok=True)
+                    td_fits_path = str(cell_dir / "td.fits")
+                    nuwt_result_path = str(cell_dir / "nuwt_result.json")
+                    wavelet_result_path = str(cell_dir / "wavelet_result.json")
+
+                    if str(stage_name) == "nuwt":
+                        _queue_progress(
+                            "TD",
+                            global_index - 1,
+                            stack_index - 1,
+                            stack_total,
+                            member_index - 1,
+                            member_total,
+                            (
+                                f"{experiment_name}: TD stack {stack_index}/{stack_total} "
+                                f"cell {member_index}/{member_total}"
+                            ),
+                        )
+                        td, meta = compute_td(
+                            self.cube,
+                            cut,
+                            int(td_params["t_ini"]),
+                            int(td_params["t_fin"]),
+                            int(td_params["stride"]),
+                            int(td_params["width"]),
+                            str(td_params["weighting"]),
+                            dynamic_geometry=self._dynamic_cut_geometry_samples(
+                                int(cut_id),
+                                int(td_params["t_ini"]),
+                                int(td_params["t_fin"]),
+                                int(td_params["stride"]),
+                            )
+                            or None,
+                        )
+                        td = np.asarray(td, dtype=np.float32)
+                        meta_payload = dict(meta)
+                        if bool(save_options.get("save_td_fits", True)):
+                            header = fits.Header()
+                            header["EXPTYPE"] = ("EXH_TD", "Exhaustive study TD map")
+                            header["EXPID"] = (int(experiment_id), "Experiment id")
+                            header["CUTID"] = (int(cut_id), "Generated cut id")
+                            header["CUTNAME"] = (str(cut.name), "Generated cut label")
+                            header["OFFIDX"] = (int(cell.get("offset_idx", 0)), "Offset index")
+                            header["OFFVAL"] = (float(cell.get("offset_value", 0.0)), "Offset value [px]")
+                            header["ANGIDX"] = (int(cell.get("angle_idx", 0)), "Angle index")
+                            header["ANGVAL"] = (float(cell.get("angle_deg", 0.0)), "Angle value [deg]")
+                            header["TINI"] = (int(td_params["t_ini"]), "Initial time index")
+                            header["TFIN"] = (int(td_params["t_fin"]), "Final time index")
+                            header["STRIDE"] = (int(td_params["stride"]), "Time stride")
+                            header["WIDTH"] = (int(td_params["width"]), "Sampling width")
+                            header["WEIGHT"] = (str(td_params["weighting"]), "Sampling weighting")
+                            fits.PrimaryHDU(data=td, header=header).writeto(
+                                td_fits_path,
+                                overwrite=True,
+                            )
+
+                        _queue_progress(
+                            "NUWT",
+                            global_index - 1,
+                            stack_index - 1,
+                            stack_total,
+                            member_index,
+                            member_total,
+                            (
+                                f"{experiment_name}: NUWT stack {stack_index}/{stack_total} "
+                                f"cell {member_index}/{member_total}"
+                            ),
+                        )
+                        td_nuwt = np.asarray(td, dtype=np.float64).T
+                        finite = np.isfinite(td_nuwt)
+                        if not np.any(finite):
+                            raise ValueError(f"{cut.name} has no finite TD values.")
+                        fill_value = float(np.nanmin(td_nuwt[finite]))
+                        if not np.all(finite):
+                            td_nuwt = np.where(finite, td_nuwt, fill_value)
+                        located = nuwt_api["locate_things"](
+                            td_nuwt,
+                            invert=bool(crest_params["invert"]),
+                            grad=float(crest_params["grad"]),
+                            res=float(crest_params["res"]),
+                            cad=float(crest_params["cad"]),
+                            nearest_pixel=not bool(crest_params["gauss"]),
+                        )
+                        threads, _ = nuwt_api["follow_threads"](
+                            located,
+                            min_tlen=int(crest_params["min_tlen"]),
+                            max_dist_jump=int(crest_params["max_dist_jump"]),
+                            max_time_skip=int(crest_params["max_time_skip"]),
+                        )
+                        threads = nuwt_api["patch_up_threads"](
+                            threads, fit_flag=0, simp_fill=False, debug=False
+                        )
+                        located_count = int(
+                            np.count_nonzero(np.asarray(located.get("errs", [])) > 0)
+                        )
+                        thread_count = int(len(threads))
+                        crest_summary = (
+                            f"Located {located_count} crest bins. "
+                            f"Threads: {thread_count}. Longest: "
+                            f"{max((int(th.get('length', 0)) for th in threads), default=0)}."
+                        )
+                        self._write_json_file(
+                            Path(nuwt_result_path),
+                            {
+                                "experiment_id": int(experiment_id),
+                                "experiment_name": str(experiment_name),
+                                "cell": dict(cell),
+                                "cut": {
+                                    "cut_id": int(cut_id),
+                                    "cut_name": str(cut.name),
+                                    "p0": [float(cut.p0[0]), float(cut.p0[1])],
+                                    "p1": [float(cut.p1[0]), float(cut.p1[1])],
+                                },
+                                "td_params": dict(td_params),
+                                "crest_params": dict(crest_params),
+                                "td_meta": meta_payload,
+                                "crest_summary": crest_summary,
+                                "crest_tracking_result": {
+                                    "located": located,
+                                    "threads": threads,
+                                    "params": dict(crest_params),
+                                },
+                                "td_fits_path": (
+                                    td_fits_path if bool(save_options.get("save_td_fits", True)) else ""
+                                ),
+                            },
+                        )
+                        stack_cells_rows.append(
+                            {
+                                "experiment_id": int(experiment_id),
+                                "experiment_name": str(experiment_name),
+                                "cell_id": cell_id,
+                                "cut_id": int(cut_id),
+                                "cut_name": str(cut.name),
+                                "offset_idx": int(cell.get("offset_idx", 0)),
+                                "offset_value": float(cell.get("offset_value", 0.0)),
+                                "angle_idx": int(cell.get("angle_idx", 0)),
+                                "angle_deg": float(cell.get("angle_deg", 0.0)),
+                                "status": "nuwt_completed",
+                                "segment_count": 0,
+                                "accepted_count": 0,
+                                "roi_enabled": bool(self._cut_analysis(cut_id).get("roi_enabled", False)),
+                                "roi_t_span": str(self._cut_analysis(cut_id).get("roi_t_span", "") or ""),
+                                "roi_d_span": str(self._cut_analysis(cut_id).get("roi_d_span", "") or ""),
+                                "t_ini": int(td_params["t_ini"]),
+                                "t_fin": int(td_params["t_fin"]),
+                                "stride": int(td_params["stride"]),
+                                "width": int(td_params["width"]),
+                                "weighting": str(td_params["weighting"]),
+                                "cell_dir": str(cell_dir),
+                                "td_fits_path": (
+                                    td_fits_path if bool(save_options.get("save_td_fits", True)) else ""
+                                ),
+                                "nuwt_result_path": nuwt_result_path,
+                                "wavelet_result_path": "",
+                                "located_count": located_count,
+                                "thread_count": thread_count,
+                            }
+                        )
+                        member_tds.append(np.asarray(td, dtype=np.float32))
+                        member_meta.append(
+                            {
+                                "member_index": int(member_index),
+                                "cell_id": cell_id,
+                                "cut_id": int(cut_id),
+                                "cut_name": str(cut.name),
+                                "offset_idx": int(cell.get("offset_idx", 0)),
+                                "offset_value": float(cell.get("offset_value", 0.0)),
+                                "angle_idx": int(cell.get("angle_idx", 0)),
+                                "angle_deg": float(cell.get("angle_deg", 0.0)),
+                                "td_shape": [int(td.shape[0]), int(td.shape[1])],
+                                "cut_length_px": float(meta_payload.get("cut_length", float("nan"))),
+                                "t_indices": self._json_safe(meta_payload.get("t_indices", [])),
+                                "distances": self._json_safe(meta_payload.get("distances", [])),
+                            }
+                        )
+                        self.background_queue.put(
+                            {
+                                "type": "cell_done",
+                                "job_id": job_id,
+                                "stage_name": stage_name,
+                                "experiment_id": int(experiment_id),
+                                "cut_id": int(cut_id),
+                                "cell_id": cell_id,
+                                "cell_dir": str(cell_dir),
+                                "td_fits_path": (
+                                    td_fits_path if bool(save_options.get("save_td_fits", True)) else ""
+                                ),
+                                "nuwt_result_path": nuwt_result_path,
+                                "wavelet_result_path": "",
+                                "segment_count": 0,
+                                "accepted_count": 0,
+                                "crest_summary": crest_summary,
+                            }
+                        )
+                        _append_log(
+                            f"{self._timestamp_now()} | stage=nuwt | stack={int(stack_spec['stack_id'])} "
+                            f"| cell={cell_id} | cut={int(cut_id)} | located={located_count} "
+                            f"threads={thread_count}"
+                        )
+                    else:
+                        if not Path(nuwt_result_path).exists():
+                            raise FileNotFoundError(
+                                f"Missing NUWT result for cell {cell_id}: {nuwt_result_path}"
+                            )
+                        nuwt_payload = self._read_json_file(Path(nuwt_result_path))
+                        crest_tracking_result = dict(
+                            nuwt_payload.get("crest_tracking_result") or {}
+                        )
+                        threads = list(crest_tracking_result.get("threads") or [])
+                        meta_payload = dict(nuwt_payload.get("td_meta") or {})
+                        _queue_progress(
+                            "Wavelet",
+                            global_index - 1,
+                            stack_index - 1,
+                            stack_total,
+                            member_index,
+                            member_total,
+                            (
+                                f"{experiment_name}: Wavelet stack {stack_index}/{stack_total} "
+                                f"cell {member_index}/{member_total}"
+                            ),
+                        )
+                        segments = wavelet_api["analyze_tracked_threads_with_wavelets"](
+                            threads,
+                            np.asarray(meta_payload.get("t_indices", []), dtype=np.float64),
+                            cadence=float(crest_params["cad"]),
+                            pix_scale=float(crest_params["res"]),
+                            km_per_arcsec=float(wavelet_params["km_per_arcsec"]),
+                            p_min=float(wavelet_params["p_min"]),
+                            p_max=float(wavelet_params["p_max"]),
+                            power_ratio_thresh=float(wavelet_params["power_ratio_thresh"]),
+                            segment_power_frac=float(wavelet_params["segment_power_frac"]),
+                            min_points_segment=int(wavelet_params["min_points_segment"]),
+                            min_amp_arcsec=float(wavelet_params["min_amp_arcsec"]),
+                            max_jump_pix=float(wavelet_params["max_jump_pix"]),
+                            min_points_cut_seg=int(wavelet_params["min_points_cut_seg"]),
+                            rms_amp_ratio_max=float(wavelet_params["rms_amp_ratio_max"]),
+                            density_kg_m3=float(wavelet_params["density_kg_m3"]),
+                            phase_speed_km_s=float(wavelet_params["phase_speed_km_s"]),
+                        )
+                        wavelet_runtime_params = {
+                            "cad": float(crest_params["cad"]),
+                            "res": float(crest_params["res"]),
+                            **dict(wavelet_params),
+                        }
+                        run_payload = self._replacement_wavelet_run_payload(
+                            segments,
+                            wavelet_runtime_params,
+                        )
+                        events = run_payload["events"]
+                        thread_count = int(len(threads))
+                        longest_thread = max(
+                            (
+                                int(thread.get("length", 0) or 0)
+                                for thread in threads
+                                if isinstance(thread, dict)
+                            ),
+                            default=0,
+                        )
+                        cell_master_rows = [
+                            self._experiment_master_row_from_event(
+                                {"experiment_id": experiment_id, "name": experiment_name},
+                                cell,
+                                stack_ref,
+                                cut,
+                                event,
+                                crest_params,
+                                wavelet_params,
+                            )
+                            for event in events
+                        ]
+                        self._annotate_curated_group_rows(cell_master_rows)
+                        cell_trace_rows: list[dict[str, Any]] = []
+                        for row, event in zip(cell_master_rows, events):
+                            for trace_row in self._event_trace_rows(
+                                int(cut_id),
+                                event,
+                                meta=meta_payload,
+                            ):
+                                cell_trace_rows.append(
+                                    {
+                                        "experiment_id": int(experiment_id),
+                                        "experiment_name": str(experiment_name),
+                                        "cut_id": int(cut_id),
+                                        "event_id": int(row["event_id"]),
+                                        "cell_id": cell_id,
+                                        "offset_idx": int(cell.get("offset_idx", 0)),
+                                        "offset_value": float(cell.get("offset_value", 0.0)),
+                                        "angle_idx": int(cell.get("angle_idx", 0)),
+                                        "angle_deg": float(cell.get("angle_deg", 0.0)),
+                                        **trace_row,
+                                    }
+                                )
+                        threads_table_path, thread_rows_count = self._write_cell_threads_table(
+                            int(cut_id),
+                            cell_dir,
+                            threads,
+                            meta=meta_payload,
+                        )
+                        accepted_count = int(run_payload["accepted_count"])
+                        segment_count = int(len(run_payload["filtered_segments"]))
+                        self._write_json_file(
+                            Path(wavelet_result_path),
+                            {
+                                "experiment_id": int(experiment_id),
+                                "experiment_name": str(experiment_name),
+                                "cell": dict(cell),
+                                "cut": {
+                                    "cut_id": int(cut_id),
+                                    "cut_name": str(cut.name),
+                                },
+                                "td_params": dict(td_params),
+                                "crest_params": dict(crest_params),
+                                "wavelet_params": dict(wavelet_runtime_params),
+                                "wavelet_filter_result": dict(run_payload["result"]),
+                                "tracked_threads": threads,
+                                "thread_count": int(thread_count),
+                                "longest_thread": int(longest_thread),
+                                "thread_rows_count": int(thread_rows_count),
+                                "threads_table_path": str(threads_table_path),
+                                "filtered_segments": self._clone_wavelet_payload(
+                                    run_payload["filtered_segments"]
+                                ),
+                                "wavelet_events": events,
+                                "summary_rows": cell_master_rows,
+                                "trace_rows_count": int(len(cell_trace_rows)),
+                                "segment_count": segment_count,
+                                "accepted_count": accepted_count,
+                            },
+                        )
+                        self._write_table_bundle(cell_dir / "events_table", cell_master_rows)
+                        self._write_table_bundle(cell_dir / "trace_table", cell_trace_rows)
+                        stack_master_rows.extend(cell_master_rows)
+                        stack_trace_rows.extend(cell_trace_rows)
+                        stack_cells_rows.append(
+                            {
+                                "experiment_id": int(experiment_id),
+                                "experiment_name": str(experiment_name),
+                                "cell_id": cell_id,
+                                "cut_id": int(cut_id),
+                                "cut_name": str(cut.name),
+                                "offset_idx": int(cell.get("offset_idx", 0)),
+                                "offset_value": float(cell.get("offset_value", 0.0)),
+                                "angle_idx": int(cell.get("angle_idx", 0)),
+                                "angle_deg": float(cell.get("angle_deg", 0.0)),
+                                "status": "wavelet_completed",
+                                "segment_count": segment_count,
+                                "accepted_count": accepted_count,
+                                "roi_enabled": bool(self._cut_analysis(cut_id).get("roi_enabled", False)),
+                                "roi_t_span": str(self._cut_analysis(cut_id).get("roi_t_span", "") or ""),
+                                "roi_d_span": str(self._cut_analysis(cut_id).get("roi_d_span", "") or ""),
+                                "t_ini": int(td_params["t_ini"]),
+                                "t_fin": int(td_params["t_fin"]),
+                                "stride": int(td_params["stride"]),
+                                "width": int(td_params["width"]),
+                                "weighting": str(td_params["weighting"]),
+                                "cell_dir": str(cell_dir),
+                                "td_fits_path": td_fits_path if Path(td_fits_path).exists() else "",
+                                "nuwt_result_path": nuwt_result_path,
+                                "wavelet_result_path": wavelet_result_path,
+                                "threads_table_path": str(threads_table_path),
+                                "thread_count": int(thread_count),
+                                "longest_thread": int(longest_thread),
+                            }
+                        )
+                        self.background_queue.put(
+                            {
+                                "type": "cell_done",
+                                "job_id": job_id,
+                                "stage_name": stage_name,
+                                "experiment_id": int(experiment_id),
+                                "cut_id": int(cut_id),
+                                "cell_id": cell_id,
+                                "cell_dir": str(cell_dir),
+                                "td_fits_path": td_fits_path if Path(td_fits_path).exists() else "",
+                                "nuwt_result_path": nuwt_result_path,
+                                "wavelet_result_path": wavelet_result_path,
+                                "threads_table_path": str(threads_table_path),
+                                "thread_count": int(thread_count),
+                                "longest_thread": int(longest_thread),
+                                "segment_count": segment_count,
+                                "accepted_count": accepted_count,
+                                "wavelet_filter_result": dict(run_payload["result"]),
+                            }
+                        )
+                        _append_log(
+                            f"{self._timestamp_now()} | stage=wavelet | stack={int(stack_spec['stack_id'])} "
+                            f"| cell={cell_id} | cut={int(cut_id)} | segments={segment_count} "
+                            f"accepted={accepted_count}"
+                        )
+
+                    self.background_queue.put(
+                        {
+                            "type": "progress",
+                            "job_id": job_id,
+                            "stage": "Save",
+                            "current": int(global_index),
+                            "total": int(total_cells),
+                            "outer_current": int(stack_index),
+                            "outer_total": int(stack_total),
+                            "inner_current": int(member_index),
+                            "inner_total": int(member_total),
+                            "message": (
+                                f"{experiment_name}: saved stack {stack_index}/{stack_total} "
+                                f"cell {member_index}/{member_total}"
+                            ),
+                        }
+                    )
+
+                stack_td_fits_path = ""
+                if str(stage_name) == "nuwt" and bool(save_options.get("save_td_fits", True)):
+                    stack_td_fits_path = _write_stack_td_cube(stack_spec, member_tds, member_meta)
+
+                cells_table_path = str(stack_base.with_name(stack_base.name + "_cells_table.json"))
+                self._write_table_bundle(
+                    stack_base.with_name(stack_base.name + "_cells_table"),
+                    stack_cells_rows,
+                )
+                master_table_path = ""
+                trace_table_path = ""
+                if str(stage_name) == "wavelet":
+                    self._annotate_curated_group_rows(stack_master_rows)
+                    self._write_table_bundle(
+                        stack_base.with_name(stack_base.name + "_master_table"),
+                        stack_master_rows,
+                    )
+                    self._write_table_bundle(
+                        stack_base.with_name(stack_base.name + "_trace_table"),
+                        stack_trace_rows,
+                    )
+                    master_table_path = str(
+                        stack_base.with_name(stack_base.name + "_master_table.json")
+                    )
+                    trace_table_path = str(
+                        stack_base.with_name(stack_base.name + "_trace_table.json")
+                    )
+
+                stack_summary_path = ""
+                if bool(save_options.get("save_stack_json", True)):
+                    stack_summary_path = str(
+                        stack_base.with_name(stack_base.name + f"_{stage_name}.json")
+                    )
+                    self._write_json_file(
+                        Path(stack_summary_path),
+                        {
+                            "experiment_id": int(experiment_id),
+                            "experiment_name": str(experiment_name),
+                            "stage_name": str(stage_name),
+                            "stack": dict(stack_ref),
+                            "cells_table_path": cells_table_path,
+                            "master_table_path": master_table_path,
+                            "trace_table_path": trace_table_path,
+                            "td_fits_path": stack_td_fits_path,
+                            "cell_count": int(len(stack_cells_rows)),
+                            "event_count": int(len(stack_master_rows)),
+                            "trace_count": int(len(stack_trace_rows)),
+                            "cells": stack_cells_rows,
+                        },
+                    )
+
+                self.background_queue.put(
+                    {
+                        "type": "stack_done",
+                        "job_id": job_id,
+                        "stage_name": stage_name,
+                        "experiment_id": int(experiment_id),
+                        "stack_id": int(stack_spec["stack_id"]),
+                        "stack_name": str(stack_spec["stack_name"]),
+                        "stack_kind": str(stack_spec["stack_kind"]),
+                        "cells_table_path": cells_table_path,
+                        "master_table_path": master_table_path,
+                        "trace_table_path": trace_table_path,
+                        "td_fits_path": stack_td_fits_path,
+                        "stack_json_path": stack_summary_path,
+                        "cell_count": int(len(stack_cells_rows)),
+                        "event_count": int(len(stack_master_rows)),
+                        "trace_count": int(len(stack_trace_rows)),
+                    }
+                )
+
+            self.background_queue.put(
+                {
+                    "type": "done",
+                    "job_id": job_id,
+                    "stage_name": stage_name,
+                    "experiment_id": int(experiment_id),
+                    "summary": (
+                        f"{stage_name.capitalize()} stage completed for {experiment_name}."
+                    ),
+                }
+            )
+        except Exception as exc:
+            self.background_queue.put(
+                {
+                    "type": "error",
+                    "job_id": job_id,
+                    "stage_name": stage_name,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    def _experiment_tables_worker(
+        self,
+        job_id: str,
+        experiment_id: int,
+        experiment_name: str,
+        export_root: str,
+        experiment_payload: dict[str, Any],
+        ordered_stack_ids: list[int],
+        completion_summary: str,
+        cancel_event: threading.Event,
+    ) -> None:
+        root_dir = Path(export_root).expanduser().resolve()
+        root_dir.mkdir(parents=True, exist_ok=True)
+        tables_root = root_dir / "tables"
+        tables_root.mkdir(parents=True, exist_ok=True)
+        stack_bundle_dir = tables_root / "stack_bundles"
+        stack_bundle_dir.mkdir(parents=True, exist_ok=True)
+        status_path = root_dir / "status.json"
+        run_log_path = root_dir / "run_log.txt"
+        stack_outputs = dict(experiment_payload.get("stack_outputs") or {})
+        ordered_stack_ids = [int(stack_id) for stack_id in ordered_stack_ids]
+        stack_total = max(len(ordered_stack_ids), 1)
+        cut_total = max(len(self._experiment_cells(experiment_payload)), 1)
+        write_steps = stack_total + 9
+        total_steps = max(len(ordered_stack_ids) + cut_total + write_steps + 2, 1)
+        current_stage = "prepare"
+        current_stack_id: int | None = None
+        current_cut_id: int | None = None
+        current_cell_id = ""
+        current_path = ""
+
+        def _append_log(line: str) -> None:
+            run_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(run_log_path, "a", encoding="utf-8") as handle:
+                handle.write(line.rstrip() + "\n")
+
+        def _debug_tables(message: str) -> None:
+            line = f"{self._timestamp_now()} | tables_debug | {message}"
+            print(line, file=sys.stderr, flush=True)
+            _append_log(line)
+
+        def _write_status(
+            *,
+            stage_label: str,
+            current: int,
+            outer_current: int,
+            outer_total: int,
+            inner_current: int,
+            inner_total: int,
+            message: str,
+        ) -> None:
+            self._write_json_file(
+                status_path,
+                {
+                    "experiment_id": int(experiment_id),
+                    "status": "tables_running",
+                    "nuwt_status": "completed",
+                    "wavelet_status": "completed",
+                    "tables_status": "running",
+                    "updated_at": self._timestamp_now(),
+                    "current": int(current),
+                    "total": int(total_steps),
+                    "outer_current": int(outer_current),
+                    "outer_total": max(int(outer_total), 1),
+                    "inner_current": int(inner_current),
+                    "inner_total": max(int(inner_total), 1),
+                    "stage": str(stage_label),
+                    "summary": str(message),
+                },
+            )
+
+        def _queue_progress(
+            *,
+            stage_label: str,
+            current: int,
+            outer_current: int,
+            outer_total: int,
+            inner_current: int,
+            inner_total: int,
+            message: str,
+        ) -> None:
+            _write_status(
+                stage_label=stage_label,
+                current=current,
+                outer_current=outer_current,
+                outer_total=outer_total,
+                inner_current=inner_current,
+                inner_total=inner_total,
+                message=message,
+            )
+            self.background_queue.put(
+                {
+                    "type": "progress",
+                    "job_id": job_id,
+                    "stage": stage_label,
+                    "current": int(current),
+                    "total": int(total_steps),
+                    "outer_current": int(outer_current),
+                    "outer_total": max(int(outer_total), 1),
+                    "inner_current": int(inner_current),
+                    "inner_total": max(int(inner_total), 1),
+                    "message": str(message),
+                }
+            )
+
+        def _check_cancel(stage_name: str, summary_text: str) -> bool:
+            if not cancel_event.is_set():
+                return False
+            self.background_queue.put(
+                {
+                    "type": "cancelled",
+                    "job_id": job_id,
+                    "stage_name": "tables",
+                }
+            )
+            _write_status(
+                stage_label=stage_name,
+                current=0,
+                outer_current=0,
+                outer_total=stack_total,
+                inner_current=0,
+                inner_total=1,
+                message=summary_text,
+            )
+            return True
+
+        try:
+            cells_rows: list[dict[str, Any]] = []
+            master_rows: list[dict[str, Any]] = []
+            trace_part_paths: list[str] = []
+            displacement_rows: list[dict[str, Any]] = []
+            rotation_rows: list[dict[str, Any]] = []
+            cell_index_rows: list[dict[str, Any]] = []
+            stack_index_rows: list[dict[str, Any]] = []
+            stack_cell_index_map: dict[int, list[dict[str, Any]]] = {}
+            summary_row_map: dict[int, dict[str, Any]] = {}
+            current_step = 0
+
+            _queue_progress(
+                stage_label="Prepare",
+                current=current_step,
+                outer_current=0,
+                outer_total=stack_total,
+                inner_current=0,
+                inner_total=1,
+                message=f"{experiment_name}: preparing tables rebuild.",
+            )
+
+            for stack_index, stack_id in enumerate(ordered_stack_ids, start=1):
+                current_stage = "load_tables"
+                current_stack_id = int(stack_id)
+                current_cut_id = None
+                current_cell_id = ""
+                current_path = ""
+                if _check_cancel("Load tables", f"{experiment_name}: tables rebuild cancelled."):
+                    return
+                info = dict(
+                    stack_outputs.get(str(int(stack_id)))
+                    or stack_outputs.get(int(stack_id))
+                    or {}
+                )
+                if info:
+                    cells_path = str(info.get("cells_table_path") or "")
+                    master_path = str(info.get("master_table_path") or "")
+                    trace_path = str(info.get("trace_table_path") or "")
+                    loaded_cells: list[dict[str, Any]] = []
+                    if cells_path and Path(cells_path).exists():
+                        current_path = str(Path(cells_path))
+                        loaded_cells_payload = self._read_json_file(Path(cells_path))
+                        if isinstance(loaded_cells_payload, list):
+                            loaded_cells = [
+                                dict(row)
+                                for row in loaded_cells_payload
+                                if isinstance(row, dict)
+                            ]
+                            cells_rows.extend(
+                                dict(row) for row in loaded_cells
+                            )
+                    stack_cell_index_rows: list[dict[str, Any]] = []
+                    stack_master_rows: list[dict[str, Any]] = []
+                    for cell_row in loaded_cells:
+                        current_stage = "thread_exports"
+                        current_cut_id = int(cell_row.get("cut_id", -1) or -1)
+                        current_cell_id = str(cell_row.get("cell_id") or "")
+                        current_path = str(cell_row.get("cell_dir") or "")
+                        thread_exports = self._ensure_saved_cell_wavelet_thread_exports(
+                            cell_row
+                        )
+                        stack_cell_index_rows.append(
+                            self._saved_experiment_cell_index_row(
+                                experiment_payload,
+                                info,
+                                cell_row,
+                                thread_exports,
+                            )
+                        )
+                        wavelet_payload = dict(
+                            thread_exports.get("wavelet_payload") or {}
+                        )
+                        if wavelet_payload:
+                            current_stage = "master_rows"
+                            stack_master_rows.extend(
+                                self._saved_cell_master_rows(
+                                    cell_row,
+                                    wavelet_payload,
+                                    thread_exports,
+                                )
+                            )
+                    if stack_cell_index_rows:
+                        cell_index_rows.extend(stack_cell_index_rows)
+                        stack_cell_index_map[int(stack_id)] = stack_cell_index_rows
+                    if stack_master_rows:
+                        master_rows.extend(stack_master_rows)
+                    elif master_path and Path(master_path).exists():
+                        current_stage = "fallback_master"
+                        current_path = str(Path(master_path))
+                        loaded_master = self._read_json_file(Path(master_path))
+                        if isinstance(loaded_master, list):
+                            master_rows.extend(
+                                dict(row)
+                                for row in loaded_master
+                                if isinstance(row, dict)
+                            )
+                    if trace_path and Path(trace_path).exists():
+                        current_stage = "trace_parts"
+                        current_path = str(Path(trace_path))
+                        trace_part_paths.append(trace_path)
+                    summary_row = {
+                        "experiment_id": int(experiment_payload["experiment_id"]),
+                        "stack_id": int(info.get("stack_id", stack_id)),
+                        "stack_name": str(info.get("stack_name") or ""),
+                        "cut_count": int(info.get("cell_count", 0) or 0),
+                        "stack_json_path": str(info.get("stack_json_path") or ""),
+                        "stack_csv_path": "",
+                        "stack_fits_path": str(info.get("td_fits_path") or ""),
+                        "stack_bundle_path": "",
+                    }
+                    summary_row_map[int(stack_id)] = summary_row
+                    if str(info.get("stack_kind") or "") == "rotation":
+                        rotation_rows.append(summary_row)
+                    else:
+                        displacement_rows.append(summary_row)
+
+                current_step += 1
+                _queue_progress(
+                    stage_label="Load tables",
+                    current=current_step,
+                    outer_current=stack_index,
+                    outer_total=stack_total,
+                    inner_current=1,
+                    inner_total=1,
+                    message=(
+                        f"{experiment_name}: loaded stack {stack_index}/{stack_total} "
+                        f"for tables rebuild."
+                    ),
+                )
+
+            self._annotate_curated_group_rows(master_rows)
+            current_stage = "novelty"
+            current_stack_id = None
+            current_cut_id = None
+            current_cell_id = ""
+            current_path = str(tables_root)
+            novelty_rows = self._build_experiment_novelty_rows(
+                experiment_payload, master_rows
+            )
+            novelty_map = {
+                (int(row["cut_id"]), int(row["event_id"])): row
+                for row in novelty_rows
+                if row.get("event_id") is not None
+            }
+            for row in master_rows:
+                novelty = novelty_map.get(
+                    (int(row["cut_id"]), int(row["event_id"])),
+                    {},
+                )
+                row["novelty_class"] = str(novelty.get("classification", ""))
+                row["novelty_score"] = float(
+                    novelty.get("novelty_score", float("nan"))
+                )
+                row["novelty_match_cut_id"] = novelty.get("matched_cut_id")
+                row["novelty_match_event_id"] = novelty.get("matched_event_id")
+            current_step += 1
+            _queue_progress(
+                stage_label="Novelty",
+                current=current_step,
+                outer_current=stack_total,
+                outer_total=stack_total,
+                inner_current=1,
+                inner_total=1,
+                message=f"{experiment_name}: computed novelty table.",
+            )
+
+            cell_lookup = {
+                int(row.get("cut_id", -1)): dict(row)
+                for row in cells_rows
+                if int(row.get("cut_id", -1)) in self.cuts
+            }
+            velocity_trace_rows: list[dict[str, Any]] = []
+            sorted_cells = sorted(cell_lookup.items())
+            for cut_index, (cut_id, cell) in enumerate(sorted_cells, start=1):
+                current_stage = "velocity_traces"
+                current_cut_id = int(cut_id)
+                current_cell_id = str(cell.get("cell_id") or "")
+                current_path = str(cell.get("cell_dir") or "")
+                if _check_cancel(
+                    "Velocity traces",
+                    f"{experiment_name}: tables rebuild cancelled.",
+                ):
+                    return
+                state = self._cut_analysis_snapshot(int(cut_id))
+                for trace in state.get("velocity_traces") or []:
+                    if not isinstance(trace, dict):
+                        continue
+                    velocity_trace_rows.append(
+                        {
+                            "experiment_id": int(experiment_payload["experiment_id"]),
+                            "experiment_name": str(experiment_payload["name"]),
+                            "cut_id": int(cut_id),
+                            "cut_name": str(self.cuts[int(cut_id)].name),
+                            "cell_id": str(cell.get("cell_id") or ""),
+                            "offset_idx": int(cell.get("offset_idx", 0)),
+                            "offset_value": float(cell.get("offset_value", 0.0)),
+                            "angle_idx": int(cell.get("angle_idx", 0)),
+                            "angle_deg": float(cell.get("angle_deg", 0.0)),
+                            **dict(trace),
+                        }
+                    )
+                current_step += 1
+                _queue_progress(
+                    stage_label="Velocity traces",
+                    current=current_step,
+                    outer_current=stack_total,
+                    outer_total=stack_total,
+                    inner_current=cut_index,
+                    inner_total=max(len(sorted_cells), 1),
+                    message=(
+                        f"{experiment_name}: rebuilt velocity traces "
+                        f"{cut_index}/{max(len(sorted_cells), 1)}."
+                    ),
+                )
+
+            trace_rows_estimate = int(
+                sum(
+                    int(info.get("trace_count", 0) or 0)
+                    for info in stack_outputs.values()
+                    if isinstance(info, dict)
+                )
+            )
+            write_trace_bundle = (
+                trace_rows_estimate <= MAX_EXPERIMENT_TRACE_BUNDLE_ROWS
+            )
+            write_important_images = False
+            current_stage = "important_rows"
+            current_stack_id = None
+            current_cut_id = None
+            current_cell_id = ""
+            current_path = str(tables_root)
+            important_rows = self._build_experiment_important_rows_from_saved_outputs(
+                experiment_payload,
+                master_rows,
+                novelty_rows,
+                cells_rows,
+                write_images=write_important_images,
+            )
+            current_step += 1
+            _queue_progress(
+                stage_label="Important zones",
+                current=current_step,
+                outer_current=stack_total,
+                outer_total=stack_total,
+                inner_current=1,
+                inner_total=1,
+                message=(
+                    f"{experiment_name}: prepared important zones table "
+                    f"(images deferred)."
+                ),
+            )
+
+            for stack_index, stack_id in enumerate(ordered_stack_ids, start=1):
+                current_stage = "stack_bundles"
+                current_stack_id = int(stack_id)
+                current_cut_id = None
+                current_cell_id = ""
+                current_path = str(stack_bundle_dir)
+                if _check_cancel(
+                    "Index saved data",
+                    f"{experiment_name}: tables rebuild cancelled.",
+                ):
+                    return
+                info = dict(
+                    stack_outputs.get(str(int(stack_id)))
+                    or stack_outputs.get(int(stack_id))
+                    or {}
+                )
+                bundle_rows = list(stack_cell_index_map.get(int(stack_id), []))
+                slug = self._safe_export_slug(
+                    str(info.get("stack_name") or f"stack_{int(stack_id):03d}")
+                )
+                bundle_path = stack_bundle_dir / (
+                    f"stack_{int(stack_id):03d}_{slug}_bundle.json"
+                )
+                current_path = str(bundle_path)
+                self._write_json_file(
+                    bundle_path,
+                    {
+                        "experiment": {
+                            "experiment_id": int(
+                                experiment_payload.get("experiment_id", 0) or 0
+                            ),
+                            "name": str(experiment_payload.get("name") or ""),
+                            "export_root": str(root_dir),
+                            "tables_root": str(tables_root),
+                        },
+                        "stack": {
+                            "stack_id": int(info.get("stack_id", stack_id)),
+                            "stack_name": str(info.get("stack_name") or ""),
+                            "stack_kind": str(info.get("stack_kind") or ""),
+                            "cell_count": int(info.get("cell_count", 0) or 0),
+                            "event_count": int(info.get("event_count", 0) or 0),
+                            "trace_count": int(info.get("trace_count", 0) or 0),
+                            "td_fits_path": str(info.get("td_fits_path") or ""),
+                            "stack_json_path": str(info.get("stack_json_path") or ""),
+                            "cells_table_path": str(info.get("cells_table_path") or ""),
+                            "master_table_path": str(info.get("master_table_path") or ""),
+                            "trace_table_path": str(info.get("trace_table_path") or ""),
+                            "bundle_path": str(bundle_path),
+                        },
+                        "cells": bundle_rows,
+                    },
+                )
+                summary_row = summary_row_map.get(int(stack_id))
+                if summary_row is not None:
+                    summary_row["stack_bundle_path"] = str(bundle_path)
+                stack_index_rows.append(
+                    {
+                        "experiment_id": int(
+                            experiment_payload.get("experiment_id", 0) or 0
+                        ),
+                        "experiment_name": str(experiment_payload.get("name") or ""),
+                        "stack_id": int(info.get("stack_id", stack_id)),
+                        "stack_name": str(info.get("stack_name") or ""),
+                        "stack_kind": str(info.get("stack_kind") or ""),
+                        "cell_count": int(info.get("cell_count", 0) or 0),
+                        "event_count": int(info.get("event_count", 0) or 0),
+                        "trace_count": int(info.get("trace_count", 0) or 0),
+                        "bundle_path": str(bundle_path),
+                        "stack_json_path": str(info.get("stack_json_path") or ""),
+                        "stack_fits_path": str(info.get("td_fits_path") or ""),
+                    }
+                )
+                current_step += 1
+                _queue_progress(
+                    stage_label="Index saved data",
+                    current=current_step,
+                    outer_current=stack_index,
+                    outer_total=stack_total,
+                    inner_current=1,
+                    inner_total=1,
+                    message=(
+                        f"{experiment_name}: indexed saved outputs for stack "
+                        f"{stack_index}/{stack_total}."
+                    ),
+                )
+
+            write_items = [
+                ("Write master", lambda: self._write_table_bundle(tables_root / "master_table", master_rows)),
+                ("Write cells", lambda: self._write_table_bundle(tables_root / "cells_table", cells_rows)),
+                (
+                    "Write cells index",
+                    lambda: self._write_table_bundle(
+                        tables_root / "cells_index", cell_index_rows
+                    ),
+                ),
+                (
+                    "Write stack index",
+                    lambda: self._write_table_bundle(
+                        tables_root / "stack_index", stack_index_rows
+                    ),
+                ),
+                (
+                    "Write traces",
+                    lambda: self._merge_table_parts_to_bundle(
+                        tables_root / "trace_table", trace_part_paths
+                    )
+                    if write_trace_bundle
+                    else 0,
+                ),
+                (
+                    "Write velocity",
+                    lambda: self._write_table_bundle(
+                        tables_root / "velocity_trace_table", velocity_trace_rows
+                    ),
+                ),
+                (
+                    "Write novelty",
+                    lambda: self._write_table_bundle(
+                        tables_root / "novelty_table", novelty_rows
+                    ),
+                ),
+                (
+                    "Write important",
+                    lambda: self._write_table_bundle(
+                        tables_root / "important_zones_table", important_rows
+                    ),
+                ),
+                ("Write summaries", None),
+            ]
+            trace_bundle_rows = 0
+            for write_index, (label, writer) in enumerate(write_items, start=1):
+                current_stage = f"write:{label.lower()}"
+                current_stack_id = None
+                current_cut_id = None
+                current_cell_id = ""
+                if _check_cancel("Write tables", f"{experiment_name}: tables rebuild cancelled."):
+                    return
+                if label == "Write summaries":
+                    current_path = str(tables_root)
+                    if displacement_rows:
+                        current_path = str(tables_root / "displacements" / "summary.json")
+                        self._write_table_bundle(
+                            tables_root / "displacements" / "summary",
+                            displacement_rows,
+                        )
+                    if rotation_rows:
+                        current_path = str(tables_root / "rotates" / "summary.json")
+                        self._write_table_bundle(
+                            tables_root / "rotates" / "summary",
+                            rotation_rows,
+                        )
+                else:
+                    current_path = str(tables_root)
+                    if label == "Write master":
+                        current_path = str(tables_root / "master_table.json")
+                    elif label == "Write cells":
+                        current_path = str(tables_root / "cells_table.json")
+                    elif label == "Write cells index":
+                        current_path = str(tables_root / "cells_index.json")
+                    elif label == "Write stack index":
+                        current_path = str(tables_root / "stack_index.json")
+                    elif label == "Write traces":
+                        current_path = str(tables_root / "trace_table.json")
+                    elif label == "Write velocity":
+                        current_path = str(tables_root / "velocity_trace_table.json")
+                    elif label == "Write novelty":
+                        current_path = str(tables_root / "novelty_table.json")
+                    elif label == "Write important":
+                        current_path = str(tables_root / "important_zones_table.json")
+                    result = writer() if writer is not None else None
+                    if label == "Write traces":
+                        trace_bundle_rows = int(result or 0)
+                current_step += 1
+                _queue_progress(
+                    stage_label="Write tables",
+                    current=current_step,
+                    outer_current=stack_total,
+                    outer_total=stack_total,
+                    inner_current=write_index,
+                    inner_total=len(write_items),
+                    message=f"{experiment_name}: {label.lower()} completed.",
+                )
+
+            finalize_notes: list[str] = []
+            if not write_trace_bundle:
+                finalize_notes.append(
+                    f"trace bundle skipped ({trace_rows_estimate} rows)"
+                )
+            if bool(
+                experiment_payload.get("save_options", {}).get(
+                    "save_important_images", True
+                )
+            ):
+                finalize_notes.append("important images deferred")
+            summary_text = completion_summary or (
+                f"Rebuilt tables for {experiment_name}."
+            )
+            if finalize_notes:
+                summary_text += " " + "; ".join(finalize_notes) + "."
+
+            current_stage = "write_manifest"
+            current_path = str(root_dir / "manifest.json")
+            self._write_json_file(
+                root_dir / "manifest.json",
+                {
+                    "experiment": experiment_payload,
+                    "stack_outputs": stack_outputs,
+                    "summary": {
+                        "tables_root": str(tables_root),
+                        "cell_count": int(len(self._experiment_cells(experiment_payload))),
+                        "stack_count": int(len(ordered_stack_ids)),
+                        "next_stage": "tables",
+                        "master_rows": len(master_rows),
+                        "cells_rows": len(cells_rows),
+                        "cells_index_rows": len(cell_index_rows),
+                        "stack_index_rows": len(stack_index_rows),
+                        "trace_parts": len(trace_part_paths),
+                        "trace_rows_estimate": trace_rows_estimate,
+                        "trace_bundle_rows": trace_bundle_rows,
+                        "trace_bundle_written": bool(write_trace_bundle),
+                        "velocity_trace_rows": len(velocity_trace_rows),
+                        "important_rows": len(important_rows),
+                        "important_images_written": False,
+                        "novelty_rows": len(novelty_rows),
+                        "stack_group_mode": self._experiment_stack_mode(experiment_payload),
+                        "full_cube_angles": bool(
+                            experiment_payload.get("full_cube_angles", False)
+                        ),
+                        "tables_generated_in_background": True,
+                    },
+                    "tables_root": str(tables_root),
+                    "master_csv_path": str(tables_root / "master_table.csv"),
+                    "cells_table_path": str(tables_root / "cells_table.json"),
+                    "cells_index_path": str(tables_root / "cells_index.json"),
+                    "stack_index_path": str(tables_root / "stack_index.json"),
+                    "trace_table_path": str(tables_root / "trace_table.json"),
+                    "velocity_trace_table_path": str(
+                        tables_root / "velocity_trace_table.csv"
+                    ),
+                    "novelty_table_path": str(tables_root / "novelty_table.json"),
+                    "important_zones_table_path": str(
+                        tables_root / "important_zones_table.json"
+                    ),
+                    "stack_bundle_dir": str(stack_bundle_dir),
+                },
+            )
+            current_stage = "write_status"
+            current_path = str(status_path)
+            self._write_json_file(
+                status_path,
+                {
+                    "experiment_id": int(experiment_id),
+                    "status": "completed",
+                    "nuwt_status": "completed",
+                    "wavelet_status": "completed",
+                    "tables_status": "completed",
+                    "updated_at": self._timestamp_now(),
+                    "completed_at": self._timestamp_now(),
+                    "summary": summary_text,
+                },
+            )
+            _append_log(
+                f"{self._timestamp_now()} | tables_worker | master={len(master_rows)} "
+                f"important={len(important_rows)} novelty={len(novelty_rows)} "
+                f"trace_bundle={'yes' if write_trace_bundle else 'no'} "
+                f"important_images=no"
+            )
+            self.background_queue.put(
+                {
+                    "type": "done",
+                    "job_id": job_id,
+                    "stage_name": "tables",
+                    "experiment_id": int(experiment_id),
+                    "summary": summary_text,
+                }
+            )
+        except Exception as exc:
+            context = (
+                f"stage={current_stage} stack_id={current_stack_id} "
+                f"cut_id={current_cut_id} cell_id={current_cell_id} path={current_path}"
+            )
+            _debug_tables(f"error | {context}")
+            _debug_tables(traceback.format_exc().rstrip())
+            self.background_queue.put(
+                {
+                    "type": "error",
+                    "job_id": job_id,
+                    "stage_name": "tables",
+                    "error": f"{type(exc).__name__}: {exc} | {context}",
+                }
+            )
+
+    def _apply_background_experiment_stack_result(self, payload: dict[str, Any]) -> None:
+        experiment_id = int(payload.get("experiment_id", 0) or 0)
+        experiment = self.experiments.get(experiment_id)
+        if experiment is None:
+            return
+        stack_outputs = dict(experiment.get("stack_outputs") or {})
+        stack_outputs[str(int(payload.get("stack_id", -1)))] = {
+            "stack_id": int(payload.get("stack_id", -1)),
+            "stack_name": str(payload.get("stack_name") or ""),
+            "stack_kind": str(payload.get("stack_kind") or ""),
+            "cells_table_path": str(payload.get("cells_table_path") or ""),
+            "master_table_path": str(payload.get("master_table_path") or ""),
+            "trace_table_path": str(payload.get("trace_table_path") or ""),
+            "td_fits_path": str(payload.get("td_fits_path") or ""),
+            "stack_json_path": str(payload.get("stack_json_path") or ""),
+            "cell_count": int(payload.get("cell_count", 0) or 0),
+            "event_count": int(payload.get("event_count", 0) or 0),
+            "trace_count": int(payload.get("trace_count", 0) or 0),
+        }
+        experiment["stack_outputs"] = stack_outputs
+        experiment["updated_at"] = self._timestamp_now()
+        experiment["last_run_summary"] = (
+            f"Saved stack {payload.get('stack_name', '')} "
+            f"({int(payload.get('cell_count', 0) or 0)} cells)."
+        )
+        self._write_experiment_metadata_files(experiment)
+        self._record_session_change()
+        self.refresh_all()
+
+    def _apply_background_experiment_cell_result(self, payload: dict[str, Any]) -> None:
+        experiment_id = int(payload.get("experiment_id", 0) or 0)
+        cut_id = int(payload.get("cut_id", 0) or 0)
+        stage_name = str(payload.get("stage_name") or "")
+        experiment = self.experiments.get(experiment_id)
+        if experiment is None or cut_id not in self.cuts:
+            return
+        for cell in experiment.get("cells") or []:
+            if int(cell.get("cut_id", -1)) != cut_id:
+                continue
+            if stage_name == "nuwt":
+                cell["status"] = "nuwt_completed"
+            elif stage_name == "wavelet":
+                cell["status"] = "wavelet_completed"
+            cell["segment_count"] = int(payload.get("segment_count", cell.get("segment_count", 0)) or 0)
+            cell["accepted_count"] = int(
+                payload.get("accepted_count", cell.get("accepted_count", 0)) or 0
+            )
+            cell["cell_dir"] = str(payload.get("cell_dir") or cell.get("cell_dir") or "")
+            if payload.get("td_fits_path"):
+                cell["td_fits_path"] = str(payload.get("td_fits_path"))
+            if payload.get("nuwt_result_path"):
+                cell["nuwt_result_path"] = str(payload.get("nuwt_result_path"))
+            if payload.get("wavelet_result_path"):
+                cell["wavelet_result_path"] = str(payload.get("wavelet_result_path"))
+            if payload.get("threads_table_path"):
+                cell["threads_table_path"] = str(payload.get("threads_table_path"))
+            cell["thread_count"] = int(
+                payload.get("thread_count", cell.get("thread_count", 0)) or 0
+            )
+            cell["longest_thread"] = int(
+                payload.get("longest_thread", cell.get("longest_thread", 0)) or 0
+            )
+            cell["updated_at"] = self._timestamp_now()
+            break
+        experiment["updated_at"] = self._timestamp_now()
+        if stage_name == "nuwt":
+            experiment["last_run_summary"] = str(
+                payload.get("crest_summary") or f"Saved NUWT result for cut {cut_id}."
+            )
+        else:
+            experiment["last_run_summary"] = (
+                f"Saved wavelet result for cut {cut_id}: "
+                f"{int(payload.get('accepted_count', 0) or 0)} accepted."
+            )
+        self._clear_experiment_cut_heavy_state(cut_id)
+        state = self._cut_analysis(cut_id)
+        state["td_params"] = dict(self._experiment_study_td_params(experiment))
+        state["crest_params"] = dict(self._experiment_study_crest_params(experiment))
+        state["wavelet_params"] = dict(self._experiment_study_wavelet_params(experiment))
+        if stage_name == "wavelet" and payload.get("wavelet_filter_result") is not None:
+            state["wavelet_filter_result"] = self._clone_wavelet_payload(
+                payload.get("wavelet_filter_result")
+            )
+        for panel in self._panels_for_cut(cut_id):
+            existing = self.td_windows.get(panel.panel_id)
+            if existing is None:
+                continue
+            existing["crest_tracking_result"] = None
+            existing["crest_tracking_td_key"] = None
+            existing["wavelet_filter_result"] = self._clone_wavelet_payload(
+                state.get("wavelet_filter_result")
+            )
+            existing["wavelet_events"] = []
+            existing["wavelet_next_event_id"] = 1
+            existing["wavelet_selected_event_id"] = None
+            existing["crest_summary_var"].set(
+                str(payload.get("crest_summary") or "Study result saved to disk.")
+            )
+            existing["wavelet_summary_var"].set(
+                (
+                    "Wavelet results saved to disk."
+                    if stage_name == "wavelet"
+                    else "NUWT results saved to disk."
+                )
+            )
+            self._refresh_td_window_wavelet_views(panel.panel_id, redraw_td=True)
+
+    def _legacy_cancel_running_experiment(self) -> None:
+        _job_id, job = self._background_experiment_job()
+        if job is None:
+            self._set_status("No exhaustive study is running.")
+            return
+        cancel_event = job.get("cancel_event")
+        if cancel_event is not None:
+            cancel_event.set()
+        self._set_status(
+            f"Cancelling exhaustive study {job.get('panel_name', '')}..."
+        )
+
+    def _legacy_experiment_worker(
         self,
         job_id: str,
         experiment_id: int,
@@ -5597,8 +8144,15 @@ class TDMosaicApp:
 
                 outer_current = int(spec.get("offset_idx", 0)) + 1
                 inner_current = int(spec.get("angle_idx", 0)) + 1
-                cell_dir = Path(str(spec.get("cell_dir") or root_dir / "cells")).expanduser().resolve()
-                cell_dir.mkdir(parents=True, exist_ok=True)
+                cell_dir_raw = str(spec.get("cell_dir") or "").strip()
+                cell_dir = (
+                    Path(cell_dir_raw).expanduser().resolve()
+                    if cell_dir_raw
+                    else root_dir / "cells"
+                )
+                write_td_fits = bool(save_options.get("save_td_fits", True))
+                if write_td_fits:
+                    cell_dir.mkdir(parents=True, exist_ok=True)
                 cut = Cut(
                     cut_id=int(spec["cut_id"]),
                     name=str(spec["cut_name"]),
@@ -5633,7 +8187,7 @@ class TDMosaicApp:
                     int(spec["width"]),
                     str(spec["weighting"]),
                 )
-                if bool(save_options.get("save_td_fits", True)):
+                if write_td_fits:
                     header = fits.Header()
                     header["EXPTYPE"] = ("EXH_TD", "Exhaustive study TD map")
                     header["CUTID"] = (int(spec["cut_id"]), "Generated cut id")
@@ -5729,24 +8283,6 @@ class TDMosaicApp:
                 located_count = int(np.count_nonzero(np.asarray(located.get("errs", [])) > 0))
                 thread_count = len(threads)
                 accepted_count = int(sum(1 for segment in segments if segment.get("accepted")))
-                if bool(save_options.get("save_cell_json", True)):
-                    _write_json(
-                        cell_dir / "cell_summary.json",
-                        {
-                            "experiment_id": int(experiment_id),
-                            "cut_id": int(spec["cut_id"]),
-                            "cut_name": str(spec["cut_name"]),
-                            "offset_idx": int(spec["offset_idx"]),
-                            "offset_value": float(spec["offset_value"]),
-                            "angle_idx": int(spec["angle_idx"]),
-                            "angle_deg": float(spec["angle_deg"]),
-                            "located_count": int(located_count),
-                            "thread_count": int(thread_count),
-                            "accepted_count": int(accepted_count),
-                            "wavelet_segment_count": int(len(segments)),
-                            "updated_at": self._timestamp_now(),
-                        },
-                    )
                 _append_log(
                     f"{self._timestamp_now()} | cut={int(spec['cut_id'])} "
                     f"cell={spec['cell_id']} | located={located_count} "
@@ -5775,7 +8311,7 @@ class TDMosaicApp:
                         "cut_id": int(spec["cut_id"]),
                         "cut_name": str(spec["cut_name"]),
                         "cell_id": str(spec["cell_id"]),
-                        "cell_dir": str(cell_dir),
+                        "cell_dir": str(cell_dir) if write_td_fits else "",
                         "offset_idx": int(spec["offset_idx"]),
                         "offset_value": float(spec["offset_value"]),
                         "angle_idx": int(spec["angle_idx"]),
@@ -5854,7 +8390,7 @@ class TDMosaicApp:
                 }
             )
 
-    def _apply_background_experiment_cell_result(self, payload: dict[str, Any]) -> None:
+    def _legacy_apply_background_experiment_cell_result(self, payload: dict[str, Any]) -> None:
         experiment_id = int(payload.get("experiment_id", 0) or 0)
         cut_id = int(payload.get("cut_id", 0) or 0)
         experiment = self.experiments.get(experiment_id)
@@ -5939,6 +8475,611 @@ class TDMosaicApp:
                         if isinstance(value, (list, dict)):
                             out_row[key] = json.dumps(self._json_safe(value), ensure_ascii=False)
                     writer.writerow(out_row)
+
+    def _annotate_curated_group_rows(
+        self, rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            group_key = self._curated_group_key(
+                row.get("cut_id"),
+                row.get("event_id"),
+                row.get("link_group_id"),
+            )
+            groups.setdefault(group_key, []).append(row)
+        for group_key, members in groups.items():
+            representative_amp = max(
+                members,
+                key=lambda row: (
+                    self._curated_row_rank_value(row.get("fit_amp_arcsec")),
+                    self._curated_row_rank_value(row.get("confidence_score")),
+                    self._curated_row_rank_value(row.get("duration_s")),
+                ),
+            )
+            representative_conf = max(
+                members,
+                key=lambda row: (
+                    self._curated_row_rank_value(row.get("confidence_score")),
+                    self._curated_row_rank_value(row.get("fit_amp_arcsec")),
+                    self._curated_row_rank_value(row.get("duration_s")),
+                ),
+            )
+            class_labels = sorted(
+                {
+                    str(member.get("propagation_class") or "").strip()
+                    for member in members
+                    if str(member.get("propagation_class") or "").strip()
+                }
+            )
+            resolved_class = (
+                class_labels[0]
+                if len(class_labels) == 1
+                else ",".join(class_labels)
+                if class_labels
+                else ("local" if len(members) == 1 else "same-wave")
+            )
+            for row in members:
+                row["group_key"] = group_key
+                row["group_member_count"] = int(len(members))
+                row["is_group_representative_amp"] = bool(row is representative_amp)
+                row["is_group_representative_conf"] = bool(row is representative_conf)
+                row["resolved_propagation_class"] = resolved_class
+        return rows
+
+    def _experiment_master_row_from_event(
+        self,
+        experiment: dict[str, Any],
+        cell: dict[str, Any],
+        stack_ref: dict[str, Any],
+        cut: Cut,
+        event: dict[str, Any],
+        crest_params: dict[str, Any],
+        wavelet_params: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._ensure_wavelet_event_fields(event)
+        state = self._cut_analysis_snapshot(int(cut.cut_id))
+        analysis = event.get("analysis") or {}
+        qa_flags = self._td_window_wavelet_event_qa_flags(event)
+        confidence_score, confidence_label = self._wavelet_event_confidence_details(event)
+        source_t = np.asarray(event.get("source_t_idx", []), dtype=np.float64)
+        wave_t = np.asarray(analysis.get("wave_t_idx", []), dtype=np.float64)
+        dynamic_keyframes = self._cut_dynamic_keyframes(int(cut.cut_id))
+        return {
+            "cut_id": int(cut.cut_id),
+            "cut_name": str(cut.name),
+            "event_id": int(event.get("event_id", -1)),
+            "parent_event_id": (
+                int(event.get("parent_event_id"))
+                if event.get("parent_event_id") is not None
+                else None
+            ),
+            "final_mode": self._td_window_wavelet_event_final_mode(event),
+            "status": self._td_window_wavelet_event_status(event),
+            "counted": bool(self._td_window_wavelet_event_is_counted(event)),
+            "origin": str(event.get("origin", "")),
+            "manual_decision": event.get("manual_decision"),
+            "reason": self._td_window_wavelet_event_reason(event),
+            "qa_flags": list(qa_flags),
+            "qa_flags_text": ",".join(qa_flags),
+            "confidence_score": float(confidence_score),
+            "confidence_label": str(confidence_label),
+            "review_locked": bool(event.get("review_locked")),
+            "review_notes": str(event.get("review_notes", "")),
+            "history_count": int(len(event.get("history") or [])),
+            "link_group_id": event.get("link_group_id"),
+            "propagation_class": str(event.get("propagation_class") or ""),
+            "link_count": 0,
+            "stack_id": int(stack_ref.get("stack_id", -1)),
+            "stack_name": str(stack_ref.get("stack_name") or ""),
+            "stack_kind": str(stack_ref.get("stack_kind") or ""),
+            "experiment_id": int(experiment["experiment_id"]),
+            "experiment_name": str(experiment["name"]),
+            "experiment_cell_id": str(cell.get("cell_id") or ""),
+            "experiment_offset_idx": int(cell.get("offset_idx", 0)),
+            "experiment_offset_value": float(cell.get("offset_value", 0.0)),
+            "experiment_angle_idx": int(cell.get("angle_idx", 0)),
+            "experiment_angle_deg": float(cell.get("angle_deg", 0.0)),
+            "dynamic_enabled": bool(self._cut_dynamic_enabled(int(cut.cut_id))),
+            "dynamic_reference_frame": int(
+                self._cut_dynamic_reference_frame(int(cut.cut_id))
+            ),
+            "dynamic_keyframe_count": int(len(dynamic_keyframes)),
+            "dynamic_keyframe_frames": [int(frame_idx) for frame_idx in sorted(dynamic_keyframes.keys())],
+            "preset_name": str(state.get("preset_name", "custom")),
+            "thread_index": int(analysis.get("thread_index", -1)),
+            "seg_id": int(analysis.get("seg_id", -1)),
+            "wseg_id": int(analysis.get("wseg_id", -1)),
+            "peak_period_s": float(analysis.get("peak_period_s", float("nan"))),
+            "freq_mhz": float(analysis.get("freq_mhz", float("nan"))),
+            "fit_amp_arcsec": float(analysis.get("fit_amp_arcsec", float("nan"))),
+            "fit_amp_km": float(analysis.get("fit_amp_km", float("nan"))),
+            "velocity_amp_km_s": float(analysis.get("velocity_amp_km_s", float("nan"))),
+            "accel_amp_km_s2": float(analysis.get("accel_amp_km_s2", float("nan"))),
+            "specific_energy_j_kg": float(
+                analysis.get("specific_energy_j_kg", float("nan"))
+            ),
+            "energy_flux_w_m2": float(analysis.get("energy_flux_w_m2", float("nan"))),
+            "duration_s": float(analysis.get("duration_s", float("nan"))),
+            "power_ratio": float(analysis.get("power_ratio", float("nan"))),
+            "fit_rms_over_amp": float(
+                analysis.get(
+                    "fit_rms_over_amp",
+                    analysis.get("rms_amp_ratio", float("nan")),
+                )
+            ),
+            "point_count": int(np.asarray(analysis.get("wave_t_idx", []), dtype=np.float64).size),
+            "source_start_frame": float(source_t[0]) if source_t.size else float("nan"),
+            "source_end_frame": float(source_t[-1]) if source_t.size else float("nan"),
+            "wave_start_frame": float(wave_t[0]) if wave_t.size else float("nan"),
+            "wave_end_frame": float(wave_t[-1]) if wave_t.size else float("nan"),
+            "cad": float(crest_params["cad"]),
+            "res": float(crest_params["res"]),
+            "grad": float(crest_params["grad"]),
+            "min_tlen": int(crest_params["min_tlen"]),
+            "max_dist_jump": int(crest_params["max_dist_jump"]),
+            "max_time_skip": int(crest_params["max_time_skip"]),
+            "invert": bool(crest_params["invert"]),
+            "gauss": bool(crest_params["gauss"]),
+            "p_min": float(wavelet_params["p_min"]),
+            "p_max": float(wavelet_params["p_max"]),
+            "power_ratio_thresh": float(wavelet_params["power_ratio_thresh"]),
+            "segment_power_frac": float(wavelet_params["segment_power_frac"]),
+            "min_points_segment": int(wavelet_params["min_points_segment"]),
+            "min_amp_arcsec": float(wavelet_params["min_amp_arcsec"]),
+            "max_jump_pix": float(wavelet_params["max_jump_pix"]),
+            "min_points_cut_seg": int(wavelet_params["min_points_cut_seg"]),
+            "rms_amp_ratio_max": float(wavelet_params["rms_amp_ratio_max"]),
+            "km_per_arcsec": float(wavelet_params["km_per_arcsec"]),
+            "density_kg_m3": float(wavelet_params["density_kg_m3"]),
+            "phase_speed_km_s": float(wavelet_params["phase_speed_km_s"]),
+            "min_prominence": float(wavelet_params.get("min_prominence", float("nan"))),
+            "min_snr": float(wavelet_params.get("min_snr", float("nan"))),
+            "continuity_weight": float(
+                wavelet_params.get("continuity_weight", float("nan"))
+            ),
+            "time_weight": float(wavelet_params.get("time_weight", float("nan"))),
+            "quality_weight": float(
+                wavelet_params.get("quality_weight", float("nan"))
+            ),
+            "error_weight": float(wavelet_params.get("error_weight", float("nan"))),
+            "decision_reason": str(analysis.get("decision_reason", "")),
+            "decision_warnings": list(analysis.get("decision_warnings") or []),
+            "amplitude_method": str(analysis.get("amplitude_method", "")),
+            "fit_model": str(analysis.get("fit_model", "")),
+            "fit_period_s": float(analysis.get("fit_period_s", float("nan"))),
+            "fit_point_count": int(analysis.get("fit_point_count", 0) or 0),
+            "interp_point_count": int(analysis.get("interp_point_count", 0) or 0),
+            "fit_rms_arcsec": float(analysis.get("fit_rms_arcsec", float("nan"))),
+            "fit_support_score": float(
+                analysis.get("fit_support_score", float("nan"))
+            ),
+            "fit_support_source": str(analysis.get("fit_support_source", "")),
+            "peak_to_peak_arcsec": float(
+                analysis.get("peak_to_peak_arcsec", float("nan"))
+            ),
+            "peak_to_peak_km": float(
+                analysis.get("peak_to_peak_km", float("nan"))
+            ),
+            "span_amp_arcsec": float(analysis.get("span_amp_arcsec", float("nan"))),
+            "kinetic_energy_density_j_m3": float(
+                analysis.get("kinetic_energy_density_j_m3", float("nan"))
+            ),
+            "mean_power": float(analysis.get("mean_power", float("nan"))),
+            "peak_power": float(analysis.get("peak_power", float("nan"))),
+            "omega_rad_s": float(analysis.get("omega_rad_s", float("nan"))),
+            "mode_rank": int(analysis.get("mode_rank", 0) or 0),
+        }
+
+    def _write_cell_threads_table(
+        self,
+        cut_id: int,
+        cell_dir: Path,
+        threads: list[dict[str, Any]] | None,
+        meta: dict[str, Any] | None = None,
+    ) -> tuple[str, int]:
+        if not str(cell_dir):
+            return "", 0
+        rows = self._thread_trace_rows(cut_id, threads or [], meta=meta)
+        base_path = cell_dir / "threads_table"
+        json_path = base_path.with_suffix(".json")
+        csv_path = base_path.with_suffix(".csv")
+        if json_path.exists() and csv_path.exists():
+            try:
+                loaded_rows = self._read_json_file(json_path)
+            except Exception:
+                loaded_rows = None
+            if isinstance(loaded_rows, list):
+                return str(json_path), int(len(loaded_rows))
+        self._write_table_bundle(base_path, rows)
+        return (str(json_path) if json_path.exists() else ""), int(len(rows))
+
+    def _ensure_saved_cell_wavelet_thread_exports(
+        self, cell_row: dict[str, Any]
+    ) -> dict[str, Any]:
+        cut_id = int(cell_row.get("cut_id", -1))
+        cell_dir = Path(
+            str(cell_row.get("cell_dir") or "")
+        ).expanduser()
+        wavelet_result_path = Path(
+            str(cell_row.get("wavelet_result_path") or "")
+        ).expanduser()
+        nuwt_result_path = Path(str(cell_row.get("nuwt_result_path") or "")).expanduser()
+        wavelet_payload: dict[str, Any] = {}
+        wavelet_read_error: str | None = None
+        if wavelet_result_path.exists():
+            try:
+                loaded_wavelet = self._read_json_file(wavelet_result_path)
+            except OSError as exc:
+                wavelet_read_error = f"{type(exc).__name__}: {exc}"
+                loaded_wavelet = {}
+            if isinstance(loaded_wavelet, dict):
+                wavelet_payload = dict(loaded_wavelet)
+        nuwt_payload = (
+            self._read_json_file(nuwt_result_path)
+            if nuwt_result_path.exists()
+            else {}
+        )
+        tracking_result = dict(nuwt_payload.get("crest_tracking_result") or {})
+        threads = list(tracking_result.get("threads") or [])
+        meta_payload = dict(nuwt_payload.get("td_meta") or {})
+        try:
+            threads_table_path, thread_rows_count = (
+                self._write_cell_threads_table(
+                    cut_id,
+                    cell_dir,
+                    threads,
+                    meta=meta_payload,
+                )
+                if cell_dir
+                else ("", 0)
+            )
+        except OSError as exc:
+            raise OSError(
+                exc.errno or 5,
+                f"thread export failed for cut {cut_id} cell {cell_dir}: {exc}",
+            ) from exc
+        thread_count = int(len(threads))
+        longest_thread = max(
+            (
+                int(thread.get("length", 0) or 0)
+                for thread in threads
+                if isinstance(thread, dict)
+            ),
+            default=0,
+        )
+        if not wavelet_payload and cell_dir:
+            events_table_path = cell_dir / "events_table.json"
+            if events_table_path.exists():
+                loaded_rows = self._read_json_file(events_table_path)
+                if isinstance(loaded_rows, list):
+                    summary_rows = [
+                        dict(row) for row in loaded_rows if isinstance(row, dict)
+                    ]
+                    first_row = summary_rows[0] if summary_rows else {}
+                    wavelet_payload = {
+                        "summary_rows": summary_rows,
+                        "wavelet_events": [],
+                        "wavelet_filter_result": {
+                            "segment_count": int(len(summary_rows)),
+                            "accepted_count": int(
+                                sum(
+                                    1
+                                    for row in summary_rows
+                                    if bool(row.get("counted"))
+                                )
+                            ),
+                            "warnings": (
+                                [f"wavelet_result fallback used: {wavelet_read_error}"]
+                                if wavelet_read_error
+                                else []
+                            ),
+                        },
+                        "td_params": dict(nuwt_payload.get("td_params") or {}),
+                        "crest_params": dict(nuwt_payload.get("crest_params") or {}),
+                        "wavelet_params": {
+                            "p_min": float(first_row.get("p_min", float("nan"))),
+                            "p_max": float(first_row.get("p_max", float("nan"))),
+                            "power_ratio_thresh": float(
+                                first_row.get("power_ratio_thresh", float("nan"))
+                            ),
+                            "segment_power_frac": float(
+                                first_row.get("segment_power_frac", float("nan"))
+                            ),
+                            "min_points_segment": int(
+                                first_row.get("min_points_segment", 0) or 0
+                            ),
+                            "min_amp_arcsec": float(
+                                first_row.get("min_amp_arcsec", float("nan"))
+                            ),
+                            "max_jump_pix": float(
+                                first_row.get("max_jump_pix", float("nan"))
+                            ),
+                            "min_points_cut_seg": int(
+                                first_row.get("min_points_cut_seg", 0) or 0
+                            ),
+                            "rms_amp_ratio_max": float(
+                                first_row.get("rms_amp_ratio_max", float("nan"))
+                            ),
+                            "km_per_arcsec": float(
+                                first_row.get("km_per_arcsec", float("nan"))
+                            ),
+                            "density_kg_m3": float(
+                                first_row.get("density_kg_m3", float("nan"))
+                            ),
+                            "phase_speed_km_s": float(
+                                first_row.get("phase_speed_km_s", float("nan"))
+                            ),
+                            "min_prominence": float("nan"),
+                            "min_snr": float("nan"),
+                            "continuity_weight": float("nan"),
+                            "time_weight": float("nan"),
+                            "quality_weight": float("nan"),
+                            "error_weight": float("nan"),
+                        },
+                    }
+        if wavelet_payload:
+            wavelet_payload = dict(wavelet_payload)
+            wavelet_payload["thread_count"] = int(thread_count)
+            wavelet_payload["longest_thread"] = int(longest_thread)
+            wavelet_payload["thread_rows_count"] = int(thread_rows_count)
+            wavelet_payload["threads_table_path"] = str(threads_table_path)
+            if wavelet_read_error:
+                wavelet_result = dict(wavelet_payload.get("wavelet_filter_result") or {})
+                warnings = list(wavelet_result.get("warnings") or [])
+                warnings.append(f"wavelet_result fallback used: {wavelet_read_error}")
+                wavelet_result["warnings"] = warnings
+                wavelet_payload["wavelet_filter_result"] = wavelet_result
+        return {
+            "wavelet_payload": dict(wavelet_payload),
+            "nuwt_payload": dict(nuwt_payload),
+            "threads": threads,
+            "threads_table_path": str(threads_table_path),
+            "thread_rows_count": int(thread_rows_count),
+            "thread_count": int(thread_count),
+            "longest_thread": int(longest_thread),
+            "events_table_path": str((cell_dir / "events_table.json").expanduser()),
+            "trace_table_path": str((cell_dir / "trace_table.json").expanduser()),
+        }
+
+    def _saved_cell_master_rows(
+        self,
+        cell_row: dict[str, Any],
+        wavelet_payload: dict[str, Any],
+        thread_exports: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        rows = [
+            dict(row)
+            for row in (wavelet_payload.get("summary_rows") or [])
+            if isinstance(row, dict)
+        ]
+        wavelet_events = {
+            int(event.get("event_id", -1)): dict(event)
+            for event in (wavelet_payload.get("wavelet_events") or [])
+            if isinstance(event, dict)
+        }
+        wavelet_params = dict(wavelet_payload.get("wavelet_params") or {})
+        for row in rows:
+            event = wavelet_events.get(int(row.get("event_id", -1)))
+            analysis = dict(event.get("analysis") or {}) if event else {}
+            row["cell_dir"] = str(cell_row.get("cell_dir") or "")
+            row["td_fits_path"] = str(cell_row.get("td_fits_path") or "")
+            row["nuwt_result_path"] = str(cell_row.get("nuwt_result_path") or "")
+            row["wavelet_result_path"] = str(cell_row.get("wavelet_result_path") or "")
+            row["events_table_path"] = str(thread_exports.get("events_table_path") or "")
+            row["trace_table_path"] = str(thread_exports.get("trace_table_path") or "")
+            row["threads_table_path"] = str(
+                thread_exports.get("threads_table_path") or ""
+            )
+            row["thread_count"] = int(thread_exports.get("thread_count", 0) or 0)
+            row["longest_thread"] = int(
+                thread_exports.get("longest_thread", 0) or 0
+            )
+            row["thread_rows_count"] = int(
+                thread_exports.get("thread_rows_count", 0) or 0
+            )
+            row["min_prominence"] = float(
+                wavelet_params.get("min_prominence", float("nan"))
+            )
+            row["min_snr"] = float(wavelet_params.get("min_snr", float("nan")))
+            row["continuity_weight"] = float(
+                wavelet_params.get("continuity_weight", float("nan"))
+            )
+            row["time_weight"] = float(
+                wavelet_params.get("time_weight", float("nan"))
+            )
+            row["quality_weight"] = float(
+                wavelet_params.get("quality_weight", float("nan"))
+            )
+            row["error_weight"] = float(
+                wavelet_params.get("error_weight", float("nan"))
+            )
+            if not event:
+                continue
+            row["history"] = self._clone_wavelet_payload(event.get("history") or [])
+            row["base_params"] = self._clone_wavelet_payload(
+                event.get("base_params") or {}
+            )
+            row["current_params"] = self._clone_wavelet_payload(
+                event.get("current_params") or {}
+            )
+            row["analysis"] = self._clone_wavelet_payload(analysis)
+            row["base_analysis"] = self._clone_wavelet_payload(
+                event.get("base_analysis") or {}
+            )
+            row["decision_reason"] = str(analysis.get("decision_reason", "") or "")
+            row["decision_warnings"] = self._clone_wavelet_payload(
+                analysis.get("decision_warnings") or []
+            )
+            row["amplitude_method"] = str(
+                analysis.get("amplitude_method", "") or ""
+            )
+            row["fit_model"] = str(analysis.get("fit_model", "") or "")
+            row["fit_period_s"] = float(
+                analysis.get("fit_period_s", float("nan"))
+            )
+            row["fit_point_count"] = int(
+                analysis.get("fit_point_count", 0) or 0
+            )
+            row["interp_point_count"] = int(
+                analysis.get("interp_point_count", 0) or 0
+            )
+            row["fit_rms_arcsec"] = float(
+                analysis.get("fit_rms_arcsec", float("nan"))
+            )
+            row["fit_support_score"] = float(
+                analysis.get("fit_support_score", float("nan"))
+            )
+            row["fit_support_source"] = str(
+                analysis.get("fit_support_source", "") or ""
+            )
+            row["peak_to_peak_arcsec"] = float(
+                analysis.get("peak_to_peak_arcsec", float("nan"))
+            )
+            row["peak_to_peak_km"] = float(
+                analysis.get("peak_to_peak_km", float("nan"))
+            )
+            row["span_amp_arcsec"] = float(
+                analysis.get("span_amp_arcsec", float("nan"))
+            )
+            row["kinetic_energy_density_j_m3"] = float(
+                analysis.get("kinetic_energy_density_j_m3", float("nan"))
+            )
+            row["mean_power"] = float(analysis.get("mean_power", float("nan")))
+            row["peak_power"] = float(analysis.get("peak_power", float("nan")))
+            row["omega_rad_s"] = float(analysis.get("omega_rad_s", float("nan")))
+            row["mode_rank"] = int(analysis.get("mode_rank", 0) or 0)
+        return rows
+
+    def _saved_experiment_cell_index_row(
+        self,
+        experiment: dict[str, Any],
+        stack_info: dict[str, Any],
+        cell_row: dict[str, Any],
+        thread_exports: dict[str, Any],
+    ) -> dict[str, Any]:
+        wavelet_payload = dict(thread_exports.get("wavelet_payload") or {})
+        wavelet_params = dict(wavelet_payload.get("wavelet_params") or {})
+        return {
+            "experiment_id": int(experiment.get("experiment_id", 0) or 0),
+            "experiment_name": str(experiment.get("name") or ""),
+            "stack_id": int(stack_info.get("stack_id", -1) or -1),
+            "stack_name": str(stack_info.get("stack_name") or ""),
+            "stack_kind": str(stack_info.get("stack_kind") or ""),
+            "cell_id": str(cell_row.get("cell_id") or ""),
+            "cut_id": int(cell_row.get("cut_id", -1) or -1),
+            "cut_name": str(cell_row.get("cut_name") or ""),
+            "offset_idx": int(cell_row.get("offset_idx", 0) or 0),
+            "offset_value": float(cell_row.get("offset_value", 0.0) or 0.0),
+            "angle_idx": int(cell_row.get("angle_idx", 0) or 0),
+            "angle_deg": float(cell_row.get("angle_deg", 0.0) or 0.0),
+            "status": str(cell_row.get("status") or ""),
+            "segment_count": int(cell_row.get("segment_count", 0) or 0),
+            "accepted_count": int(cell_row.get("accepted_count", 0) or 0),
+            "event_count": int(len(wavelet_payload.get("summary_rows") or [])),
+            "thread_count": int(thread_exports.get("thread_count", 0) or 0),
+            "longest_thread": int(thread_exports.get("longest_thread", 0) or 0),
+            "thread_rows_count": int(
+                thread_exports.get("thread_rows_count", 0) or 0
+            ),
+            "td_fits_path": str(cell_row.get("td_fits_path") or ""),
+            "nuwt_result_path": str(cell_row.get("nuwt_result_path") or ""),
+            "wavelet_result_path": str(cell_row.get("wavelet_result_path") or ""),
+            "events_table_path": str(thread_exports.get("events_table_path") or ""),
+            "trace_table_path": str(thread_exports.get("trace_table_path") or ""),
+            "threads_table_path": str(
+                thread_exports.get("threads_table_path") or ""
+            ),
+            "cell_dir": str(cell_row.get("cell_dir") or ""),
+            "wavelet_filter_result": self._clone_wavelet_payload(
+                wavelet_payload.get("wavelet_filter_result") or {}
+            ),
+            "td_params": self._clone_wavelet_payload(
+                wavelet_payload.get("td_params") or {}
+            ),
+            "crest_params": self._clone_wavelet_payload(
+                wavelet_payload.get("crest_params") or {}
+            ),
+            "wavelet_params": self._clone_wavelet_payload(wavelet_params),
+            "min_prominence": float(
+                wavelet_params.get("min_prominence", float("nan"))
+            ),
+            "min_snr": float(wavelet_params.get("min_snr", float("nan"))),
+            "continuity_weight": float(
+                wavelet_params.get("continuity_weight", float("nan"))
+            ),
+            "time_weight": float(
+                wavelet_params.get("time_weight", float("nan"))
+            ),
+            "quality_weight": float(
+                wavelet_params.get("quality_weight", float("nan"))
+            ),
+            "error_weight": float(
+                wavelet_params.get("error_weight", float("nan"))
+            ),
+        }
+
+    def _merge_table_parts_to_bundle(
+        self, base_path: Path, part_paths: list[str]
+    ) -> int:
+        json_path = base_path.with_suffix(".json")
+        csv_path = base_path.with_suffix(".csv")
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        total_rows = 0
+        fieldnames: list[str] = []
+        csv_handle = open(csv_path, "w", encoding="utf-8", newline="")
+        try:
+            writer: csv.DictWriter | None = None
+            with open(json_path, "w", encoding="utf-8") as json_handle:
+                json_handle.write("[")
+                wrote_any = False
+                for part_path_text in part_paths:
+                    part_path = Path(str(part_path_text)).expanduser()
+                    if not part_path.exists():
+                        continue
+                    rows = self._read_json_file(part_path)
+                    if not isinstance(rows, list):
+                        continue
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        normalized = dict(row)
+                        if not fieldnames:
+                            fieldnames = list(normalized.keys())
+                            writer = csv.DictWriter(csv_handle, fieldnames=fieldnames)
+                            writer.writeheader()
+                        if wrote_any:
+                            json_handle.write(",")
+                        json.dump(self._json_safe(normalized), json_handle, ensure_ascii=False)
+                        wrote_any = True
+                        if writer is not None:
+                            out_row = dict(normalized)
+                            for key, value in list(out_row.items()):
+                                if isinstance(value, (list, dict)):
+                                    out_row[key] = json.dumps(
+                                        self._json_safe(value), ensure_ascii=False
+                                    )
+                            writer.writerow(out_row)
+                        total_rows += 1
+                json_handle.write("]")
+            if total_rows == 0:
+                csv_handle.write("")
+        finally:
+            csv_handle.close()
+        return int(total_rows)
+
+    def _clear_experiment_cut_heavy_state(self, cut_id: int) -> None:
+        if cut_id not in self.cuts:
+            return
+        state = self._cut_analysis(cut_id)
+        state["td_cache_key"] = None
+        state["td_cache_td"] = None
+        state["td_cache_meta"] = None
+        state["crest_tracking_result"] = None
+        state["crest_tracking_td_key"] = None
+        state["wavelet_filter_result"] = None
+        state["wavelet_events"] = []
+        state["wavelet_next_event_id"] = 1
+        state["wavelet_selected_event_id"] = None
 
     def _experiment_curated_rows(self, experiment: dict[str, Any]) -> list[dict[str, Any]]:
         experiment_id = int(experiment["experiment_id"])
@@ -6139,6 +9280,8 @@ class TDMosaicApp:
         master_rows: list[dict[str, Any]],
         novelty_rows: list[dict[str, Any]],
         cells_rows: list[dict[str, Any]],
+        *,
+        write_images: bool = True,
     ) -> list[dict[str, Any]]:
         novelty_map = {
             (int(row["cut_id"]), int(row["event_id"])): row for row in novelty_rows
@@ -6146,7 +9289,11 @@ class TDMosaicApp:
         important_rows: list[dict[str, Any]] = []
         important_cell_ids: set[str] = set()
         image_dir = self._experiment_output_root(experiment) / "important_zones_images"
-        if bool(experiment.get("save_options", {}).get("save_important_images", True)):
+        allow_images = bool(
+            write_images
+            and experiment.get("save_options", {}).get("save_important_images", True)
+        )
+        if allow_images:
             image_dir.mkdir(parents=True, exist_ok=True)
         for row in master_rows:
             novelty = novelty_map.get((int(row["cut_id"]), int(row["event_id"])), {})
@@ -6164,7 +9311,7 @@ class TDMosaicApp:
             if not is_important:
                 continue
             image_path = ""
-            if bool(experiment.get("save_options", {}).get("save_important_images", True)):
+            if allow_images:
                 image_file = image_dir / (
                     f"cut{int(row['cut_id']):03d}_event{int(row['event_id']):03d}.png"
                 )
@@ -6228,6 +9375,676 @@ class TDMosaicApp:
             )
         return important_rows
 
+    def _write_saved_experiment_event_arrow_png(
+        self,
+        cell_row: dict[str, Any],
+        event_id: int,
+        save_path: Path,
+        *,
+        map_cut_ids: list[int] | None = None,
+    ) -> None:
+        cut_id = int(cell_row.get("cut_id", -1))
+        if cut_id not in self.cuts:
+            return
+        wavelet_result_path = Path(
+            str(cell_row.get("wavelet_result_path") or "")
+        ).expanduser()
+        nuwt_result_path = Path(str(cell_row.get("nuwt_result_path") or "")).expanduser()
+        if not wavelet_result_path.exists() or not nuwt_result_path.exists():
+            return
+        wavelet_payload = self._read_json_file(wavelet_result_path)
+        nuwt_payload = self._read_json_file(nuwt_result_path)
+        events = list(wavelet_payload.get("wavelet_events") or [])
+        event = next(
+            (
+                dict(candidate)
+                for candidate in events
+                if int(candidate.get("event_id", -1)) == int(event_id)
+            ),
+            None,
+        )
+        if event is None:
+            return
+        trace_rows = self._event_trace_rows(
+            cut_id,
+            event,
+            meta=dict(nuwt_payload.get("td_meta") or {}),
+        )
+        if not trace_rows:
+            return
+        frame_idx = int(self.t_visual_var.get())
+        fig = self.Figure(figsize=(12.8, 5.8), dpi=160)
+        grid = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.12], wspace=0.24)
+        map_ax = fig.add_subplot(grid[0, 0])
+        td_ax = fig.add_subplot(grid[0, 1])
+        context_cut_ids = (
+            [int(current_cut_id) for current_cut_id in map_cut_ids if int(current_cut_id) in self.cuts]
+            if map_cut_ids is not None
+            else [int(cut_id)]
+        )
+        if int(cut_id) not in context_cut_ids:
+            context_cut_ids.append(int(cut_id))
+        self._draw_export_map_axis(
+            map_ax,
+            frame_idx,
+            cut_ids=context_cut_ids,
+            focus_cut_id=cut_id,
+            trace_rows=trace_rows,
+            title=f"Important zone | cut {cut_id} | event {event_id}",
+        )
+        wave_rows = [row for row in trace_rows if str(row.get("series")) == "wave"]
+        if len(wave_rows) >= 2:
+            start_row = wave_rows[0]
+            end_row = wave_rows[-1]
+            start_disp = self._map_data_to_display(
+                float(start_row["map_x"]), float(start_row["map_y"])
+            )
+            end_disp = self._map_data_to_display(
+                float(end_row["map_x"]), float(end_row["map_y"])
+            )
+            map_ax.annotate(
+                "",
+                xy=(float(end_disp[0]), float(end_disp[1])),
+                xytext=(float(start_disp[0]), float(start_disp[1])),
+                arrowprops={"arrowstyle": "->", "color": "lime", "linewidth": 2.2},
+            )
+        td = None
+        meta = dict(nuwt_payload.get("td_meta") or {})
+        td_fits_path = Path(str(cell_row.get("td_fits_path") or "")).expanduser()
+        if td_fits_path.exists():
+            td = np.asarray(fits.getdata(td_fits_path), dtype=np.float32)
+        if td is None:
+            result = self._compute_cut_td_export(cut_id)
+            if result is not None:
+                td, meta, _params = result
+        if td is not None:
+            td = np.asarray(td, dtype=np.float32)
+            distances = np.asarray(dict(meta).get("distances", []), dtype=np.float64)
+            t_indices = np.asarray(dict(meta).get("t_indices", []), dtype=np.float64)
+            dist_max = float(distances[-1]) if distances.size else max(float(td.shape[1] - 1), 1.0)
+            t_min = float(t_indices[0]) if t_indices.size else 0.0
+            t_max = float(t_indices[-1]) if t_indices.size > 1 else t_min + 1.0
+            vmin, vmax = frame_limits(td)
+            td_ax.imshow(
+                td,
+                origin="lower",
+                aspect="auto",
+                cmap="gray",
+                extent=[0.0, dist_max, t_min, t_max],
+                vmin=vmin,
+                vmax=vmax,
+                interpolation="nearest",
+            )
+            for series_name, color in (("source", "tab:orange"), ("wave", "lime")):
+                series_rows = [row for row in trace_rows if str(row.get("series")) == series_name]
+                if not series_rows:
+                    continue
+                td_ax.plot(
+                    [float(row["dist_px"]) for row in series_rows],
+                    [float(row["t_idx"]) for row in series_rows],
+                    color=color,
+                    linewidth=1.6,
+                )
+            td_ax.set_xlabel("distance [pixel]")
+            td_ax.set_ylabel("time index")
+            td_ax.set_title(
+                f"Important: {self.cuts[cut_id].name} | event {int(event_id)}",
+                fontsize=10.0,
+            )
+        self._save_export_figure_png(fig, save_path)
+
+    def _build_experiment_important_rows_from_saved_outputs(
+        self,
+        experiment: dict[str, Any],
+        master_rows: list[dict[str, Any]],
+        novelty_rows: list[dict[str, Any]],
+        cells_rows: list[dict[str, Any]],
+        *,
+        write_images: bool = True,
+    ) -> list[dict[str, Any]]:
+        novelty_map = {
+            (int(row["cut_id"]), int(row["event_id"])): row for row in novelty_rows
+        }
+        cell_lookup = {
+            int(row.get("cut_id", -1)): dict(row)
+            for row in cells_rows
+            if int(row.get("cut_id", -1)) in self.cuts
+        }
+        important_rows: list[dict[str, Any]] = []
+        important_cell_ids: set[str] = set()
+        image_dir = self._experiment_output_root(experiment) / "important_zones_images"
+        allow_images = bool(
+            write_images
+            and experiment.get("save_options", {}).get("save_important_images", True)
+        )
+        if allow_images:
+            image_dir.mkdir(parents=True, exist_ok=True)
+        for row in master_rows:
+            novelty = novelty_map.get((int(row["cut_id"]), int(row["event_id"])), {})
+            state = self._cut_analysis(int(row["cut_id"]))
+            is_important = (
+                bool(state.get("roi_enabled"))
+                or str(novelty.get("classification", "")) == "new"
+                or float(row.get("confidence_score", float("nan"))) >= float(
+                    experiment.get("important_zone_rules", {}).get(
+                        "confidence_min", EXPERIMENT_IMPORTANT_CONFIDENCE_MIN
+                    )
+                )
+                or bool(row.get("review_locked"))
+            )
+            if not is_important:
+                continue
+            image_path = ""
+            if allow_images:
+                image_file = image_dir / (
+                    f"cut{int(row['cut_id']):03d}_event{int(row['event_id']):03d}.png"
+                )
+                self._write_saved_experiment_event_arrow_png(
+                    cell_lookup.get(int(row["cut_id"]), {}),
+                    int(row["event_id"]),
+                    image_file,
+                    map_cut_ids=[int(row["cut_id"])],
+                )
+                image_path = str(image_file)
+            important_row = dict(row)
+            important_row["important_reason"] = ",".join(
+                [
+                    label
+                    for label, enabled in (
+                        ("roi", bool(state.get("roi_enabled"))),
+                        ("new", str(novelty.get("classification", "")) == "new"),
+                        (
+                            "high_conf",
+                            float(row.get("confidence_score", float("nan"))) >= float(
+                                experiment.get("important_zone_rules", {}).get(
+                                    "confidence_min", EXPERIMENT_IMPORTANT_CONFIDENCE_MIN
+                                )
+                            ),
+                        ),
+                        ("locked", bool(row.get("review_locked"))),
+                    )
+                    if enabled
+                ]
+            )
+            important_row["important_image"] = image_path
+            important_rows.append(important_row)
+            important_cell_ids.add(str(row.get("experiment_cell_id") or ""))
+        for cell_row in cells_rows:
+            if not bool(cell_row.get("roi_enabled")):
+                continue
+            if str(cell_row.get("cell_id") or "") in important_cell_ids:
+                continue
+            important_rows.append(
+                {
+                    "experiment_id": int(experiment["experiment_id"]),
+                    "experiment_name": str(experiment["name"]),
+                    "cut_id": int(cell_row["cut_id"]),
+                    "cut_name": str(cell_row["cut_name"]),
+                    "event_id": None,
+                    "experiment_cell_id": str(cell_row["cell_id"]),
+                    "experiment_offset_idx": int(cell_row["offset_idx"]),
+                    "experiment_offset_value": float(cell_row["offset_value"]),
+                    "experiment_angle_idx": int(cell_row["angle_idx"]),
+                    "experiment_angle_deg": float(cell_row["angle_deg"]),
+                    "status": "roi-only",
+                    "counted": False,
+                    "confidence_score": float("nan"),
+                    "review_locked": False,
+                    "roi_enabled": True,
+                    "roi_t_span": str(cell_row.get("roi_t_span", "") or ""),
+                    "roi_d_span": str(cell_row.get("roi_d_span", "") or ""),
+                    "important_reason": "roi",
+                    "important_image": "",
+                }
+            )
+        return important_rows
+
+    def _write_csv_rows(self, path: Path, rows: list[dict[str, Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = list(rows[0].keys()) if rows else []
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            if not fieldnames:
+                handle.write("")
+                return
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                out_row = dict(row)
+                for key, value in list(out_row.items()):
+                    if isinstance(value, (list, dict)):
+                        out_row[key] = json.dumps(self._json_safe(value), ensure_ascii=False)
+                writer.writerow(out_row)
+
+    def _compute_cut_td_export(
+        self, cut_id: int
+    ) -> tuple[np.ndarray, dict[str, Any], dict[str, Any]] | None:
+        cut = self.cuts.get(int(cut_id))
+        if cut is None:
+            return None
+        params = self._cut_td_params(int(cut_id))
+        dynamic_geometry = self._dynamic_cut_geometry_samples(
+            int(cut_id),
+            int(params["t_ini"]),
+            int(params["t_fin"]),
+            int(params["stride"]),
+        )
+        td, meta = compute_td(
+            self.cube,
+            cut,
+            int(params["t_ini"]),
+            int(params["t_fin"]),
+            int(params["stride"]),
+            int(params["width"]),
+            str(params["weighting"]),
+            dynamic_geometry=dynamic_geometry or None,
+        )
+        return np.asarray(td, dtype=np.float32), dict(meta), dict(params)
+
+    def _write_experiment_stack_csv_tables(
+        self,
+        experiment: dict[str, Any],
+        root_dir: Path,
+        master_rows: list[dict[str, Any]],
+    ) -> tuple[dict[int, str], dict[int, str], str]:
+        csv_root = root_dir / "csv_tables"
+        master_csv_path = csv_root / "master_events.csv"
+        self._write_csv_rows(master_csv_path, master_rows)
+
+        def _write_group(
+            folder_name: str, stack_ids: list[int]
+        ) -> dict[int, str]:
+            paths: dict[int, str] = {}
+            for stack_id in stack_ids:
+                stack = self.stacks.get(int(stack_id))
+                if stack is None:
+                    continue
+                cut_id_set = {
+                    int(cut_id)
+                    for cut_id in (stack.get("cut_ids") or [])
+                    if int(cut_id) in self.cuts
+                }
+                rows = [
+                    dict(row)
+                    for row in master_rows
+                    if int(row.get("cut_id", -1)) in cut_id_set
+                ]
+                slug = self._safe_export_slug(str(stack.get("name") or f"stack_{int(stack_id):03d}"))
+                path = csv_root / folder_name / f"stack_{int(stack_id):03d}_{slug}.csv"
+                self._write_csv_rows(path, rows)
+                paths[int(stack_id)] = str(path)
+            return paths
+
+        displacement_paths = _write_group(
+            "displacements",
+            [int(stack_id) for stack_id in (experiment.get("displacement_stack_ids") or [])],
+        )
+        rotation_paths = _write_group(
+            "rotates",
+            [int(stack_id) for stack_id in (experiment.get("rotation_stack_ids") or [])],
+        )
+        return displacement_paths, rotation_paths, str(master_csv_path)
+
+    def _write_experiment_td_fits(
+        self,
+        experiment: dict[str, Any],
+        root_dir: Path,
+    ) -> tuple[dict[int, str], dict[int, str], str, str]:
+        if not bool(experiment.get("save_options", {}).get("save_td_fits", True)):
+            return {}, {}, "", ""
+
+        def _write_stack_cube(
+            folder_name: str,
+            stack_kind: str,
+            stack_ids: list[int],
+        ) -> tuple[dict[int, str], str]:
+            stack_paths: dict[int, str] = {}
+            stack_cubes: list[np.ndarray] = []
+            max_members = 0
+            max_t = 0
+            max_s = 0
+            valid_stack_count = 0
+
+            for stack_id in stack_ids:
+                stack = self.stacks.get(int(stack_id))
+                if stack is None:
+                    continue
+                cut_ids = [
+                    int(cut_id)
+                    for cut_id in (stack.get("cut_ids") or [])
+                    if int(cut_id) in self.cuts
+                ]
+                member_tds: list[np.ndarray] = []
+                member_meta: list[dict[str, Any]] = []
+                stack_value = float("nan")
+                varying_key = "angle_deg" if stack_kind == "displacement" else "offset_value"
+                constant_key = "offset_value" if stack_kind == "displacement" else "angle_deg"
+                constant_unit = "px" if stack_kind == "displacement" else "deg"
+                varying_unit = "deg" if stack_kind == "displacement" else "px"
+
+                for member_index, cut_id in enumerate(cut_ids, start=1):
+                    result = self._compute_cut_td_export(int(cut_id))
+                    if result is None:
+                        continue
+                    td, meta, params = result
+                    cut = self.cuts.get(int(cut_id))
+                    if cut is None:
+                        continue
+                    cell = next(
+                        (
+                            dict(candidate)
+                            for candidate in self._experiment_cells(experiment)
+                            if int(candidate.get("cut_id", -1)) == int(cut_id)
+                        ),
+                        {},
+                    )
+                    if not np.isfinite(stack_value):
+                        stack_value = float(cell.get(constant_key, float("nan")))
+                    member_tds.append(td)
+                    member_meta.append(
+                        {
+                            "member_index": int(member_index),
+                            "cut_id": int(cut_id),
+                            "cut_name": str(cut.name),
+                            "offset_idx": int(cell.get("offset_idx", 0)),
+                            "offset_value": float(cell.get("offset_value", float("nan"))),
+                            "angle_idx": int(cell.get("angle_idx", 0)),
+                            "angle_deg": float(cell.get("angle_deg", float("nan"))),
+                            "varying_value": float(cell.get(varying_key, float("nan"))),
+                            "varying_unit": varying_unit,
+                            "td_shape": [int(td.shape[0]), int(td.shape[1])],
+                            "cut_length_px": float(meta.get("cut_length", float("nan"))),
+                            "t_indices": self._json_safe(meta.get("t_indices", [])),
+                            "distances": self._json_safe(meta.get("distances", [])),
+                            "td_params": {
+                                "t_ini": int(params["t_ini"]),
+                                "t_fin": int(params["t_fin"]),
+                                "stride": int(params["stride"]),
+                                "width": int(params["width"]),
+                                "weighting": str(params["weighting"]),
+                            },
+                        }
+                    )
+                    max_t = max(max_t, int(td.shape[0]))
+                    max_s = max(max_s, int(td.shape[1]))
+
+                if not member_tds:
+                    continue
+
+                cube = np.full(
+                    (len(member_tds), max((td.shape[0] for td in member_tds), default=0), max((td.shape[1] for td in member_tds), default=0)),
+                    np.nan,
+                    dtype=np.float32,
+                )
+                for member_idx, td in enumerate(member_tds):
+                    cube[member_idx, : td.shape[0], : td.shape[1]] = td
+
+                slug = self._safe_export_slug(str(stack.get("name") or f"stack_{int(stack_id):03d}"))
+                path = root_dir / folder_name / f"stack_{int(stack_id):03d}_{slug}_td.fits"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                header = fits.Header()
+                header["EXPTYPE"] = ("EXHSTK", "Exhaustive stack TD cube")
+                header["EXPID"] = (int(experiment["experiment_id"]), "Experiment id")
+                header["STKTYP"] = (str(stack_kind).upper(), "Stack family")
+                header["STACKID"] = (int(stack["stack_id"]), "Stack id")
+                header["STKNAME"] = (str(stack.get("name") or ""), "Stack name")
+                header["STACKBY"] = (str(stack_kind).upper(), "Stack grouped by")
+                header["STKVAL"] = (float(stack_value), f"Constant {constant_key}")
+                header["STKUNIT"] = (constant_unit, "Constant stack unit")
+                header["VARIES"] = (varying_key.upper()[:8], "Value changing inside stack")
+                header["NMEMBER"] = (int(len(member_tds)), "Members in stack")
+                header["MAXT"] = (int(cube.shape[1]), "Padded time axis length")
+                header["MAXS"] = (int(cube.shape[2]), "Padded distance axis length")
+                header["PADVAL"] = ("NaN", "Padding value")
+                header["DMIN"] = (float(experiment.get("displacement_min", float("nan"))), "Study displacement min [px]")
+                header["DMAX"] = (float(experiment.get("displacement_max", float("nan"))), "Study displacement max [px]")
+                header["DSTEP"] = (float(experiment.get("displacement_step", float("nan"))), "Study displacement step [px]")
+                header["AMIN"] = (float(experiment.get("angle_min", float("nan"))), "Study angle min [deg]")
+                header["AMAX"] = (float(experiment.get("angle_max", float("nan"))), "Study angle max [deg]")
+                header["ASTEP"] = (float(experiment.get("angle_step", float("nan"))), "Study angle step [deg]")
+                header["CTYPE1"] = ("DIST", "Axis 1 = distance sample")
+                header["CUNIT1"] = ("pixel", "Axis 1 unit")
+                header["CTYPE2"] = ("TIME", "Axis 2 = time sample")
+                header["CUNIT2"] = ("frame", "Axis 2 unit")
+                header["CTYPE3"] = ("MEMBER", "Axis 3 = stack member")
+                header["TDWIDTH"] = (int(experiment.get("td_width", 1)), "TD sampling width")
+                header["WEIGHT"] = (str(experiment.get("td_weighting") or "uniform"), "TD weighting")
+                fits.PrimaryHDU(data=cube, header=header).writeto(path, overwrite=True)
+
+                stack_paths[int(stack["stack_id"])] = str(path)
+                stack_cubes.append(cube)
+                max_members = max(max_members, int(cube.shape[0]))
+                valid_stack_count += 1
+
+            if not stack_cubes:
+                return stack_paths, ""
+
+            group_cube = np.full(
+                (valid_stack_count, max_members, max_t, max_s),
+                np.nan,
+                dtype=np.float32,
+            )
+            for stack_index, cube in enumerate(stack_cubes):
+                group_cube[
+                    stack_index,
+                    : cube.shape[0],
+                    : cube.shape[1],
+                    : cube.shape[2],
+                ] = cube
+
+            group_path = root_dir / f"{folder_name}_cube.fits"
+            group_path.parent.mkdir(parents=True, exist_ok=True)
+            group_header = fits.Header()
+            group_header["EXPTYPE"] = ("EXHGRP", "Exhaustive grouped TD cube")
+            group_header["EXPID"] = (int(experiment["experiment_id"]), "Experiment id")
+            group_header["STACKBY"] = (str(stack_kind).upper(), "Outer stack axis meaning")
+            group_header["NSTACK"] = (int(valid_stack_count), "Number of stacks")
+            group_header["NMEMMAX"] = (int(max_members), "Padded member axis length")
+            group_header["MAXT"] = (int(max_t), "Padded time axis length")
+            group_header["MAXS"] = (int(max_s), "Padded distance axis length")
+            group_header["PADVAL"] = ("NaN", "Padding value")
+            group_header["CTYPE1"] = ("DIST", "Axis 1 = distance sample")
+            group_header["CUNIT1"] = ("pixel", "Axis 1 unit")
+            group_header["CTYPE2"] = ("TIME", "Axis 2 = time sample")
+            group_header["CUNIT2"] = ("frame", "Axis 2 unit")
+            group_header["CTYPE3"] = ("MEMBER", "Axis 3 = stack member")
+            group_header["CTYPE4"] = ("STACK", "Axis 4 = stack index")
+            group_header["DMIN"] = (float(experiment.get("displacement_min", float("nan"))), "Study displacement min [px]")
+            group_header["DMAX"] = (float(experiment.get("displacement_max", float("nan"))), "Study displacement max [px]")
+            group_header["DSTEP"] = (float(experiment.get("displacement_step", float("nan"))), "Study displacement step [px]")
+            group_header["AMIN"] = (float(experiment.get("angle_min", float("nan"))), "Study angle min [deg]")
+            group_header["AMAX"] = (float(experiment.get("angle_max", float("nan"))), "Study angle max [deg]")
+            group_header["ASTEP"] = (float(experiment.get("angle_step", float("nan"))), "Study angle step [deg]")
+            group_header["TDWIDTH"] = (int(experiment.get("td_width", 1)), "TD sampling width")
+            group_header["WEIGHT"] = (str(experiment.get("td_weighting") or "uniform"), "TD weighting")
+            fits.PrimaryHDU(data=group_cube, header=group_header).writeto(
+                group_path, overwrite=True
+            )
+            return stack_paths, str(group_path)
+
+        displacement_paths, displacement_group_path = _write_stack_cube(
+            "displacements",
+            "displacement",
+            [int(stack_id) for stack_id in (experiment.get("displacement_stack_ids") or [])],
+        )
+        rotation_paths, rotation_group_path = _write_stack_cube(
+            "rotates",
+            "rotation",
+            [int(stack_id) for stack_id in (experiment.get("rotation_stack_ids") or [])],
+        )
+        return (
+            displacement_paths,
+            rotation_paths,
+            displacement_group_path,
+            rotation_group_path,
+        )
+
+    def _write_experiment_stack_payloads(
+        self,
+        experiment: dict[str, Any],
+        root_dir: Path,
+        cells_rows: list[dict[str, Any]],
+        master_rows: list[dict[str, Any]],
+        novelty_rows: list[dict[str, Any]],
+        important_rows: list[dict[str, Any]],
+        trace_rows: list[dict[str, Any]],
+    ) -> tuple[dict[int, str], dict[int, str], str]:
+        if not bool(experiment.get("save_options", {}).get("save_stack_json", True)):
+            return {}, {}, ""
+
+        experiment_summary = {
+            "experiment_id": int(experiment["experiment_id"]),
+            "name": str(experiment.get("name") or ""),
+            "base_cut_id": int(experiment.get("base_cut_id")) if experiment.get("base_cut_id") is not None else None,
+            "base_cut_name": str(experiment.get("base_cut_name") or ""),
+            "base_frame_idx": int(experiment.get("base_frame_idx", 0)),
+            "stack_group_mode": str(self._experiment_stack_mode(experiment)),
+            "full_cube_angles": bool(experiment.get("full_cube_angles", False)),
+            "dynamic_length": bool(experiment.get("dynamic_length", False)),
+            "min_cut_length_px": float(
+                experiment.get("min_cut_length_px", MIN_EXPERIMENT_CUT_LENGTH_PX)
+            ),
+            "displacement_step": float(experiment.get("displacement_step", float("nan"))),
+            "displacement_min": float(experiment.get("displacement_min", float("nan"))),
+            "displacement_max": float(experiment.get("displacement_max", float("nan"))),
+            "full_sweep": bool(experiment.get("full_sweep", False)),
+            "angle_min": float(experiment.get("angle_min", float("nan"))),
+            "angle_max": float(experiment.get("angle_max", float("nan"))),
+            "angle_step": float(experiment.get("angle_step", float("nan"))),
+            "td_width": int(experiment.get("td_width", 1)),
+            "td_weighting": str(experiment.get("td_weighting") or "uniform"),
+            "status": str(experiment.get("status") or ""),
+            "updated_at": str(experiment.get("updated_at") or ""),
+        }
+        cells_by_cut = {
+            int(row["cut_id"]): dict(row)
+            for row in cells_rows
+            if int(row.get("cut_id", -1)) in self.cuts
+        }
+        events_by_cut: dict[int, list[dict[str, Any]]] = {}
+        novelty_by_cut: dict[int, list[dict[str, Any]]] = {}
+        important_by_cut: dict[int, list[dict[str, Any]]] = {}
+        traces_by_cut: dict[int, list[dict[str, Any]]] = {}
+        for row in master_rows:
+            events_by_cut.setdefault(int(row.get("cut_id", -1)), []).append(dict(row))
+        for row in novelty_rows:
+            novelty_by_cut.setdefault(int(row.get("cut_id", -1)), []).append(dict(row))
+        for row in important_rows:
+            important_by_cut.setdefault(int(row.get("cut_id", -1)), []).append(dict(row))
+        for row in trace_rows:
+            traces_by_cut.setdefault(int(row.get("cut_id", -1)), []).append(dict(row))
+
+        def _stack_payload(stack: dict[str, Any], kind: str) -> dict[str, Any]:
+            cut_ids = [
+                int(cut_id)
+                for cut_id in (stack.get("cut_ids") or [])
+                if int(cut_id) in self.cuts
+            ]
+            cut_id_set = set(cut_ids)
+            cuts_payload: list[dict[str, Any]] = []
+            for member_index, cut_id in enumerate(cut_ids, start=1):
+                cut = self.cuts.get(int(cut_id))
+                if cut is None:
+                    continue
+                cuts_payload.append(
+                    {
+                        "member_index": int(member_index),
+                        "cut_id": int(cut_id),
+                        "cut_name": str(cut.name),
+                        "cell": dict(cells_by_cut.get(int(cut_id), {})),
+                        "events": [dict(row) for row in events_by_cut.get(int(cut_id), [])],
+                        "novelty": [dict(row) for row in novelty_by_cut.get(int(cut_id), [])],
+                        "important": [dict(row) for row in important_by_cut.get(int(cut_id), [])],
+                        "traces": [dict(row) for row in traces_by_cut.get(int(cut_id), [])],
+                        "velocity_traces": self._session_analysis_state_payload(
+                            self._cut_analysis_snapshot(int(cut_id))
+                        ).get("velocity_traces", []),
+                        "analysis_state": self._session_analysis_state_payload(
+                            self._cut_analysis_snapshot(int(cut_id))
+                        ),
+                    }
+                )
+            return {
+                "experiment": dict(experiment_summary),
+                "stack": {
+                    "kind": str(kind),
+                    "stack_id": int(stack["stack_id"]),
+                    "stack_name": str(stack.get("name") or ""),
+                    "cut_ids": cut_ids,
+                    "cut_count": int(len(cut_ids)),
+                },
+                "cells": [
+                    dict(row)
+                    for row in cells_rows
+                    if int(row.get("cut_id", -1)) in cut_id_set
+                ],
+                "events": [
+                    dict(row)
+                    for row in master_rows
+                    if int(row.get("cut_id", -1)) in cut_id_set
+                ],
+                "novelty": [
+                    dict(row)
+                    for row in novelty_rows
+                    if int(row.get("cut_id", -1)) in cut_id_set
+                ],
+                "important": [
+                    dict(row)
+                    for row in important_rows
+                    if int(row.get("cut_id", -1)) in cut_id_set
+                ],
+                "traces": [
+                    dict(row)
+                    for row in trace_rows
+                    if int(row.get("cut_id", -1)) in cut_id_set
+                ],
+                "cuts": cuts_payload,
+            }
+
+        def _write_stack_group(
+            folder_name: str,
+            stack_ids: list[int],
+        ) -> tuple[list[dict[str, Any]], dict[int, str]]:
+            payloads: list[dict[str, Any]] = []
+            paths: dict[int, str] = {}
+            stack_kind = "rotation" if folder_name == "rotates" else "displacement"
+            for stack_id in stack_ids:
+                stack = self.stacks.get(int(stack_id))
+                if stack is None:
+                    continue
+                payload = _stack_payload(stack, stack_kind)
+                slug = self._safe_export_slug(str(stack.get("name") or f"stack_{int(stack_id):03d}"))
+                path = root_dir / folder_name / f"stack_{int(stack_id):03d}_{slug}.json"
+                payload["stack"]["json_path"] = str(path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(self._json_safe(payload), handle, indent=2)
+                payloads.append(dict(payload))
+                paths[int(stack_id)] = str(path)
+            return payloads, paths
+
+        displacement_payloads, displacement_paths = _write_stack_group(
+            "displacements",
+            [int(stack_id) for stack_id in (experiment.get("displacement_stack_ids") or [])],
+        )
+        rotation_payloads, rotation_paths = _write_stack_group(
+            "rotates",
+            [int(stack_id) for stack_id in (experiment.get("rotation_stack_ids") or [])],
+        )
+        root_bundle_path = root_dir / "stacks_bundle.json"
+        with open(root_bundle_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                self._json_safe(
+                    {
+                        "experiment": experiment_summary,
+                        "displacements": displacement_payloads,
+                        "rotates": rotation_payloads,
+                    }
+                ),
+                handle,
+                indent=2,
+            )
+        return displacement_paths, rotation_paths, str(root_bundle_path)
+
     def _finalize_experiment_outputs(
         self,
         experiment_id: int,
@@ -6238,6 +10055,193 @@ class TDMosaicApp:
         if experiment is None:
             return
         root_dir = self._experiment_output_root(experiment)
+        stack_outputs = dict(experiment.get("stack_outputs") or {})
+        if stack_outputs:
+            ordered_stack_ids = self._experiment_stack_ids_for_processing(experiment)
+            cells_rows: list[dict[str, Any]] = []
+            master_rows: list[dict[str, Any]] = []
+            trace_part_paths: list[str] = []
+            displacement_rows: list[dict[str, Any]] = []
+            rotation_rows: list[dict[str, Any]] = []
+            for stack_id in ordered_stack_ids:
+                info = dict(
+                    stack_outputs.get(str(int(stack_id)))
+                    or stack_outputs.get(int(stack_id))
+                    or {}
+                )
+                if not info:
+                    continue
+                cells_path = str(info.get("cells_table_path") or "")
+                master_path = str(info.get("master_table_path") or "")
+                trace_path = str(info.get("trace_table_path") or "")
+                if cells_path and Path(cells_path).exists():
+                    loaded_cells = self._read_json_file(Path(cells_path))
+                    if isinstance(loaded_cells, list):
+                        cells_rows.extend(
+                            dict(row) for row in loaded_cells if isinstance(row, dict)
+                        )
+                if master_path and Path(master_path).exists():
+                    loaded_master = self._read_json_file(Path(master_path))
+                    if isinstance(loaded_master, list):
+                        master_rows.extend(
+                            dict(row) for row in loaded_master if isinstance(row, dict)
+                        )
+                if trace_path and Path(trace_path).exists():
+                    trace_part_paths.append(trace_path)
+                summary_row = {
+                    "experiment_id": int(experiment["experiment_id"]),
+                    "stack_id": int(info.get("stack_id", stack_id)),
+                    "stack_name": str(info.get("stack_name") or ""),
+                    "cut_count": int(info.get("cell_count", 0) or 0),
+                    "stack_json_path": str(info.get("stack_json_path") or ""),
+                    "stack_csv_path": "",
+                    "stack_fits_path": str(info.get("td_fits_path") or ""),
+                }
+                if str(info.get("stack_kind") or "") == "rotation":
+                    rotation_rows.append(summary_row)
+                else:
+                    displacement_rows.append(summary_row)
+
+            self._annotate_curated_group_rows(master_rows)
+            novelty_rows = self._build_experiment_novelty_rows(experiment, master_rows)
+            novelty_map = {
+                (int(row["cut_id"]), int(row["event_id"])): row for row in novelty_rows
+                if row.get("event_id") is not None
+            }
+            for row in master_rows:
+                novelty = novelty_map.get((int(row["cut_id"]), int(row["event_id"])), {})
+                row["novelty_class"] = str(novelty.get("classification", ""))
+                row["novelty_score"] = float(novelty.get("novelty_score", float("nan")))
+                row["novelty_match_cut_id"] = novelty.get("matched_cut_id")
+                row["novelty_match_event_id"] = novelty.get("matched_event_id")
+
+            cell_lookup = {
+                int(row.get("cut_id", -1)): dict(row)
+                for row in cells_rows
+                if int(row.get("cut_id", -1)) in self.cuts
+            }
+            velocity_trace_rows: list[dict[str, Any]] = []
+            for cut_id, cell in sorted(cell_lookup.items()):
+                state = self._cut_analysis_snapshot(int(cut_id))
+                for trace in state.get("velocity_traces") or []:
+                    if not isinstance(trace, dict):
+                        continue
+                    velocity_trace_rows.append(
+                        {
+                            "experiment_id": int(experiment["experiment_id"]),
+                            "experiment_name": str(experiment["name"]),
+                            "cut_id": int(cut_id),
+                            "cut_name": str(self.cuts[int(cut_id)].name),
+                            "cell_id": str(cell.get("cell_id") or ""),
+                            "offset_idx": int(cell.get("offset_idx", 0)),
+                            "offset_value": float(cell.get("offset_value", 0.0)),
+                            "angle_idx": int(cell.get("angle_idx", 0)),
+                            "angle_deg": float(cell.get("angle_deg", 0.0)),
+                            **dict(trace),
+                        }
+                    )
+
+            trace_rows_estimate = int(
+                sum(
+                    int(info.get("trace_count", 0) or 0)
+                    for info in stack_outputs.values()
+                    if isinstance(info, dict)
+                )
+            )
+            write_trace_bundle = trace_rows_estimate <= MAX_EXPERIMENT_TRACE_BUNDLE_ROWS
+            write_important_images = bool(
+                len(master_rows) <= MAX_EXPERIMENT_AUTO_IMPORTANT_IMAGE_SOURCE_ROWS
+            )
+            important_rows = self._build_experiment_important_rows_from_saved_outputs(
+                experiment,
+                master_rows,
+                novelty_rows,
+                cells_rows,
+                write_images=write_important_images,
+            )
+
+            self._write_table_bundle(root_dir / "master_table", master_rows)
+            self._write_table_bundle(root_dir / "cells_table", cells_rows)
+            trace_bundle_rows = 0
+            if write_trace_bundle:
+                trace_bundle_rows = self._merge_table_parts_to_bundle(
+                    root_dir / "trace_table",
+                    trace_part_paths,
+                )
+            self._write_table_bundle(root_dir / "velocity_trace_table", velocity_trace_rows)
+            self._write_table_bundle(root_dir / "novelty_table", novelty_rows)
+            self._write_table_bundle(root_dir / "important_zones_table", important_rows)
+            if displacement_rows:
+                self._write_table_bundle(root_dir / "displacements" / "summary", displacement_rows)
+            if rotation_rows:
+                self._write_table_bundle(root_dir / "rotates" / "summary", rotation_rows)
+            self._write_json_file(
+                root_dir / "manifest.json",
+                {
+                    "experiment": experiment,
+                    "stack_outputs": stack_outputs,
+                    "summary": {
+                        "master_rows": len(master_rows),
+                        "cells_rows": len(cells_rows),
+                        "trace_parts": len(trace_part_paths),
+                        "trace_rows_estimate": trace_rows_estimate,
+                        "trace_bundle_rows": trace_bundle_rows,
+                        "trace_bundle_written": bool(write_trace_bundle),
+                        "velocity_trace_rows": len(velocity_trace_rows),
+                        "important_rows": len(important_rows),
+                        "important_images_written": bool(write_important_images),
+                        "novelty_rows": len(novelty_rows),
+                        "stack_group_mode": self._experiment_stack_mode(experiment),
+                        "full_cube_angles": bool(experiment.get("full_cube_angles", False)),
+                    },
+                    "master_csv_path": str(root_dir / "master_table.csv"),
+                    "velocity_trace_table_path": str(root_dir / "velocity_trace_table.csv"),
+                },
+            )
+            finalize_notes: list[str] = []
+            if not write_trace_bundle:
+                finalize_notes.append(
+                    f"trace bundle skipped ({trace_rows_estimate} rows)"
+                )
+            if not write_important_images and bool(
+                experiment.get("save_options", {}).get("save_important_images", True)
+            ):
+                finalize_notes.append(
+                    f"important images skipped ({len(master_rows)} source events)"
+                )
+            summary_text = summary or f"Completed with {len(master_rows)} event row(s)."
+            if finalize_notes:
+                summary_text += " " + "; ".join(finalize_notes) + "."
+            experiment["status"] = "completed"
+            experiment["nuwt_status"] = (
+                "completed"
+                if str(experiment.get("nuwt_status") or "pending") != "pending"
+                else experiment.get("nuwt_status", "pending")
+            )
+            experiment["wavelet_status"] = (
+                "completed"
+                if str(experiment.get("wavelet_status") or "pending") != "pending"
+                else experiment.get("wavelet_status", "pending")
+            )
+            experiment["tables_status"] = "completed"
+            experiment["updated_at"] = self._timestamp_now()
+            experiment["completed_at"] = self._timestamp_now()
+            experiment["last_run_summary"] = summary_text
+            self._write_experiment_metadata_files(experiment)
+            with open(root_dir / "run_log.txt", "a", encoding="utf-8") as handle:
+                handle.write(
+                    f"{self._timestamp_now()} | finalize_staged | master={len(master_rows)} "
+                    f"important={len(important_rows)} novelty={len(novelty_rows)} "
+                    f"trace_bundle={'yes' if write_trace_bundle else 'no'} "
+                    f"important_images={'yes' if write_important_images else 'no'}\n"
+                )
+            self._record_session_change()
+            self.refresh_all()
+            self._set_status(
+                (summary_text or f"Exhaustive study completed for {experiment['name']}.")
+                + f" Folder: {root_dir}"
+            )
+            return
         master_rows = self._experiment_curated_rows(experiment)
         novelty_rows = self._build_experiment_novelty_rows(experiment, master_rows)
         novelty_map = {
@@ -6273,11 +10277,63 @@ class TDMosaicApp:
                         **trace_row,
                     }
                 )
+        cell_lookup = {
+            int(cell.get("cut_id", -1)): dict(cell)
+            for cell in self._experiment_cells(experiment)
+            if int(cell.get("cut_id", -1)) in self.cuts
+        }
+        velocity_trace_rows: list[dict[str, Any]] = []
+        for cut_id, cell in sorted(cell_lookup.items()):
+            state = self._cut_analysis_snapshot(int(cut_id))
+            for trace in state.get("velocity_traces") or []:
+                if not isinstance(trace, dict):
+                    continue
+                velocity_trace_rows.append(
+                    {
+                        "experiment_id": int(experiment["experiment_id"]),
+                        "experiment_name": str(experiment["name"]),
+                        "cut_id": int(cut_id),
+                        "cut_name": str(self.cuts[int(cut_id)].name),
+                        "cell_id": str(cell.get("cell_id") or ""),
+                        "offset_idx": int(cell.get("offset_idx", 0)),
+                        "offset_value": float(cell.get("offset_value", 0.0)),
+                        "angle_idx": int(cell.get("angle_idx", 0)),
+                        "angle_deg": float(cell.get("angle_deg", 0.0)),
+                        **dict(trace),
+                    }
+                )
         important_rows = self._build_experiment_important_rows(
             experiment,
             master_rows,
             novelty_rows,
             cells_rows,
+        )
+        displacement_csv_paths, rotation_csv_paths, master_csv_path = (
+            self._write_experiment_stack_csv_tables(
+                experiment,
+                root_dir,
+                master_rows,
+            )
+        )
+        (
+            displacement_fits_paths,
+            rotation_fits_paths,
+            displacement_group_fits_path,
+            rotation_group_fits_path,
+        ) = self._write_experiment_td_fits(
+            experiment,
+            root_dir,
+        )
+        displacement_stack_paths, rotation_stack_paths, stack_bundle_path = (
+            self._write_experiment_stack_payloads(
+                experiment,
+                root_dir,
+                cells_rows,
+                master_rows,
+                novelty_rows,
+                important_rows,
+                trace_rows,
+            )
         )
 
         displacement_rows: list[dict[str, Any]] = []
@@ -6291,6 +10347,9 @@ class TDMosaicApp:
                     "stack_id": int(stack["stack_id"]),
                     "stack_name": str(stack["name"]),
                     "cut_count": int(len([cut_id for cut_id in (stack.get("cut_ids") or []) if int(cut_id) in self.cuts])),
+                    "stack_json_path": str(displacement_stack_paths.get(int(stack["stack_id"]), "")),
+                    "stack_csv_path": str(displacement_csv_paths.get(int(stack["stack_id"]), "")),
+                    "stack_fits_path": str(displacement_fits_paths.get(int(stack["stack_id"]), "")),
                 }
             )
         rotation_rows: list[dict[str, Any]] = []
@@ -6304,16 +10363,22 @@ class TDMosaicApp:
                     "stack_id": int(stack["stack_id"]),
                     "stack_name": str(stack["name"]),
                     "cut_count": int(len([cut_id for cut_id in (stack.get("cut_ids") or []) if int(cut_id) in self.cuts])),
+                    "stack_json_path": str(rotation_stack_paths.get(int(stack["stack_id"]), "")),
+                    "stack_csv_path": str(rotation_csv_paths.get(int(stack["stack_id"]), "")),
+                    "stack_fits_path": str(rotation_fits_paths.get(int(stack["stack_id"]), "")),
                 }
             )
 
         self._write_table_bundle(root_dir / "master_table", master_rows)
         self._write_table_bundle(root_dir / "cells_table", cells_rows)
         self._write_table_bundle(root_dir / "trace_table", trace_rows)
+        self._write_table_bundle(root_dir / "velocity_trace_table", velocity_trace_rows)
         self._write_table_bundle(root_dir / "novelty_table", novelty_rows)
         self._write_table_bundle(root_dir / "important_zones_table", important_rows)
-        self._write_table_bundle(root_dir / "displacements" / "summary", displacement_rows)
-        self._write_table_bundle(root_dir / "rotates" / "summary", rotation_rows)
+        if displacement_rows:
+            self._write_table_bundle(root_dir / "displacements" / "summary", displacement_rows)
+        if rotation_rows:
+            self._write_table_bundle(root_dir / "rotates" / "summary", rotation_rows)
         with open(root_dir / "manifest.json", "w", encoding="utf-8") as handle:
             json.dump(
                 self._json_safe(
@@ -6323,9 +10388,17 @@ class TDMosaicApp:
                             "master_rows": len(master_rows),
                             "cells_rows": len(cells_rows),
                             "trace_rows": len(trace_rows),
+                            "velocity_trace_rows": len(velocity_trace_rows),
                             "important_rows": len(important_rows),
                             "novelty_rows": len(novelty_rows),
+                            "stack_group_mode": self._experiment_stack_mode(experiment),
+                            "full_cube_angles": bool(experiment.get("full_cube_angles", False)),
                         },
+                        "stack_bundle_path": stack_bundle_path,
+                        "master_csv_path": master_csv_path,
+                        "velocity_trace_table_path": str(root_dir / "velocity_trace_table.csv"),
+                        "displacement_group_fits_path": displacement_group_fits_path,
+                        "rotation_group_fits_path": rotation_group_fits_path,
                     }
                 ),
                 handle,
@@ -6350,24 +10423,21 @@ class TDMosaicApp:
                 f"important={len(important_rows)} novelty={len(novelty_rows)}\n"
             )
         experiment["status"] = "completed"
+        experiment["nuwt_status"] = "completed"
+        experiment["wavelet_status"] = "completed"
+        experiment["tables_status"] = "completed"
         experiment["updated_at"] = self._timestamp_now()
         experiment["completed_at"] = self._timestamp_now()
         experiment["last_run_summary"] = summary or f"Completed with {len(master_rows)} event row(s)."
         self._record_session_change()
         self.refresh_all()
         self._set_status(
-            summary or f"Exhaustive study completed for {experiment['name']}."
+            (summary or f"Exhaustive study completed for {experiment['name']}.")
+            + f" Folder: {root_dir}"
         )
 
     def _export_selected_experiment_tables(self) -> None:
-        experiment = self._selected_experiment()
-        if experiment is None:
-            self._set_status("Select a study first.")
-            return
-        self._finalize_experiment_outputs(
-            int(experiment["experiment_id"]),
-            summary=f"Exported tables for {experiment['name']}.",
-        )
+        self._run_selected_experiment("tables")
 
     def _td_window_wavelet_event_final_mode(self, event: dict[str, Any]) -> str:
         origin = str(event.get("origin", "") or "")
@@ -10077,25 +14147,144 @@ class TDMosaicApp:
             button_frame, text="Delete Cut", command=self._delete_selected_cut
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.ttk.Button(
-            button_frame, text="Copy Cut", command=self._copy_selected_cut
+            button_frame, text="Curved Cut", command=self._start_draw_curve_cut
         ).grid(row=2, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
         self.ttk.Button(
-            button_frame, text="Paste Cut", command=self._paste_cut
+            button_frame, text="Finish Curved", command=self._finish_pending_curve_cut
         ).grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=(4, 0))
         self.ttk.Button(
-            button_frame, text="Rotate -5°", command=lambda: self._rotate_selected_cut(-5.0)
+            button_frame, text="Copy Cut", command=self._copy_selected_cut
         ).grid(row=3, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
         self.ttk.Button(
-            button_frame, text="Rotate +5°", command=lambda: self._rotate_selected_cut(5.0)
+            button_frame, text="Paste Cut", command=self._paste_cut
         ).grid(row=3, column=1, sticky="ew", pady=(6, 0), padx=(4, 0))
         self.ttk.Button(
+            button_frame, text="Rotate -5°", command=lambda: self._rotate_selected_cut(-5.0)
+        ).grid(row=4, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
+        self.ttk.Button(
+            button_frame, text="Rotate +5°", command=lambda: self._rotate_selected_cut(5.0)
+        ).grid(row=4, column=1, sticky="ew", pady=(6, 0), padx=(4, 0))
+        self.ttk.Button(
             button_frame, text="Open Cut Browser", command=self._open_selected_cut_browser
-        ).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        function_cut_frame = self.ttk.LabelFrame(
+            self.sidebar_cuts_tab, text="Function Cut", padding=8
+        )
+        function_cut_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        function_cut_frame.columnconfigure(1, weight=1)
+        function_cut_frame.columnconfigure(2, weight=1)
+
+        self.ttk.Label(
+            function_cut_frame,
+            textvariable=self.function_cut_mode_var,
+            justify="left",
+            wraplength=320,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+
+        self.ttk.Label(function_cut_frame, text="y =").grid(
+            row=1, column=0, sticky="w", pady=(6, 0)
+        )
+        self.function_cut_expression_entry = self.ttk.Entry(
+            function_cut_frame,
+            textvariable=self.function_cut_expression_var,
+            width=28,
+        )
+        self.function_cut_expression_entry.grid(
+            row=1, column=1, columnspan=2, sticky="ew", pady=(6, 0), padx=(6, 0)
+        )
+        self.function_cut_expression_entry.bind(
+            "<Return>", self._on_function_expression_event
+        )
+        self.function_cut_expression_entry.bind(
+            "<FocusOut>", self._on_function_expression_event
+        )
+
+        self.ttk.Label(function_cut_frame, text="Render pts").grid(
+            row=2, column=0, sticky="w", pady=(6, 0)
+        )
+        self.function_cut_points_entry = self.ttk.Entry(
+            function_cut_frame,
+            textvariable=self.function_cut_points_var,
+            width=10,
+        )
+        self.function_cut_points_entry.grid(
+            row=2, column=1, sticky="ew", pady=(6, 0), padx=(6, 8)
+        )
+        self.function_cut_points_entry.bind(
+            "<Return>", self._on_function_render_points_event
+        )
+        self.ttk.Label(
+            function_cut_frame,
+            textvariable=self.function_fit_points_var,
+            justify="left",
+            wraplength=320,
+        ).grid(row=2, column=2, sticky="w", pady=(6, 0))
+
+        self.ttk.Label(
+            function_cut_frame,
+            text=(
+                "Write a parameterized function like `a*x**2 + b*x + c`, then click points on the image "
+                "to fit it. Editing the parameters updates the control points and the curve."
+            ),
+            justify="left",
+            wraplength=320,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        function_button_row = self.ttk.Frame(function_cut_frame)
+        function_button_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        function_button_row.columnconfigure(0, weight=1)
+        function_button_row.columnconfigure(1, weight=1)
+        function_button_row.columnconfigure(2, weight=1)
+        self.ttk.Button(
+            function_button_row,
+            text="Load Selected",
+            command=self._load_selected_cut_into_function_editor,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.ttk.Button(
+            function_button_row,
+            text="Pick Fit Points",
+            command=self._start_draw_function_cut,
+        ).grid(row=0, column=1, sticky="ew", padx=4)
+        self.ttk.Button(
+            function_button_row,
+            text="Clear Picked",
+            command=self._cancel_function_cut_draw,
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        function_apply_row = self.ttk.Frame(function_cut_frame)
+        function_apply_row.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        function_apply_row.columnconfigure(0, weight=1)
+        function_apply_row.columnconfigure(1, weight=1)
+        function_apply_row.columnconfigure(2, weight=1)
+        self.ttk.Button(
+            function_apply_row,
+            text="Finish Fit",
+            command=self._finish_pending_function_cut,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.ttk.Button(
+            function_apply_row,
+            text="Apply Params",
+            command=self._apply_function_params_to_selected_cut,
+        ).grid(row=0, column=1, sticky="ew", padx=4)
+        self.ttk.Button(
+            function_apply_row,
+            text="Refit Selected",
+            command=self._refit_selected_function_cut,
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        self.function_param_frame = self.ttk.LabelFrame(
+            function_cut_frame, text="Fit Parameters", padding=6
+        )
+        self.function_param_frame.grid(
+            row=6, column=0, columnspan=3, sticky="ew", pady=(8, 0)
+        )
+        self.function_param_frame.columnconfigure(1, weight=1)
 
         feature_axis_box = self.ttk.LabelFrame(
             self.sidebar_cuts_tab, text="Feature Axis / Auto Cuts", padding=8
         )
-        feature_axis_box.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        feature_axis_box.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         feature_axis_box.columnconfigure(0, weight=1)
         feature_axis_box.columnconfigure(1, weight=1)
 
@@ -10446,6 +14635,66 @@ class TDMosaicApp:
             command=self._set_center_distance_between_cuts,
         ).grid(row=0, column=2, sticky="ew", padx=(6, 0))
 
+        function_points_box = self.ttk.LabelFrame(
+            measure_frame, text="Function Points", padding=6
+        )
+        function_points_box.grid(
+            row=10, column=0, columnspan=3, sticky="ew", pady=(10, 0)
+        )
+        function_points_box.columnconfigure(0, weight=1)
+        function_points_box.columnconfigure(1, weight=1)
+
+        self.ttk.Label(
+            function_points_box,
+            textvariable=self.function_point_summary_var,
+            justify="left",
+            wraplength=320,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        self.function_point_listbox = self.tk.Listbox(
+            function_points_box, height=5, exportselection=False
+        )
+        self.function_point_listbox.grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0)
+        )
+        self.function_point_listbox.bind(
+            "<<ListboxSelect>>", self._on_function_point_list_select
+        )
+
+        point_edit_row = self.ttk.Frame(function_points_box)
+        point_edit_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        point_edit_row.columnconfigure(1, weight=1)
+        point_edit_row.columnconfigure(3, weight=1)
+        self.ttk.Label(point_edit_row, text="x").grid(row=0, column=0, sticky="w")
+        self.function_point_x_entry = self.ttk.Entry(
+            point_edit_row, textvariable=self.function_point_x_var, width=10
+        )
+        self.function_point_x_entry.grid(
+            row=0, column=1, sticky="ew", padx=(6, 8)
+        )
+        self.ttk.Label(point_edit_row, text="y").grid(row=0, column=2, sticky="w")
+        self.function_point_y_entry = self.ttk.Entry(
+            point_edit_row, textvariable=self.function_point_y_var, width=10
+        )
+        self.function_point_y_entry.grid(
+            row=0, column=3, sticky="ew", padx=(6, 0)
+        )
+
+        point_button_row = self.ttk.Frame(function_points_box)
+        point_button_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        point_button_row.columnconfigure(0, weight=1)
+        point_button_row.columnconfigure(1, weight=1)
+        self.ttk.Button(
+            point_button_row,
+            text="Apply Point",
+            command=self._apply_selected_function_control_point,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.ttk.Button(
+            point_button_row,
+            text="Remove Point",
+            command=self._remove_selected_function_control_point,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
         for widget in (self.stride_spin,):
             widget.bind("<Return>", self._on_panel_param_event)
             widget.bind("<FocusOut>", self._on_panel_param_event)
@@ -10454,6 +14703,8 @@ class TDMosaicApp:
             length_entry,
             center_distance_entry,
             *coord_entries,
+            self.function_point_x_entry,
+            self.function_point_y_entry,
         ):
             widget.bind("<Return>", self._on_geometry_entry_event)
 
@@ -10534,7 +14785,10 @@ class TDMosaicApp:
 
         self.ttk.Label(
             experiments_box,
-            text="Base cut = selected cut. Offsets are parallel shifts; angles are relative rotations.",
+            text=(
+                "Base cut = selected cut. Offsets are parallel shifts; "
+                "angles are relative rotations."
+            ),
             justify="left",
             wraplength=320,
         ).grid(row=0, column=0, columnspan=2, sticky="w")
@@ -10545,39 +14799,87 @@ class TDMosaicApp:
         self.ttk.Entry(
             experiments_box, textvariable=self.experiment_name_var
         ).grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
-        self.ttk.Label(experiments_box, text="d step").grid(
+        self.ttk.Label(experiments_box, text="Study folder").grid(
             row=2, column=0, sticky="w", pady=(6, 0)
         )
+        output_row = self.ttk.Frame(experiments_box)
+        output_row.grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
+        output_row.columnconfigure(0, weight=1)
         self.ttk.Entry(
-            experiments_box, textvariable=self.experiment_displacement_step_var, width=10
-        ).grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
-        self.ttk.Label(experiments_box, text="d limit").grid(
-            row=3, column=0, sticky="w", pady=(6, 0)
-        )
-        self.ttk.Entry(
-            experiments_box, textvariable=self.experiment_displacement_limit_var, width=10
-        ).grid(row=3, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
-        self.ttk.Label(experiments_box, text="ang min").grid(
+            output_row,
+            textvariable=self.experiment_output_dir_var,
+        ).grid(row=0, column=0, sticky="ew")
+        self.ttk.Button(
+            output_row,
+            text="Browse",
+            command=self._browse_experiment_output_dir,
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self.ttk.Label(
+            experiments_box,
+            textvariable=self.experiment_output_info_var,
+            justify="left",
+            wraplength=320,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.ttk.Label(experiments_box, text="d step").grid(
             row=4, column=0, sticky="w", pady=(6, 0)
         )
         self.ttk.Entry(
-            experiments_box, textvariable=self.experiment_angle_min_var, width=10
+            experiments_box, textvariable=self.experiment_displacement_step_var, width=10
         ).grid(row=4, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
-        self.ttk.Label(experiments_box, text="ang max").grid(
+        self.ttk.Label(experiments_box, text="d min").grid(
             row=5, column=0, sticky="w", pady=(6, 0)
         )
         self.ttk.Entry(
-            experiments_box, textvariable=self.experiment_angle_max_var, width=10
+            experiments_box, textvariable=self.experiment_displacement_min_var, width=10
         ).grid(row=5, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
-        self.ttk.Label(experiments_box, text="ang step").grid(
+        self.ttk.Label(experiments_box, text="d max").grid(
             row=6, column=0, sticky="w", pady=(6, 0)
         )
         self.ttk.Entry(
-            experiments_box, textvariable=self.experiment_angle_step_var, width=10
+            experiments_box, textvariable=self.experiment_displacement_max_var, width=10
         ).grid(row=6, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
+        self.ttk.Checkbutton(
+            experiments_box,
+            text="Full sweep (usa todo el rango lateral valido)",
+            variable=self.experiment_full_sweep_var,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.ttk.Label(experiments_box, text="ang min").grid(
+            row=8, column=0, sticky="w", pady=(6, 0)
+        )
+        self.ttk.Entry(
+            experiments_box, textvariable=self.experiment_angle_min_var, width=10
+        ).grid(row=8, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
+        self.ttk.Label(experiments_box, text="ang max").grid(
+            row=9, column=0, sticky="w", pady=(6, 0)
+        )
+        self.ttk.Entry(
+            experiments_box, textvariable=self.experiment_angle_max_var, width=10
+        ).grid(row=9, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
+        self.ttk.Label(experiments_box, text="ang step").grid(
+            row=10, column=0, sticky="w", pady=(6, 0)
+        )
+        self.ttk.Entry(
+            experiments_box, textvariable=self.experiment_angle_step_var, width=10
+        ).grid(row=10, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
+        self.ttk.Label(experiments_box, text="TD width").grid(
+            row=11, column=0, sticky="w", pady=(6, 0)
+        )
+        self.ttk.Entry(
+            experiments_box, textvariable=self.experiment_width_var, width=10
+        ).grid(row=11, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
+        self.ttk.Label(experiments_box, text="weighting").grid(
+            row=12, column=0, sticky="w", pady=(6, 0)
+        )
+        self.ttk.Combobox(
+            experiments_box,
+            textvariable=self.experiment_weighting_var,
+            values=["uniform", "gaussian"],
+            state="readonly",
+            width=10,
+        ).grid(row=12, column=1, sticky="ew", pady=(6, 0), padx=(8, 0))
 
         save_row = self.ttk.Frame(experiments_box)
-        save_row.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        save_row.grid(row=13, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         save_row.columnconfigure(0, weight=1)
         save_row.columnconfigure(1, weight=1)
         save_row.columnconfigure(2, weight=1)
@@ -10588,8 +14890,8 @@ class TDMosaicApp:
         ).grid(row=0, column=0, sticky="w")
         self.ttk.Checkbutton(
             save_row,
-            text="Save cell JSON",
-            variable=self.experiment_save_cell_json_var,
+            text="Save stack JSON",
+            variable=self.experiment_save_stack_json_var,
         ).grid(row=0, column=1, sticky="w")
         self.ttk.Checkbutton(
             save_row,
@@ -10598,57 +14900,70 @@ class TDMosaicApp:
         ).grid(row=0, column=2, sticky="w")
 
         experiment_button_row = self.ttk.Frame(experiments_box)
-        experiment_button_row.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        experiment_button_row.grid(row=14, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         experiment_button_row.columnconfigure(0, weight=1)
         experiment_button_row.columnconfigure(1, weight=1)
+        experiment_button_row.columnconfigure(2, weight=1)
         self.ttk.Button(
             experiment_button_row,
             text="Generate Study",
             command=self._generate_exhaustive_experiment,
         ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.ttk.Button(
+        self.experiment_nuwt_button = self.ttk.Button(
             experiment_button_row,
-            text="Run Exhaustive",
-            command=self._run_selected_experiment,
-        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
-        self.ttk.Button(
+            text="Run NUWT",
+            command=lambda: self._run_selected_experiment("nuwt"),
+        )
+        self.experiment_nuwt_button.grid(row=0, column=1, sticky="ew", padx=4)
+        self.experiment_wavelet_button = self.ttk.Button(
             experiment_button_row,
-            text="Export Tables",
-            command=self._export_selected_experiment_tables,
-        ).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(6, 0))
+            text="Run Wavelet",
+            command=lambda: self._run_selected_experiment("wavelet"),
+        )
+        self.experiment_wavelet_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        self.experiment_rebuild_button = self.ttk.Button(
+            experiment_button_row,
+            text="Rebuild Tables",
+            command=lambda: self._run_selected_experiment("tables"),
+        )
+        self.experiment_rebuild_button.grid(
+            row=1, column=0, columnspan=2, sticky="ew", padx=(0, 4), pady=(6, 0)
+        )
         self.ttk.Button(
             experiment_button_row,
             text="Delete Study",
             command=self._delete_selected_experiment,
-        ).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
+        ).grid(row=1, column=2, sticky="ew", padx=(4, 0), pady=(6, 0))
 
         self.experiment_listbox = self.tk.Listbox(
             experiments_box, height=7, exportselection=False
         )
-        self.experiment_listbox.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.experiment_listbox.grid(row=15, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.experiment_listbox.bind("<<ListboxSelect>>", self._on_experiment_list_select)
 
         experiment_view_row = self.ttk.Frame(experiments_box)
-        experiment_view_row.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        experiment_view_row.grid(row=16, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         experiment_view_row.columnconfigure(0, weight=1)
         experiment_view_row.columnconfigure(1, weight=1)
-        self.ttk.Radiobutton(
+        self.experiment_view_displacement_button = self.ttk.Radiobutton(
             experiment_view_row,
             text="By displacement",
             variable=self.experiment_view_mode_var,
             value="displacement",
             command=lambda: self._activate_selected_experiment_view("displacement"),
-        ).grid(row=0, column=0, sticky="w")
-        self.ttk.Radiobutton(
+        )
+        self.experiment_view_displacement_button.grid(row=0, column=0, sticky="w")
+        self.experiment_view_rotation_button = self.ttk.Radiobutton(
             experiment_view_row,
             text="By rotation",
             variable=self.experiment_view_mode_var,
             value="rotation",
             command=lambda: self._activate_selected_experiment_view("rotation"),
-        ).grid(row=0, column=1, sticky="w")
+        )
+        self.experiment_view_rotation_button.grid(row=0, column=1, sticky="w")
 
         progress_box = self.ttk.LabelFrame(experiments_box, text="Progress", padding=6)
-        progress_box.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        progress_box.grid(row=17, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         progress_box.columnconfigure(0, weight=1)
         self.ttk.Label(
             progress_box, textvariable=self.experiment_progress_global_var, justify="left"
@@ -10959,6 +15274,7 @@ class TDMosaicApp:
             dynamic_marker = f"D{len(self._cut_dynamic_keyframes(cut.cut_id))}" if self._cut_dynamic_enabled(cut.cut_id) else "--"
             label = (
                 f"{cut.cut_id:02d} {cut.name} {marker} {dynamic_marker} "
+                f"[{self._cut_curve_mode_label(preview_cut)}] "
                 f"({preview_cut.p0[0]:.1f},{preview_cut.p0[1]:.1f}) -> ({preview_cut.p1[0]:.1f},{preview_cut.p1[1]:.1f})"
             )
             self.cut_listbox.insert(self.tk.END, label)
@@ -11092,8 +15408,26 @@ class TDMosaicApp:
             cut = self.cuts[cut_id]
             state = self._cut_analysis(cut_id)
             event_count = len(state.get("wavelet_events") or [])
-            tracking_done = "T" if state.get("crest_tracking_result") else "-"
-            wavelet_done = "W" if state.get("wavelet_filter_result") else "-"
+            cell_status = ""
+            for experiment in self.experiments.values():
+                for cell in experiment.get("cells") or []:
+                    if int(cell.get("cut_id", -1)) == int(cut_id):
+                        cell_status = str(cell.get("status") or "")
+                        break
+                if cell_status:
+                    break
+            tracking_done = (
+                "T"
+                if state.get("crest_tracking_result")
+                or cell_status in {"nuwt_completed", "wavelet_completed", "completed"}
+                else "-"
+            )
+            wavelet_done = (
+                "W"
+                if state.get("wavelet_filter_result")
+                or cell_status in {"wavelet_completed", "completed"}
+                else "-"
+            )
             dynamic_tag = f"D{len(self._cut_dynamic_keyframes(cut_id))}" if self._cut_dynamic_enabled(cut_id) else "--"
             self.stack_member_listbox.insert(
                 self.tk.END,
@@ -11119,6 +15453,8 @@ class TDMosaicApp:
     def _refresh_experiment_list(self) -> None:
         if not hasattr(self, "experiment_listbox"):
             return
+        for experiment in self.experiments.values():
+            self._sync_experiment_state_from_disk(experiment)
         self.experiment_listbox.delete(0, self.tk.END)
         ordered = sorted(
             self.experiments.values(),
@@ -11144,24 +15480,57 @@ class TDMosaicApp:
         experiment = self._selected_experiment()
         if experiment is None:
             self.experiment_progress_global_var.set("Idle.")
-            self.experiment_progress_outer_var.set("Displacements: 0/0")
-            self.experiment_progress_inner_var.set("Angles: 0/0")
+            self.experiment_progress_outer_var.set("Stacks: 0/0")
+            self.experiment_progress_inner_var.set("Members: 0/0")
             self.experiment_progress_stage_var.set("Stage: idle")
             self.experiment_view_mode_var.set("displacement")
+            self._refresh_experiment_output_info(None)
+            self._refresh_experiment_run_button(None)
+            if hasattr(self, "experiment_view_displacement_button"):
+                self.experiment_view_displacement_button.configure(state="normal")
+            if hasattr(self, "experiment_view_rotation_button"):
+                self.experiment_view_rotation_button.configure(state="normal")
             return
-        self.experiment_view_mode_var.set(str(experiment.get("view_mode") or "displacement"))
+        self.experiment_output_dir_var.set(
+            str(experiment.get("export_root") or self.experiment_output_dir_var.get()).strip()
+        )
+        self._refresh_experiment_output_info(experiment)
+        self._refresh_experiment_run_button(experiment)
+        available_modes = self._experiment_available_stack_modes(experiment)
+        current_view_mode = self._normalize_experiment_stack_mode(
+            experiment.get("view_mode") or self._experiment_stack_mode(experiment)
+        )
+        if available_modes and current_view_mode not in available_modes:
+            current_view_mode = self._experiment_stack_mode(experiment)
+            experiment["view_mode"] = current_view_mode
+        self.experiment_view_mode_var.set(current_view_mode)
+        if hasattr(self, "experiment_view_displacement_button"):
+            self.experiment_view_displacement_button.configure(
+                state=("normal" if "displacement" in available_modes or not available_modes else "disabled")
+            )
+        if hasattr(self, "experiment_view_rotation_button"):
+            self.experiment_view_rotation_button.configure(
+                state=("normal" if "rotation" in available_modes or not available_modes else "disabled")
+            )
         cells = len(self._experiment_cells(experiment))
+        stack_count = len(self._experiment_stack_specs(experiment))
+        stack_mode = self._experiment_stack_mode(experiment)
         self.experiment_progress_global_var.set(
-            f"{experiment['name']} | status={experiment.get('status', 'created')} | cells={cells}"
+            f"{experiment['name']} | status={experiment.get('status', 'created')} "
+            f"| stacks={stack_mode} "
+            f"| study={'full-cube-angle' if bool(experiment.get('full_cube_angles', False)) else 'standard'} "
+            f"| coverage={'full-frame' if bool(experiment.get('dynamic_length', False)) else 'base-length'} "
+            f"| w={int(experiment.get('td_width', 1))} {str(experiment.get('td_weighting') or 'uniform')} "
+            f"| cells={cells}"
         )
-        self.experiment_progress_outer_var.set(
-            f"Displacements: {len(experiment.get('offset_values') or [])}"
-        )
-        self.experiment_progress_inner_var.set(
-            f"Angles: {len(experiment.get('angle_values') or [])}"
-        )
+        self.experiment_progress_outer_var.set(f"Stacks: {stack_count}")
+        self.experiment_progress_inner_var.set(f"Members: {cells}")
         self.experiment_progress_stage_var.set(
-            f"Stage: {experiment.get('last_run_summary') or experiment.get('status', 'idle')}"
+            "Stage: "
+            f"NUWT={experiment.get('nuwt_status', 'pending')} | "
+            f"Wavelet={experiment.get('wavelet_status', 'pending')} | "
+            f"Tables={experiment.get('tables_status', 'pending')} | "
+            f"{experiment.get('last_run_summary') or experiment.get('status', 'idle')}"
         )
 
     def _on_experiment_list_select(self, _event: Any) -> None:
@@ -11180,12 +15549,49 @@ class TDMosaicApp:
         self.active_experiment_id = int(ordered[index]["experiment_id"])
         self._refresh_experiment_list()
 
+    def _experiment_td_sampling_params(self) -> tuple[int, str]:
+        width_default = max(
+            self._safe_int_text(
+                self.panel_width_var.get() if hasattr(self, "panel_width_var") else 1,
+                1,
+            ),
+            1,
+        )
+        width = max(
+            self._safe_int_text(
+                self.experiment_width_var.get() if hasattr(self, "experiment_width_var") else width_default,
+                width_default,
+            ),
+            1,
+        )
+        weighting = str(
+            self.experiment_weighting_var.get()
+            if hasattr(self, "experiment_weighting_var")
+            else "uniform"
+        ).strip() or "uniform"
+        if weighting not in {"uniform", "gaussian"}:
+            weighting = "uniform"
+        if hasattr(self, "experiment_width_var"):
+            self.experiment_width_var.set(str(width))
+        if hasattr(self, "experiment_weighting_var"):
+            self.experiment_weighting_var.set(weighting)
+        return width, weighting
+
     def _activate_selected_experiment_view(self, mode: str) -> None:
         experiment = self._selected_experiment()
         if experiment is None:
             self._set_status("Select a study first.")
             return
-        normalized_mode = "rotation" if str(mode) == "rotation" else "displacement"
+        normalized_mode = self._normalize_experiment_stack_mode(mode)
+        available_modes = self._experiment_available_stack_modes(experiment)
+        if available_modes and normalized_mode not in available_modes:
+            fallback_mode = self._experiment_stack_mode(experiment)
+            experiment["view_mode"] = fallback_mode
+            self.refresh_all()
+            self._set_status(
+                f"{experiment['name']}: only {fallback_mode} stacks are available for this study."
+            )
+            return
         experiment["view_mode"] = normalized_mode
         stack_ids = (
             experiment.get("rotation_stack_ids")
@@ -11229,6 +15635,42 @@ class TDMosaicApp:
             values.sort()
         return values
 
+    def _offset_series(
+        self, min_value: float, max_value: float, step_value: float
+    ) -> list[float]:
+        start_value = float(min(min_value, max_value))
+        end_value = float(max(min_value, max_value))
+        values = self._series_from_range(start_value, end_value, step_value)
+        if start_value <= 0.0 <= end_value and not any(abs(value) <= 1e-6 for value in values):
+            values.append(0.0)
+            values.sort()
+        return values
+
+    def _cut_normal_and_displacement_limits(
+        self, cut: Cut
+    ) -> tuple[float, float, float, float] | None:
+        dx = float(cut.p1[0] - cut.p0[0])
+        dy = float(cut.p1[1] - cut.p0[1])
+        norm = math.hypot(dx, dy)
+        if norm <= 1e-6:
+            return None
+        normal_x = -dy / norm
+        normal_y = dx / norm
+        positive_limit = min(
+            ray_limit(cut.p0, (normal_x, normal_y), self.nx, self.ny),
+            ray_limit(cut.p1, (normal_x, normal_y), self.nx, self.ny),
+        )
+        negative_limit = min(
+            ray_limit(cut.p0, (-normal_x, -normal_y), self.nx, self.ny),
+            ray_limit(cut.p1, (-normal_x, -normal_y), self.nx, self.ny),
+        )
+        return (
+            float(normal_x),
+            float(normal_y),
+            -float(max(negative_limit, 0.0)),
+            float(max(positive_limit, 0.0)),
+        )
+
     def _experiment_output_root(self, experiment: dict[str, Any]) -> Path:
         configured = str(experiment.get("export_root") or "").strip()
         if configured:
@@ -11244,6 +15686,655 @@ class TDMosaicApp:
         target.mkdir(parents=True, exist_ok=True)
         experiment["export_root"] = str(target)
         return target
+
+    def _experiment_output_display_path(
+        self, experiment: dict[str, Any] | None = None
+    ) -> Path:
+        if experiment is not None:
+            configured = str(experiment.get("export_root") or "").strip()
+            if configured:
+                return Path(configured).expanduser().resolve()
+            return self._resolved_export_dir() / (
+                f"{self._safe_export_slug(self.cube_path.stem)}"
+                f"_cut{int(experiment.get('base_cut_id') or 0):03d}"
+                f"_study{int(experiment.get('experiment_id') or 0):03d}"
+                f"_{self._safe_export_slug(str(experiment.get('name') or 'study'))}"
+            )
+        configured = str(self.experiment_output_dir_var.get()).strip()
+        if configured:
+            return Path(configured).expanduser().resolve()
+        return self._resolved_export_dir()
+
+    def _refresh_experiment_output_info(
+        self, experiment: dict[str, Any] | None = None
+    ) -> None:
+        if not hasattr(self, "experiment_output_info_var"):
+            return
+        label = "Output"
+        if experiment is not None:
+            label = f"Output for {str(experiment.get('name') or 'study')}"
+        self.experiment_output_info_var.set(
+            f"{label}: {self._experiment_output_display_path(experiment)}"
+        )
+
+    def _ensure_experiment_output_structure(
+        self, root_dir: Path, experiment: dict[str, Any] | None = None
+    ) -> None:
+        root_dir.mkdir(parents=True, exist_ok=True)
+        (root_dir / "cells").mkdir(parents=True, exist_ok=True)
+        # Create both stack families so a folder change cannot break later saves.
+        (root_dir / "displacements").mkdir(parents=True, exist_ok=True)
+        (root_dir / "rotates").mkdir(parents=True, exist_ok=True)
+        if experiment is not None and bool(
+            experiment.get("save_options", {}).get("save_important_images", True)
+        ):
+            (root_dir / "important_zones_images").mkdir(parents=True, exist_ok=True)
+
+    def _sync_experiment_state_from_disk(self, experiment: dict[str, Any] | None) -> None:
+        if experiment is None:
+            return
+        configured_root = str(experiment.get("export_root") or "").strip()
+        root_dir = (
+            Path(configured_root).expanduser().resolve()
+            if configured_root
+            else self._experiment_output_display_path(experiment)
+        )
+        status_path = Path(
+            str(experiment.get("status_path") or (root_dir / "status.json"))
+        ).expanduser()
+        manifest_path = Path(
+            str(experiment.get("manifest_path") or (root_dir / "manifest.json"))
+        ).expanduser()
+        experiment["status_path"] = str(status_path.resolve())
+        experiment["manifest_path"] = str(manifest_path.resolve())
+
+        status_payload: dict[str, Any] = {}
+        status_mtime_ns = (
+            status_path.stat().st_mtime_ns if status_path.exists() else None
+        )
+        if status_mtime_ns != experiment.get("_status_mtime_ns") and status_path.exists():
+            try:
+                loaded_status = self._read_json_file(status_path)
+            except Exception:
+                loaded_status = None
+            if isinstance(loaded_status, dict):
+                status_payload = loaded_status
+                for key in (
+                    "status",
+                    "nuwt_status",
+                    "wavelet_status",
+                    "tables_status",
+                    "updated_at",
+                    "completed_at",
+                ):
+                    value = loaded_status.get(key)
+                    if value not in {None, ""}:
+                        experiment[key] = value
+                summary_text = str(loaded_status.get("summary") or "").strip()
+                if summary_text:
+                    experiment["last_run_summary"] = summary_text
+        experiment["_status_mtime_ns"] = status_mtime_ns
+
+        manifest_payload: dict[str, Any] = {}
+        manifest_mtime_ns = (
+            manifest_path.stat().st_mtime_ns if manifest_path.exists() else None
+        )
+        need_manifest_sync = bool(
+            not experiment.get("stack_outputs")
+            or manifest_mtime_ns != experiment.get("_manifest_mtime_ns")
+        )
+        if need_manifest_sync and manifest_path.exists():
+            try:
+                loaded_manifest = self._read_json_file(manifest_path)
+            except Exception:
+                loaded_manifest = None
+            if isinstance(loaded_manifest, dict):
+                manifest_payload = loaded_manifest
+                stack_outputs = loaded_manifest.get("stack_outputs")
+                if isinstance(stack_outputs, dict):
+                    experiment["stack_outputs"] = dict(stack_outputs)
+                disk_experiment = loaded_manifest.get("experiment")
+                if isinstance(disk_experiment, dict):
+                    for key in (
+                        "export_root",
+                        "completed_at",
+                        "study_td_params",
+                        "study_crest_params",
+                        "study_wavelet_params",
+                        "save_options",
+                        "important_zone_rules",
+                        "stack_group_mode",
+                        "view_mode",
+                        "td_width",
+                        "td_weighting",
+                        "dynamic_length",
+                        "full_cube_angles",
+                    ):
+                        if key in disk_experiment and disk_experiment.get(key) is not None:
+                            experiment[key] = self._json_safe(disk_experiment.get(key))
+        experiment["_manifest_mtime_ns"] = manifest_mtime_ns
+
+        if not status_payload:
+            next_stage = str(
+                ((manifest_payload.get("summary") or {}).get("next_stage") or "")
+            ).strip().lower()
+            if next_stage == "tables":
+                experiment["status"] = str(experiment.get("status") or "finalizing")
+                experiment["nuwt_status"] = "completed"
+                experiment["wavelet_status"] = "completed"
+                experiment["tables_status"] = str(
+                    experiment.get("tables_status") or "pending"
+                )
+            elif next_stage == "wavelet":
+                experiment["nuwt_status"] = "completed"
+                experiment["wavelet_status"] = str(
+                    experiment.get("wavelet_status") or "pending"
+                )
+            elif next_stage == "nuwt":
+                experiment["nuwt_status"] = str(
+                    experiment.get("nuwt_status") or "pending"
+                )
+
+    def _write_experiment_metadata_files(self, experiment: dict[str, Any]) -> None:
+        root_dir = self._experiment_output_root(experiment)
+        self._ensure_experiment_output_structure(root_dir, experiment)
+        stack_outputs = experiment.get("stack_outputs") or {}
+        manifest_path = root_dir / "manifest.json"
+        existing_manifest: dict[str, Any] = {}
+        if manifest_path.exists():
+            try:
+                loaded_manifest = self._read_json_file(manifest_path)
+            except Exception:
+                loaded_manifest = None
+            if isinstance(loaded_manifest, dict):
+                existing_manifest = dict(loaded_manifest)
+        summary_payload = {
+            **dict(existing_manifest.get("summary") or {}),
+            "cell_count": int(len(self._experiment_cells(experiment))),
+            "stack_count": int(len(self._experiment_stack_specs(experiment))),
+            "next_stage": self._experiment_next_stage(experiment),
+        }
+        self._write_json_file(
+            manifest_path,
+            {
+                **existing_manifest,
+                "experiment": experiment,
+                "stack_outputs": stack_outputs,
+                "summary": summary_payload,
+            },
+        )
+        self._write_json_file(
+            root_dir / "status.json",
+            {
+                "experiment_id": int(experiment["experiment_id"]),
+                "status": str(experiment.get("status") or "created"),
+                "nuwt_status": str(experiment.get("nuwt_status") or "pending"),
+                "wavelet_status": str(experiment.get("wavelet_status") or "pending"),
+                "tables_status": str(experiment.get("tables_status") or "pending"),
+                "updated_at": self._timestamp_now(),
+                "completed_at": experiment.get("completed_at"),
+                "summary": str(experiment.get("last_run_summary") or ""),
+            },
+        )
+
+    def _browse_experiment_output_dir(self) -> None:
+        raw = str(self.experiment_output_dir_var.get()).strip()
+        initial_dir = str(
+            Path(raw).expanduser()
+            if raw
+            else self._resolved_export_dir()
+        )
+        selected = self.filedialog.askdirectory(
+            title="Select study folder",
+            initialdir=initial_dir,
+            mustexist=False,
+        )
+        if not selected:
+            return
+        resolved = str(Path(selected).expanduser().resolve())
+        Path(resolved).mkdir(parents=True, exist_ok=True)
+        self.experiment_output_dir_var.set(resolved)
+        experiment = self._selected_experiment()
+        _job_id, running_job = self._background_experiment_job()
+        if experiment is not None and running_job is None:
+            experiment["export_root"] = resolved
+            experiment["updated_at"] = self._timestamp_now()
+            self._ensure_experiment_output_structure(Path(resolved), experiment)
+            self._write_experiment_metadata_files(experiment)
+            self._record_session_change()
+            self._refresh_experiment_list()
+        self._refresh_experiment_output_info(experiment)
+        self._set_status(f"Study folder set to {resolved}.")
+
+    def _refresh_experiment_run_button(self, experiment: dict[str, Any] | None) -> None:
+        if not hasattr(self, "experiment_nuwt_button"):
+            return
+        has_experiment = experiment is not None
+        _job_id, running_job = self._background_experiment_job()
+        busy = running_job is not None
+        next_stage = self._experiment_next_stage(experiment)
+        nuwt_status = str((experiment or {}).get("nuwt_status") or "pending")
+        wavelet_status = str((experiment or {}).get("wavelet_status") or "pending")
+
+        nuwt_enabled = has_experiment and not busy
+        wavelet_enabled = (
+            has_experiment
+            and not busy
+            and nuwt_status == "completed"
+        )
+        rebuild_enabled = (
+            has_experiment
+            and not busy
+            and wavelet_status == "completed"
+        )
+
+        self.experiment_nuwt_button.configure(
+            state=("normal" if nuwt_enabled else "disabled")
+        )
+        self.experiment_wavelet_button.configure(
+            state=("normal" if wavelet_enabled else "disabled")
+        )
+        self.experiment_rebuild_button.configure(
+            state=("normal" if rebuild_enabled else "disabled")
+        )
+
+        if next_stage == "nuwt":
+            self.experiment_nuwt_button.configure(text="Run NUWT")
+            self.experiment_wavelet_button.configure(text="Run Wavelet")
+            self.experiment_rebuild_button.configure(text="Rebuild Tables")
+        elif next_stage == "wavelet":
+            self.experiment_nuwt_button.configure(text="Run NUWT")
+            self.experiment_wavelet_button.configure(text="Run Wavelet")
+            self.experiment_rebuild_button.configure(text="Rebuild Tables")
+        else:
+            self.experiment_nuwt_button.configure(text="Run NUWT")
+            self.experiment_wavelet_button.configure(text="Run Wavelet")
+            self.experiment_rebuild_button.configure(text="Rebuild Tables")
+
+    def _experiment_stage_summary_text(
+        self, experiment: dict[str, Any], stage_name: str
+    ) -> str:
+        stack_specs = self._experiment_stack_specs(experiment)
+        td_params = self._experiment_study_td_params(experiment)
+        crest_params = self._experiment_study_crest_params(experiment)
+        lines = [
+            f"Study: {str(experiment.get('name') or '')}",
+            f"Stage: {str(stage_name).upper()}",
+            f"Folder: {self._experiment_output_root(experiment)}",
+            f"Stacks: {len(stack_specs)} | cells: {len(self._experiment_cells(experiment))}",
+            (
+                f"TD: t={int(td_params['t_ini'])}:{int(td_params['t_fin'])}:{int(td_params['stride'])} "
+                f"| width={int(td_params['width'])} | weighting={str(td_params['weighting'])}"
+            ),
+            (
+                f"NUWT: cad={float(crest_params['cad']):.3f} | res={float(crest_params['res']):.3f} "
+                f"| grad={float(crest_params['grad']):.3f} | min_tlen={int(crest_params['min_tlen'])}"
+            ),
+        ]
+        if str(stage_name) == "wavelet":
+            wavelet_params = self._experiment_study_wavelet_params(experiment)
+            lines.append(
+                (
+                    f"Wavelet: P=[{float(wavelet_params['p_min']):.2f}, {float(wavelet_params['p_max']):.2f}] s "
+                    f"| ratio={float(wavelet_params['power_ratio_thresh']):.2f} "
+                    f"| min amp={float(wavelet_params['min_amp_arcsec']):.3f}"
+                )
+            )
+        return "\n".join(lines)
+
+    def _prompt_experiment_nuwt_settings(
+        self, experiment: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        td_params = self._experiment_study_td_params(experiment)
+        crest_params = self._experiment_study_crest_params(experiment)
+        top = self.tk.Toplevel(self.root)
+        top.title("NUWT Study Conditions")
+        top.transient(self.root)
+        top.grab_set()
+        top.resizable(True, True)
+
+        frame = self.ttk.Frame(top, padding=14)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
+
+        self.ttk.Label(
+            frame,
+            text=self._experiment_stage_summary_text(experiment, "nuwt"),
+            justify="left",
+            wraplength=520,
+        ).grid(row=0, column=0, columnspan=4, sticky="w")
+
+        row = 1
+        self.ttk.Label(frame, text="TD conditions").grid(
+            row=row, column=0, columnspan=4, sticky="w", pady=(10, 0)
+        )
+        row += 1
+
+        td_vars = {
+            "t_ini": self.tk.StringVar(value=str(int(td_params["t_ini"]))),
+            "t_fin": self.tk.StringVar(value=str(int(td_params["t_fin"]))),
+            "stride": self.tk.StringVar(value=str(int(td_params["stride"]))),
+            "width": self.tk.StringVar(value=str(int(td_params["width"]))),
+            "weighting": self.tk.StringVar(value=str(td_params["weighting"])),
+        }
+        td_fields = [
+            ("t_ini", "t ini"),
+            ("t_fin", "t fin"),
+            ("stride", "stride"),
+            ("width", "TD width"),
+        ]
+        for key, label in td_fields:
+            self.ttk.Label(frame, text=label).grid(
+                row=row, column=0 if key in {"t_ini", "stride"} else 2, sticky="w", pady=(6, 0)
+            )
+            self.ttk.Entry(frame, textvariable=td_vars[key], width=10).grid(
+                row=row,
+                column=1 if key in {"t_ini", "stride"} else 3,
+                sticky="ew",
+                pady=(6, 0),
+                padx=(6, 8 if key in {"t_ini", "stride"} else 0),
+            )
+            if key in {"t_fin", "width"}:
+                row += 1
+
+        self.ttk.Label(frame, text="weighting").grid(row=row, column=0, sticky="w", pady=(6, 0))
+        self.ttk.Combobox(
+            frame,
+            textvariable=td_vars["weighting"],
+            values=["uniform", "gaussian"],
+            state="readonly",
+            width=12,
+        ).grid(row=row, column=1, sticky="ew", pady=(6, 0), padx=(6, 8))
+        row += 1
+
+        self.ttk.Label(frame, text="NUWT conditions").grid(
+            row=row, column=0, columnspan=4, sticky="w", pady=(10, 0)
+        )
+        row += 1
+
+        crest_vars = {
+            "cad": self.tk.StringVar(value=f"{float(crest_params['cad']):.3f}"),
+            "res": self.tk.StringVar(value=f"{float(crest_params['res']):.3f}"),
+            "grad": self.tk.StringVar(value=f"{float(crest_params['grad']):.3f}"),
+            "min_tlen": self.tk.StringVar(value=str(int(crest_params["min_tlen"]))),
+            "max_dist_jump": self.tk.StringVar(value=str(int(crest_params["max_dist_jump"]))),
+            "max_time_skip": self.tk.StringVar(value=str(int(crest_params["max_time_skip"]))),
+        }
+        crest_fields = [
+            ("cad", "cad"),
+            ("res", "res"),
+            ("grad", "grad"),
+            ("min_tlen", "min tlen"),
+            ("max_dist_jump", "max dist jump"),
+            ("max_time_skip", "max time skip"),
+        ]
+        for index, (key, label) in enumerate(crest_fields):
+            local_row = row + index // 2
+            local_col = 0 if index % 2 == 0 else 2
+            self.ttk.Label(frame, text=label).grid(
+                row=local_row, column=local_col, sticky="w", pady=(6, 0)
+            )
+            self.ttk.Entry(frame, textvariable=crest_vars[key], width=10).grid(
+                row=local_row,
+                column=local_col + 1,
+                sticky="ew",
+                pady=(6, 0),
+                padx=(6, 8 if local_col == 0 else 0),
+            )
+        row += (len(crest_fields) + 1) // 2
+
+        invert_var = self.tk.BooleanVar(value=bool(crest_params.get("invert", False)))
+        gauss_var = self.tk.BooleanVar(value=bool(crest_params.get("gauss", False)))
+        checks = self.ttk.Frame(frame)
+        checks.grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.ttk.Checkbutton(checks, text="invert", variable=invert_var).grid(
+            row=0, column=0, sticky="w"
+        )
+        self.ttk.Checkbutton(checks, text="gauss", variable=gauss_var).grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+        row += 1
+
+        result: dict[str, Any] = {"value": None}
+
+        def close_with(value: Any) -> None:
+            result["value"] = value
+            if top.winfo_exists():
+                top.destroy()
+
+        def confirm() -> None:
+            try:
+                updated_td = {
+                    "t_ini": clamp_int(int(float(td_vars["t_ini"].get())), 0, self.nt - 1),
+                    "t_fin": clamp_int(int(float(td_vars["t_fin"].get())), 0, self.nt - 1),
+                    "stride": max(int(float(td_vars["stride"].get())), 1),
+                    "width": max(int(float(td_vars["width"].get())), 1),
+                    "weighting": (
+                        "gaussian"
+                        if str(td_vars["weighting"].get() or "") == "gaussian"
+                        else "uniform"
+                    ),
+                }
+                if int(updated_td["t_fin"]) < int(updated_td["t_ini"]):
+                    raise ValueError("t fin must be >= t ini.")
+                updated_crest = {
+                    "cad": float(crest_vars["cad"].get()),
+                    "res": float(crest_vars["res"].get()),
+                    "grad": float(crest_vars["grad"].get()),
+                    "min_tlen": max(int(float(crest_vars["min_tlen"].get())), 1),
+                    "max_dist_jump": max(int(float(crest_vars["max_dist_jump"].get())), 1),
+                    "max_time_skip": max(int(float(crest_vars["max_time_skip"].get())), 0),
+                    "invert": bool(invert_var.get()),
+                    "gauss": bool(gauss_var.get()),
+                }
+            except Exception as exc:
+                self.messagebox.showerror(
+                    "Invalid NUWT settings",
+                    f"Could not parse the study settings:\n\n{exc}",
+                    parent=top,
+                )
+                return
+            close_with((updated_td, updated_crest))
+
+        buttons = self.ttk.Frame(frame)
+        buttons.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+        self.ttk.Button(buttons, text="Run NUWT", command=confirm).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        self.ttk.Button(buttons, text="Cancel", command=lambda: close_with(None)).grid(
+            row=0, column=1, sticky="ew", padx=(4, 0)
+        )
+
+        top.protocol("WM_DELETE_WINDOW", lambda: close_with(None))
+        top.bind("<Escape>", lambda _event: close_with(None))
+        top.bind("<Return>", lambda _event: confirm())
+        top.update_idletasks()
+        top.focus_set()
+        self.root.wait_window(top)
+        return result["value"]
+
+    def _prompt_experiment_wavelet_settings(
+        self, experiment: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        wavelet_params = self._experiment_study_wavelet_params(experiment)
+        top = self.tk.Toplevel(self.root)
+        top.title("Wavelet Study Conditions")
+        top.transient(self.root)
+        top.grab_set()
+        top.resizable(True, True)
+
+        frame = self.ttk.Frame(top, padding=14)
+        frame.grid(row=0, column=0, sticky="nsew")
+        for col in range(4):
+            frame.columnconfigure(col, weight=1 if col in {1, 3} else 0)
+
+        self.ttk.Label(
+            frame,
+            text=self._experiment_stage_summary_text(experiment, "wavelet"),
+            justify="left",
+            wraplength=560,
+        ).grid(row=0, column=0, columnspan=4, sticky="w")
+
+        vars_map = {
+            "p_min": self.tk.StringVar(value=f"{float(wavelet_params['p_min']):.2f}"),
+            "p_max": self.tk.StringVar(value=f"{float(wavelet_params['p_max']):.2f}"),
+            "power_ratio_thresh": self.tk.StringVar(
+                value=f"{float(wavelet_params['power_ratio_thresh']):.2f}"
+            ),
+            "segment_power_frac": self.tk.StringVar(
+                value=f"{float(wavelet_params['segment_power_frac']):.2f}"
+            ),
+            "min_points_segment": self.tk.StringVar(
+                value=str(int(wavelet_params["min_points_segment"]))
+            ),
+            "min_amp_arcsec": self.tk.StringVar(
+                value=f"{float(wavelet_params['min_amp_arcsec']):.3f}"
+            ),
+            "max_jump_pix": self.tk.StringVar(
+                value=f"{float(wavelet_params['max_jump_pix']):.2f}"
+            ),
+            "min_points_cut_seg": self.tk.StringVar(
+                value=str(int(wavelet_params["min_points_cut_seg"]))
+            ),
+            "rms_amp_ratio_max": self.tk.StringVar(
+                value=f"{float(wavelet_params['rms_amp_ratio_max']):.2f}"
+            ),
+            "km_per_arcsec": self.tk.StringVar(
+                value=f"{float(wavelet_params['km_per_arcsec']):.2f}"
+            ),
+            "density_kg_m3": self.tk.StringVar(
+                value=""
+                if not np.isfinite(float(wavelet_params["density_kg_m3"]))
+                else f"{float(wavelet_params['density_kg_m3']):.3e}"
+            ),
+            "phase_speed_km_s": self.tk.StringVar(
+                value=""
+                if not np.isfinite(float(wavelet_params["phase_speed_km_s"]))
+                else f"{float(wavelet_params['phase_speed_km_s']):.2f}"
+            ),
+            "min_prominence": self.tk.StringVar(
+                value=f"{float(wavelet_params['min_prominence']):.3f}"
+            ),
+            "min_snr": self.tk.StringVar(value=f"{float(wavelet_params['min_snr']):.2f}"),
+            "continuity_weight": self.tk.StringVar(
+                value=f"{float(wavelet_params['continuity_weight']):.2f}"
+            ),
+            "time_weight": self.tk.StringVar(
+                value=f"{float(wavelet_params['time_weight']):.2f}"
+            ),
+            "quality_weight": self.tk.StringVar(
+                value=f"{float(wavelet_params['quality_weight']):.2f}"
+            ),
+            "error_weight": self.tk.StringVar(
+                value=f"{float(wavelet_params['error_weight']):.2f}"
+            ),
+        }
+        labels = [
+            ("p_min", "P min [s]"),
+            ("p_max", "P max [s]"),
+            ("power_ratio_thresh", "power ratio"),
+            ("segment_power_frac", "segment frac"),
+            ("min_points_segment", "min pts seg"),
+            ("min_amp_arcsec", "min amp [arcsec]"),
+            ("max_jump_pix", "max jump [px]"),
+            ("min_points_cut_seg", "min pts cut"),
+            ("rms_amp_ratio_max", "rms/amp max"),
+            ("km_per_arcsec", "km/arcsec"),
+            ("density_kg_m3", "density [kg/m3]"),
+            ("phase_speed_km_s", "phase speed [km/s]"),
+            ("min_prominence", "min prominence"),
+            ("min_snr", "min snr"),
+            ("continuity_weight", "continuity w"),
+            ("time_weight", "time w"),
+            ("quality_weight", "quality w"),
+            ("error_weight", "error w"),
+        ]
+        for index, (key, label) in enumerate(labels, start=1):
+            local_row = index
+            local_col = 0 if index % 2 == 1 else 2
+            if local_col == 0 and index > 1:
+                local_row = (index + 1) // 2
+            elif local_col == 2:
+                local_row = index // 2
+            self.ttk.Label(frame, text=label).grid(
+                row=local_row, column=local_col, sticky="w", pady=(6, 0)
+            )
+            self.ttk.Entry(frame, textvariable=vars_map[key], width=12).grid(
+                row=local_row,
+                column=local_col + 1,
+                sticky="ew",
+                pady=(6, 0),
+                padx=(6, 8 if local_col == 0 else 0),
+            )
+        row = max((len(labels) + 1) // 2, 1) + 1
+
+        result: dict[str, Any] = {"value": None}
+
+        def close_with(value: Any) -> None:
+            result["value"] = value
+            if top.winfo_exists():
+                top.destroy()
+
+        def parse_optional_float(text: str) -> float:
+            clean = str(text).strip()
+            if not clean:
+                return float("nan")
+            return float(clean)
+
+        def confirm() -> None:
+            try:
+                updated = {
+                    "p_min": float(vars_map["p_min"].get()),
+                    "p_max": float(vars_map["p_max"].get()),
+                    "power_ratio_thresh": float(vars_map["power_ratio_thresh"].get()),
+                    "segment_power_frac": float(vars_map["segment_power_frac"].get()),
+                    "min_points_segment": max(int(float(vars_map["min_points_segment"].get())), 1),
+                    "min_amp_arcsec": float(vars_map["min_amp_arcsec"].get()),
+                    "max_jump_pix": float(vars_map["max_jump_pix"].get()),
+                    "min_points_cut_seg": max(int(float(vars_map["min_points_cut_seg"].get())), 1),
+                    "rms_amp_ratio_max": float(vars_map["rms_amp_ratio_max"].get()),
+                    "km_per_arcsec": float(vars_map["km_per_arcsec"].get()),
+                    "density_kg_m3": parse_optional_float(vars_map["density_kg_m3"].get()),
+                    "phase_speed_km_s": parse_optional_float(vars_map["phase_speed_km_s"].get()),
+                    "min_prominence": float(vars_map["min_prominence"].get()),
+                    "min_snr": float(vars_map["min_snr"].get()),
+                    "continuity_weight": float(vars_map["continuity_weight"].get()),
+                    "time_weight": float(vars_map["time_weight"].get()),
+                    "quality_weight": float(vars_map["quality_weight"].get()),
+                    "error_weight": float(vars_map["error_weight"].get()),
+                }
+                if float(updated["p_max"]) <= float(updated["p_min"]):
+                    raise ValueError("P max must be greater than P min.")
+            except Exception as exc:
+                self.messagebox.showerror(
+                    "Invalid wavelet settings",
+                    f"Could not parse the wavelet settings:\n\n{exc}",
+                    parent=top,
+                )
+                return
+            close_with(updated)
+
+        buttons = self.ttk.Frame(frame)
+        buttons.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+        self.ttk.Button(buttons, text="Run Wavelet", command=confirm).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        self.ttk.Button(buttons, text="Cancel", command=lambda: close_with(None)).grid(
+            row=0, column=1, sticky="ew", padx=(4, 0)
+        )
+
+        top.protocol("WM_DELETE_WINDOW", lambda: close_with(None))
+        top.bind("<Escape>", lambda _event: close_with(None))
+        top.bind("<Return>", lambda _event: confirm())
+        top.update_idletasks()
+        top.focus_set()
+        self.root.wait_window(top)
+        return result["value"]
 
     def _drop_cut_from_experiments(self, cut_id: int) -> None:
         for experiment in self.experiments.values():
@@ -11276,42 +16367,138 @@ class TDMosaicApp:
         if base_cut is None:
             self._set_status("Select a base cut first.")
             return
+        if self._cut_is_curve(base_cut):
+            self._set_status("Exhaustive studies currently require a straight base cut.")
+            return
+        full_sweep = bool(self.experiment_full_sweep_var.get())
         step_value = self._parse_float_var(
             self.experiment_displacement_step_var.get(), "displacement step"
-        )
-        limit_value = self._parse_float_var(
-            self.experiment_displacement_limit_var.get(), "displacement limit"
         )
         angle_min = self._parse_float_var(self.experiment_angle_min_var.get(), "angle min")
         angle_max = self._parse_float_var(self.experiment_angle_max_var.get(), "angle max")
         angle_step = self._parse_float_var(self.experiment_angle_step_var.get(), "angle step")
-        if None in {step_value, limit_value, angle_min, angle_max, angle_step}:
+        if None in {step_value, angle_min, angle_max, angle_step}:
             return
         step_value = max(float(step_value), 1.0)
-        limit_value = max(float(limit_value), 0.0)
         angle_step = max(abs(float(angle_step)), 0.1)
-        offset_values = self._symmetric_series(limit_value, step_value)
+
+        base_preview = (
+            self._cut_preview(base_cut.cut_id, int(self.t_visual_var.get())) or base_cut
+        )
+        displacement_geometry = self._cut_normal_and_displacement_limits(base_preview)
+        if displacement_geometry is None:
+            self._set_status("Base cut is too short for a study.")
+            return
+        normal_x, normal_y, allowed_min, allowed_max = displacement_geometry
         angle_values = self._series_from_range(float(angle_min), float(angle_max), angle_step)
-        total_cells = len(offset_values) * len(angle_values)
+        if not angle_values:
+            self._set_status("The study definition produced no valid angles.")
+            return
+
+        base_name = str(self.experiment_name_var.get()).strip() or f"Study {self.next_experiment_id}"
+        full_cube_angles = self._warn_experiment_full_cube_angles(base_name)
+        if full_cube_angles is None:
+            self._set_status("Study generation cancelled.")
+            return
+
+        displacement_min: float
+        displacement_max: float
+        offset_values: list[float] = []
+        angle_offset_values: list[list[float]] = []
+        stack_group_mode: str
+        total_cells = 0
+
+        if bool(full_cube_angles):
+            base_center = cut_center(base_preview)
+            base_directed_angle = float(cut_directed_angle_deg(base_preview))
+            global_offset_min = float("inf")
+            global_offset_max = -float("inf")
+            max_offset_series: list[float] = []
+            for angle_value in angle_values:
+                target_angle = base_directed_angle - float(angle_value)
+                family_offsets = self._full_cube_angle_offset_values(
+                    base_center,
+                    target_angle,
+                    step_value,
+                )
+                if not family_offsets:
+                    family_offsets = [0.0]
+                angle_offset_values.append([float(value) for value in family_offsets])
+                total_cells += len(family_offsets)
+                if len(family_offsets) > len(max_offset_series):
+                    max_offset_series = list(family_offsets)
+                global_offset_min = min(global_offset_min, float(min(family_offsets)))
+                global_offset_max = max(global_offset_max, float(max(family_offsets)))
+            if not np.isfinite(global_offset_min) or not np.isfinite(global_offset_max):
+                global_offset_min = float(allowed_min)
+                global_offset_max = float(allowed_max)
+            displacement_min = float(global_offset_min)
+            displacement_max = float(global_offset_max)
+            offset_values = [float(value) for value in max_offset_series]
+            stack_group_mode = "rotation"
+        else:
+            displacement_min_in = None
+            displacement_max_in = None
+            if not full_sweep:
+                displacement_min_in = self._parse_float_var(
+                    self.experiment_displacement_min_var.get(), "displacement min"
+                )
+                displacement_max_in = self._parse_float_var(
+                    self.experiment_displacement_max_var.get(), "displacement max"
+                )
+                if None in {displacement_min_in, displacement_max_in}:
+                    return
+            if full_sweep:
+                displacement_min = float(allowed_min)
+                displacement_max = float(allowed_max)
+            else:
+                displacement_min = clamp_value(
+                    float(displacement_min_in), allowed_min, allowed_max
+                )
+                displacement_max = clamp_value(
+                    float(displacement_max_in), allowed_min, allowed_max
+                )
+            offset_values = self._offset_series(
+                float(displacement_min),
+                float(displacement_max),
+                step_value,
+            )
+            total_cells = len(offset_values) * len(angle_values)
+            stack_group_mode = self._prompt_experiment_stack_mode(
+                base_name,
+                len(offset_values),
+                len(angle_values),
+            ) or ""
+            if not stack_group_mode:
+                self._set_status("Study generation cancelled.")
+                return
+
+        td_width, td_weighting = self._experiment_td_sampling_params()
         if total_cells <= 0:
             self._set_status("The study definition produced no cells.")
             return
-        if total_cells > MAX_EXPERIMENT_CUTS:
+        if total_cells > MAX_EXPERIMENT_CUTS_HARD:
             self._set_status(
-                f"Study would generate {total_cells} cuts. Reduce the ranges first."
+                f"Study would generate {total_cells} cuts. Hard limit is {MAX_EXPERIMENT_CUTS_HARD}; reduce the ranges first."
             )
             return
-
-        base_preview = self._cut_preview(base_cut.cut_id, int(self.t_visual_var.get())) or base_cut
-        dx = float(base_preview.p1[0] - base_preview.p0[0])
-        dy = float(base_preview.p1[1] - base_preview.p0[1])
-        norm = math.hypot(dx, dy)
-        if norm <= 1e-6:
-            self._set_status("Base cut is too short for a study.")
+        if total_cells > MAX_EXPERIMENT_CUTS_WARN:
+            continue_large = self.messagebox.askyesno(
+                "Large Study",
+                (
+                    f"This study will generate {total_cells} cuts.\n\n"
+                    f"The recommended limit is {MAX_EXPERIMENT_CUTS_WARN} because larger studies can be slow and heavy.\n"
+                    "Do you want to continue anyway?"
+                ),
+                parent=self.root,
+            )
+            if not continue_large:
+                self._set_status("Study generation cancelled.")
+                return
+        dynamic_length = self._warn_experiment_full_frame_rotations(base_name)
+        if dynamic_length is None:
+            self._set_status("Study generation cancelled.")
             return
-        normal_x = -dy / norm
-        normal_y = dx / norm
-        base_name = str(self.experiment_name_var.get()).strip() or f"Study {self.next_experiment_id}"
         experiment_id = int(self.next_experiment_id)
         self.next_experiment_id += 1
         experiment = self._make_default_experiment_state(
@@ -11324,89 +16511,243 @@ class TDMosaicApp:
         experiment["base_angle_deg"] = float(cut_display_angle_deg(base_preview))
         experiment["base_length_px"] = float(cut_length(base_preview))
         experiment["displacement_step"] = float(step_value)
-        experiment["displacement_limit"] = float(limit_value)
+        experiment["displacement_min"] = float(displacement_min)
+        experiment["displacement_max"] = float(displacement_max)
+        experiment["displacement_limit"] = max(
+            abs(float(displacement_min)),
+            abs(float(displacement_max)),
+        )
+        experiment["full_sweep"] = bool(full_sweep)
+        experiment["full_cube_angles"] = bool(full_cube_angles)
         experiment["offset_values"] = [float(value) for value in offset_values]
+        experiment["angle_offset_values"] = self._json_safe(angle_offset_values)
         experiment["angle_min"] = float(min(angle_values))
         experiment["angle_max"] = float(max(angle_values))
         experiment["angle_step"] = float(angle_step)
         experiment["angle_values"] = [float(value) for value in angle_values]
+        experiment["td_width"] = int(td_width)
+        experiment["td_weighting"] = str(td_weighting)
+        experiment["dynamic_length"] = bool(dynamic_length)
+        experiment["min_cut_length_px"] = float(MIN_EXPERIMENT_CUT_LENGTH_PX)
+        experiment["stack_group_mode"] = str(stack_group_mode)
+        experiment["view_mode"] = str(stack_group_mode)
+        base_state = self._cut_analysis_snapshot(base_cut.cut_id)
+        base_td_params = self._cut_td_params(base_cut.cut_id)
+        crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
+            base_state.get("crest_params"), base_state.get("wavelet_params")
+        )
+        experiment["study_td_params"] = {
+            "t_ini": int(base_td_params["t_ini"]),
+            "t_fin": int(base_td_params["t_fin"]),
+            "stride": int(base_td_params["stride"]),
+            "width": int(td_width),
+            "weighting": str(td_weighting),
+        }
+        experiment["study_crest_params"] = dict(crest_params)
+        experiment["study_wavelet_params"] = dict(wavelet_params)
+        requested_output_dir = str(self.experiment_output_dir_var.get()).strip()
+        if requested_output_dir:
+            experiment["export_root"] = str(Path(requested_output_dir).expanduser().resolve())
+        else:
+            default_root = self._resolved_export_dir() / (
+                f"{self._safe_export_slug(self.cube_path.stem)}"
+                f"_cut{int(base_cut.cut_id):03d}"
+                f"_study{int(experiment_id):03d}"
+                f"_{self._safe_export_slug(base_name)}"
+            )
+            experiment["export_root"] = str(default_root.resolve())
+            self.experiment_output_dir_var.set(str(default_root.resolve()))
         experiment["save_options"] = {
             "save_td_fits": bool(self.experiment_save_td_fits_var.get()),
-            "save_cell_json": bool(self.experiment_save_cell_json_var.get()),
+            "save_stack_json": bool(self.experiment_save_stack_json_var.get()),
             "save_important_images": bool(self.experiment_save_important_images_var.get()),
         }
         experiment_root = self._experiment_output_root(experiment)
-        for folder_name in ("cells", "displacements", "rotates", "important_zones_images"):
+        output_folders = [
+            "rotates" if str(stack_group_mode) == "rotation" else "displacements",
+            "cells",
+        ]
+        if bool(experiment["save_options"].get("save_important_images", True)):
+            output_folders.append("important_zones_images")
+        for folder_name in output_folders:
             (experiment_root / folder_name).mkdir(parents=True, exist_ok=True)
         experiment["status_path"] = str(experiment_root / "status.json")
         experiment["manifest_path"] = str(experiment_root / "manifest.json")
 
         generated_cut_ids: list[int] = []
         cells: list[dict[str, Any]] = []
+        displacement_stack_specs: list[tuple[float, list[int]]] = []
         displacement_stack_ids: list[int] = []
-        rotation_stack_map: dict[int, list[int]] = {idx: [] for idx in range(len(angle_values))}
+        rotation_stack_map: dict[int, list[int]] = {
+            idx: [] for idx in range(len(angle_values))
+        }
         template_panel = self.active_panel
-        for offset_idx, offset_value in enumerate(offset_values):
-            row_cut_ids: list[int] = []
-            displacement_label = f"{base_name} | d={offset_value:+.1f}px"
-            displacement_stack = self._create_stack_state(
-                name=displacement_label, cut_ids=[]
-            )
-            displacement_stack_ids.append(int(displacement_stack["stack_id"]))
+        base_length_px = max(float(cut_length(base_preview)), 1.0)
+        min_cut_length_px = float(experiment["min_cut_length_px"])
+        if bool(full_cube_angles):
+            base_center = cut_center(base_preview)
+            base_directed_angle = float(cut_directed_angle_deg(base_preview))
             for angle_idx, angle_value in enumerate(angle_values):
-                shifted = Cut(
-                    cut_id=-1,
-                    name="template",
-                    color=base_preview.color,
-                    p0=base_preview.p0,
-                    p1=base_preview.p1,
+                row_cut_ids: list[int] = []
+                target_angle = base_directed_angle - float(angle_value)
+                ux, uy = vector_from_vertical_angle(target_angle)
+                normal_x = -uy
+                normal_y = ux
+                family_offsets = (
+                    angle_offset_values[angle_idx]
+                    if angle_idx < len(angle_offset_values)
+                    else [0.0]
                 )
-                shifted.p0, shifted.p1 = shift_cut(
-                    shifted,
-                    float(offset_value * normal_x),
-                    float(offset_value * normal_y),
-                    self.nx,
-                    self.ny,
-                )
-                rotate_cut(shifted, float(angle_value), self.nx, self.ny)
-                if cut_length(shifted) < 1.0:
-                    continue
-                cut = self._create_cut(shifted.p0, shifted.p1)
-                cut.name = (
-                    f"{base_name} d{offset_idx:02d} a{angle_idx:02d}"
-                )
-                self._seed_cut_td_params_from_panel(cut.cut_id, template_panel)
-                row_cut_ids.append(int(cut.cut_id))
-                rotation_stack_map[int(angle_idx)].append(int(cut.cut_id))
-                generated_cut_ids.append(int(cut.cut_id))
-                cell_id = f"off_{offset_idx:03d}_ang_{angle_idx:03d}"
-                cells.append(
-                    {
-                        "cell_id": cell_id,
-                        "cut_id": int(cut.cut_id),
-                        "cut_name": str(cut.name),
-                        "offset_idx": int(offset_idx),
-                        "offset_value": float(offset_value),
-                        "angle_idx": int(angle_idx),
-                        "angle_deg": float(angle_value),
-                        "cell_dir": str(experiment_root / "cells" / cell_id),
-                        "status": "created",
+                for offset_idx, offset_value in enumerate(family_offsets):
+                    point_on_line = (
+                        float(base_center[0] + float(offset_value) * normal_x),
+                        float(base_center[1] + float(offset_value) * normal_y),
+                    )
+                    frame_segment = self._line_segment_through_frame(
+                        point_on_line,
+                        target_angle,
+                    )
+                    if frame_segment is None:
+                        continue
+                    if bool(dynamic_length):
+                        p0, p1, shifted_length = frame_segment
+                    else:
+                        frame_p0, frame_p1, _frame_length = frame_segment
+                        frame_center = (
+                            0.5 * (float(frame_p0[0]) + float(frame_p1[0])),
+                            0.5 * (float(frame_p0[1]) + float(frame_p1[1])),
+                        )
+                        p0, p1, shifted_length = segment_from_angle_length(
+                            target_angle,
+                            base_length_px,
+                            "center",
+                            None,
+                            frame_center,
+                            self.nx,
+                            self.ny,
+                        )
+                    if float(shifted_length) < min_cut_length_px:
+                        continue
+                    cut = self._create_cut(p0, p1)
+                    cut.name = f"{base_name} a{angle_idx:02d} d{offset_idx:02d}"
+                    self._seed_cut_td_params_from_panel(cut.cut_id, template_panel)
+                    cut_state = self._cut_analysis(cut.cut_id)
+                    cut_state["td_params"] = {
+                        **dict(cut_state.get("td_params") or {}),
+                        "width": int(td_width),
+                        "weighting": str(td_weighting),
                     }
-                )
-            displacement_stack["cut_ids"] = row_cut_ids
+                    self._sync_panels_from_cut_td_params(cut.cut_id)
+                    row_cut_ids.append(int(cut.cut_id))
+                    rotation_stack_map[int(angle_idx)].append(int(cut.cut_id))
+                    generated_cut_ids.append(int(cut.cut_id))
+                    cell_id = f"ang_{angle_idx:03d}_off_{offset_idx:03d}"
+                    cell_dir = str(experiment_root / "cells" / cell_id)
+                    cells.append(
+                        {
+                            "cell_id": cell_id,
+                            "cut_id": int(cut.cut_id),
+                            "cut_name": str(cut.name),
+                            "offset_idx": int(offset_idx),
+                            "offset_value": float(offset_value),
+                            "angle_idx": int(angle_idx),
+                            "angle_deg": float(angle_value),
+                            "cell_dir": cell_dir,
+                            "status": "created",
+                            "td_fits_path": "",
+                            "nuwt_result_path": "",
+                            "wavelet_result_path": "",
+                        }
+                    )
+        else:
+            for offset_idx, offset_value in enumerate(offset_values):
+                row_cut_ids: list[int] = []
+                for angle_idx, angle_value in enumerate(angle_values):
+                    shifted = Cut(
+                        cut_id=-1,
+                        name="template",
+                        color=base_preview.color,
+                        p0=base_preview.p0,
+                        p1=base_preview.p1,
+                    )
+                    shifted.p0, shifted.p1 = shift_cut(
+                        shifted,
+                        float(offset_value * normal_x),
+                        float(offset_value * normal_y),
+                        self.nx,
+                        self.ny,
+                    )
+                    target_angle = (
+                        float(cut_directed_angle_deg(shifted)) - float(angle_value)
+                    )
+                    shifted_center = cut_center(shifted)
+                    shifted.p0, shifted.p1, shifted_length = (
+                        self._build_experiment_cut_segment(
+                            shifted_center,
+                            target_angle,
+                            base_length_px,
+                            bool(dynamic_length),
+                        )
+                    )
+                    if float(shifted_length) < min_cut_length_px:
+                        continue
+                    cut = self._create_cut(shifted.p0, shifted.p1)
+                    cut.name = f"{base_name} d{offset_idx:02d} a{angle_idx:02d}"
+                    self._seed_cut_td_params_from_panel(cut.cut_id, template_panel)
+                    cut_state = self._cut_analysis(cut.cut_id)
+                    cut_state["td_params"] = {
+                        **dict(cut_state.get("td_params") or {}),
+                        "width": int(td_width),
+                        "weighting": str(td_weighting),
+                    }
+                    self._sync_panels_from_cut_td_params(cut.cut_id)
+                    row_cut_ids.append(int(cut.cut_id))
+                    rotation_stack_map[int(angle_idx)].append(int(cut.cut_id))
+                    generated_cut_ids.append(int(cut.cut_id))
+                    cell_id = f"off_{offset_idx:03d}_ang_{angle_idx:03d}"
+                    cell_dir = str(experiment_root / "cells" / cell_id)
+                    cells.append(
+                        {
+                            "cell_id": cell_id,
+                            "cut_id": int(cut.cut_id),
+                            "cut_name": str(cut.name),
+                            "offset_idx": int(offset_idx),
+                            "offset_value": float(offset_value),
+                            "angle_idx": int(angle_idx),
+                            "angle_deg": float(angle_value),
+                            "cell_dir": cell_dir,
+                            "status": "created",
+                            "td_fits_path": "",
+                            "nuwt_result_path": "",
+                            "wavelet_result_path": "",
+                        }
+                    )
+                displacement_stack_specs.append((float(offset_value), list(row_cut_ids)))
 
         rotation_stack_ids: list[int] = []
-        for angle_idx, angle_value in enumerate(angle_values):
-            cut_ids = [
-                int(cut_id)
-                for cut_id in rotation_stack_map.get(int(angle_idx), [])
-                if int(cut_id) in self.cuts
-            ]
-            rotation_stack = self._create_stack_state(
-                name=f"{base_name} | a={float(angle_value):+.1f}deg",
-                cut_ids=cut_ids,
-            )
-            rotation_stack_ids.append(int(rotation_stack["stack_id"]))
+        if str(stack_group_mode) == "displacement":
+            for offset_value, row_cut_ids in displacement_stack_specs:
+                if not row_cut_ids:
+                    continue
+                displacement_stack = self._create_stack_state(
+                    name=f"{base_name} | d={float(offset_value):+.1f}px",
+                    cut_ids=row_cut_ids,
+                )
+                displacement_stack_ids.append(int(displacement_stack["stack_id"]))
+        else:
+            for angle_idx, angle_value in enumerate(angle_values):
+                cut_ids = [
+                    int(cut_id)
+                    for cut_id in rotation_stack_map.get(int(angle_idx), [])
+                    if int(cut_id) in self.cuts
+                ]
+                if not cut_ids:
+                    continue
+                rotation_stack = self._create_stack_state(
+                    name=f"{base_name} | a={float(angle_value):+.1f}deg",
+                    cut_ids=cut_ids,
+                )
+                rotation_stack_ids.append(int(rotation_stack["stack_id"]))
 
         if not generated_cut_ids:
             for stack_id in displacement_stack_ids + rotation_stack_ids:
@@ -11420,20 +16761,36 @@ class TDMosaicApp:
         experiment["displacement_stack_ids"] = displacement_stack_ids
         experiment["rotation_stack_ids"] = rotation_stack_ids
         experiment["status"] = "generated"
+        experiment["nuwt_status"] = "pending"
+        experiment["wavelet_status"] = "pending"
+        experiment["tables_status"] = "pending"
+        experiment["stack_outputs"] = {}
         experiment["updated_at"] = self._timestamp_now()
-        experiment["last_run_summary"] = "Generated geometry."
+        experiment["last_run_summary"] = "Generated geometry. Study folder ready."
         self.experiments[experiment_id] = experiment
+        self._apply_experiment_params_to_cuts(experiment)
+        self._write_experiment_metadata_files(experiment)
         self.active_experiment_id = experiment_id
         self.selected_cut_id = int(generated_cut_ids[0])
+        primary_stack_ids = (
+            displacement_stack_ids
+            if str(stack_group_mode) == "displacement"
+            else rotation_stack_ids
+        )
         self.active_stack_id = (
-            int(displacement_stack_ids[0]) if displacement_stack_ids else self.active_stack_id
+            int(primary_stack_ids[0]) if primary_stack_ids else self.active_stack_id
         )
         self.selected_stack_cut_id = int(generated_cut_ids[0])
         self._record_session_change()
         self.refresh_all()
         self._set_status(
             f"Generated {len(generated_cut_ids)} exhaustive cuts for {base_name} "
-            f"({len(offset_values)} displacements x {len(angle_values)} angles)."
+            f"(d={float(displacement_min):+.1f}..{float(displacement_max):+.1f}px, "
+            f"{'variable displacements per angle' if bool(full_cube_angles) else f'{len(offset_values)} displacements x {len(angle_values)} angles'}, "
+            f"stacked by {stack_group_mode}, "
+            f"study={'full cube' if bool(full_cube_angles) else 'standard'}, "
+            f"length={'dynamic' if bool(dynamic_length) else 'fixed'}). "
+            f"Folder: {experiment_root}"
         )
 
     def _delete_selected_experiment(self) -> None:
@@ -11762,7 +17119,10 @@ class TDMosaicApp:
         else:
             preview_cut = self._cut_preview(cut.cut_id) or cut
             dynamic_label = " | dynamic" if self._cut_dynamic_enabled(cut.cut_id) else ""
-            self.selected_cut_name_var.set(f"Selected: {cut.name}{dynamic_label}")
+            curve_label = ""
+            if self._cut_is_curve(cut):
+                curve_label = f" | {self._cut_curve_mode_label(preview_cut)}"
+            self.selected_cut_name_var.set(f"Selected: {cut.name}{curve_label}{dynamic_label}")
             self.geometry_angle_var.set(f"{cut_display_angle_deg(preview_cut):.2f}")
             self.geometry_length_var.set(f"{cut_length(preview_cut):.2f}")
             self.geometry_x1_var.set(f"{preview_cut.p0[0]:.2f}")
@@ -11771,6 +17131,7 @@ class TDMosaicApp:
             self.geometry_y2_var.set(f"{preview_cut.p1[1]:.2f}")
         self.geometry_update_guard = False
         self._refresh_dynamic_cut_controls()
+        self._sync_function_cut_controls_from_selected_cut()
 
     def _refresh_dynamic_cut_controls(self) -> None:
         if not hasattr(self, "dynamic_keyframe_listbox"):
@@ -11819,6 +17180,10 @@ class TDMosaicApp:
         if cut is None:
             self.dynamic_cut_enabled_var.set(False)
             self._set_status("Select a cut first.")
+            return
+        if self._cut_is_curve(cut):
+            self.dynamic_cut_enabled_var.set(False)
+            self._set_status("Dynamic geometry is not available for curved cuts yet.")
             return
         state = self._cut_analysis(cut.cut_id)
         enabled = bool(self.dynamic_cut_enabled_var.get())
@@ -11938,6 +17303,32 @@ class TDMosaicApp:
     def _selected_editable_cut(self, action: str) -> Cut | None:
         return self._editable_cut(self._selected_cut(), action)
 
+    def _cut_is_curve(self, cut: Cut | None) -> bool:
+        return cut is not None and str(getattr(cut, "mode", "line")) == "curve"
+
+    def _curve_cut_edit_supported(self, cut: Cut | None, action: str) -> bool:
+        return True
+
+    def _shift_curve_cut_geometry(self, cut: Cut, dx: float, dy: float) -> bool:
+        points = cut_polyline_points(cut)
+        if len(points) < 2:
+            return False
+        min_dx = -min(point[0] for point in points)
+        max_dx = (self.nx - 1.0) - max(point[0] for point in points)
+        min_dy = -min(point[1] for point in points)
+        max_dy = (self.ny - 1.0) - max(point[1] for point in points)
+        dx = clamp_value(float(dx), float(min_dx), float(max_dx))
+        dy = clamp_value(float(dy), float(min_dy), float(max_dy))
+        shifted_points = [
+            (float(point[0] + dx), float(point[1] + dy)) for point in points
+        ]
+        updated, _limited = self._set_curve_cut_geometry(
+            cut,
+            shifted_points,
+            curve_fit=self._curve_transform_fit_mode(cut),
+        )
+        return updated
+
     def _apply_cut_points(
         self, cut: Cut, p0: tuple[float, float], p1: tuple[float, float], status: str
     ) -> bool:
@@ -11960,6 +17351,10 @@ class TDMosaicApp:
         else:
             cut.p0 = p0
             cut.p1 = p1
+            cut.mode = "line"
+            cut.curve_fit = "line"
+            cut.curve_points = []
+            self._clear_cut_function_metadata(cut)
         self.selected_cut_id = cut.cut_id
         self._invalidate_cut_dependents(cut.cut_id)
         self._record_session_change()
@@ -11993,6 +17388,29 @@ class TDMosaicApp:
         self, cut: Cut, angle_deg: float, anchor_mode: str, status_prefix: str
     ) -> bool:
         preview_cut = self._cut_preview(cut.cut_id) or cut
+        if self._cut_is_curve(preview_cut):
+            normalized_anchor = self._normalize_anchor_mode(anchor_mode)
+            if normalized_anchor == "center":
+                anchor_point = cut_center(preview_cut)
+            elif normalized_anchor == "p0":
+                anchor_point = preview_cut.p0
+            elif normalized_anchor == "p1":
+                anchor_point = preview_cut.p1
+            else:
+                self._set_status(f"Unknown anchor mode: {anchor_mode}")
+                return False
+            delta_deg = float(angle_deg) - cut_display_angle_deg(preview_cut)
+            rotated_points = [
+                rotate_point(point, anchor_point, delta_deg)
+                for point in cut_polyline_points(preview_cut)
+            ]
+            return self._apply_curve_cut_geometry(
+                cut,
+                rotated_points,
+                status_prefix,
+                curve_fit=self._curve_transform_fit_mode(cut),
+            )
+
         desired_length = cut_length(preview_cut)
         normalized_anchor = self._normalize_anchor_mode(anchor_mode)
         if normalized_anchor == "center":
@@ -12039,6 +17457,36 @@ class TDMosaicApp:
         self, cut: Cut, length_value: float, length_mode: str, status_prefix: str
     ) -> bool:
         preview_cut = self._cut_preview(cut.cut_id) or cut
+        if self._cut_is_curve(preview_cut):
+            current_length = cut_length(preview_cut)
+            if current_length <= 1e-9:
+                self._set_status("Curved cut is too short to resize.")
+                return False
+            normalized_length = self._normalize_length_mode(length_mode)
+            if normalized_length == "symmetric":
+                anchor_point = cut_center(preview_cut)
+            elif normalized_length == "p0":
+                anchor_point = preview_cut.p0
+            elif normalized_length == "p1":
+                anchor_point = preview_cut.p1
+            else:
+                self._set_status(f"Unknown length mode: {length_mode}")
+                return False
+            scale = max(float(length_value), 1.0) / current_length
+            scaled_points = [
+                (
+                    float(anchor_point[0] + scale * (point[0] - anchor_point[0])),
+                    float(anchor_point[1] + scale * (point[1] - anchor_point[1])),
+                )
+                for point in cut_polyline_points(preview_cut)
+            ]
+            return self._apply_curve_cut_geometry(
+                cut,
+                scaled_points,
+                status_prefix,
+                curve_fit=self._curve_transform_fit_mode(cut),
+            )
+
         angle_deg = cut_directed_angle_deg(preview_cut)
         requested_length = max(float(length_value), 1.0)
 
@@ -12108,6 +17556,34 @@ class TDMosaicApp:
             self._set_center_distance_between_cuts()
         elif widget in getattr(self, "geometry_coord_entries", []):
             self._apply_selected_cut_coords()
+        elif widget in {
+            getattr(self, "function_point_x_entry", None),
+            getattr(self, "function_point_y_entry", None),
+        }:
+            self._apply_selected_function_control_point()
+
+    def _on_function_expression_event(self, _event: Any) -> None:
+        expression = str(self.function_cut_expression_var.get() or "").strip()
+        current_params: dict[str, float] = {}
+        for name, var in dict(getattr(self, "function_param_vars", {}) or {}).items():
+            try:
+                current_params[str(name)] = float(str(var.get()).strip())
+            except Exception:
+                continue
+        cut = self._selected_cut()
+        if cut is not None and self._cut_is_function_curve(cut):
+            for name, value in dict(getattr(cut, "function_params", {}) or {}).items():
+                current_params.setdefault(str(name), float(value))
+        self._refresh_function_param_editor(expression, current_params)
+
+    def _on_function_render_points_event(self, _event: Any) -> None:
+        cut = self._selected_cut()
+        if cut is None or not self._cut_is_function_curve(cut):
+            return
+        self._refit_selected_function_cut()
+
+    def _on_function_param_entry_event(self, _event: Any) -> None:
+        self._apply_function_params_to_selected_cut()
 
     def _on_angle_entry_event(self, _event: Any) -> None:
         self._set_selected_cut_angle()
@@ -12127,6 +17603,8 @@ class TDMosaicApp:
         cut = self._selected_editable_cut("set angle")
         if cut is None:
             return
+        if not self._curve_cut_edit_supported(cut, "set angle"):
+            return
         angle_deg = self._parse_float_var(self.geometry_angle_var.get(), "angle")
         if angle_deg is None:
             return
@@ -12136,6 +17614,8 @@ class TDMosaicApp:
     def _adjust_selected_cut_angle(self, delta_deg: float) -> None:
         cut = self._selected_editable_cut("adjust angle")
         if cut is None:
+            return
+        if not self._curve_cut_edit_supported(cut, "adjust angle"):
             return
         new_angle = cut_display_angle_deg(cut) + delta_deg
         self._set_cut_angle(
@@ -12151,6 +17631,8 @@ class TDMosaicApp:
         cut = self._selected_editable_cut("set length")
         if cut is None:
             return
+        if not self._curve_cut_edit_supported(cut, "set length"):
+            return
         length_value = self._parse_float_var(self.geometry_length_var.get(), "length")
         if length_value is None:
             return
@@ -12164,6 +17646,8 @@ class TDMosaicApp:
     def _adjust_selected_cut_length(self, delta_length: float) -> None:
         cut = self._selected_editable_cut("adjust length")
         if cut is None:
+            return
+        if not self._curve_cut_edit_supported(cut, "adjust length"):
             return
         new_length = max(1.0, cut_length(cut) + delta_length)
         self._set_cut_length(
@@ -12185,6 +17669,15 @@ class TDMosaicApp:
         x2 = self._parse_float_var(self.geometry_x2_var.get(), "x2")
         y2 = self._parse_float_var(self.geometry_y2_var.get(), "y2")
         if None in {x1, y1, x2, y2}:
+            return
+
+        if self._cut_is_curve(cut):
+            self._apply_curve_cut_endpoint_mapping(
+                cut,
+                (float(x1), float(y1)),
+                (float(x2), float(y2)),
+                f"Applied coordinates to {cut.name}.",
+            )
             return
 
         self._apply_cut_points(
@@ -12272,9 +17765,11 @@ class TDMosaicApp:
         target_center = cut_center(target_preview)
         dx = ref_center[0] - target_center[0]
         dy = ref_center[1] - target_center[1]
-        p0, p1 = shift_cut(target_preview, dx, dy, self.nx, self.ny)
-        self._apply_cut_points(
-            target_cut, p0, p1, f"Matched center of {target_cut.name} to {ref_cut.name}."
+        self._shift_cut_geometry(
+            target_cut,
+            dx,
+            dy,
+            f"Matched center of {target_cut.name} to {ref_cut.name}.",
         )
 
     def _match_vertices(self, vertex_name: str) -> None:
@@ -12297,8 +17792,7 @@ class TDMosaicApp:
             self._set_status(f"Unknown vertex selector: {vertex_name}")
             return
 
-        p0, p1 = shift_cut(target_preview, dx, dy, self.nx, self.ny)
-        self._apply_cut_points(target_cut, p0, p1, status)
+        self._shift_cut_geometry(target_cut, dx, dy, status)
 
     def _copy_reference_geometry(self) -> None:
         ref_cut, target_cut = self._measurement_cuts("copy geometry")
@@ -12307,11 +17801,10 @@ class TDMosaicApp:
             return
         ref_preview = self._cut_preview(ref_cut.cut_id) or ref_cut
 
-        self._apply_cut_points(
+        self._apply_cut_geometry_copy(
             target_cut,
-            ref_preview.p0,
-            ref_preview.p1,
-            f"Copied both vertices from {ref_cut.name} to {target_cut.name}.",
+            ref_preview,
+            f"Copied geometry from {ref_cut.name} to {target_cut.name}.",
         )
 
     def _set_center_distance_between_cuts(self) -> None:
@@ -12343,11 +17836,10 @@ class TDMosaicApp:
         new_center = (ref_center[0] + desired * ux, ref_center[1] + desired * uy)
         move_dx = new_center[0] - target_center[0]
         move_dy = new_center[1] - target_center[1]
-        p0, p1 = shift_cut(target_preview, move_dx, move_dy, self.nx, self.ny)
-        self._apply_cut_points(
+        self._shift_cut_geometry(
             target_cut,
-            p0,
-            p1,
+            move_dx,
+            move_dy,
             f"Set center distance between {ref_cut.name} and {target_cut.name} to {desired:.2f} px.",
         )
 
@@ -12579,6 +18071,1240 @@ class TDMosaicApp:
         self.next_cut_id += 1
         return cut
 
+    def _cut_is_function_curve(self, cut: Cut | None) -> bool:
+        return (
+            cut is not None
+            and str(getattr(cut, "mode", "line")) == "curve"
+            and str(getattr(cut, "curve_fit", "")).strip().lower() == "function"
+            and bool(str(getattr(cut, "function_expr", "") or "").strip())
+        )
+
+    def _cut_curve_mode_label(self, cut: Cut | None) -> str:
+        if cut is None:
+            return "none"
+        if not self._cut_is_curve(cut):
+            return "line"
+        fit_mode = str(getattr(cut, "curve_fit", "polyline") or "polyline").strip()
+        if self._cut_is_function_curve(cut):
+            fit_mode = "function"
+        point_count = len(cut_polyline_points(cut))
+        return f"curve:{fit_mode} | pts={point_count} | L={cut_length(cut):.1f}px"
+
+    def _clear_cut_function_metadata(self, cut: Cut) -> None:
+        cut.function_expr = ""
+        cut.function_x_start = float(cut.p0[0])
+        cut.function_x_end = float(cut.p1[0])
+        cut.function_point_count = 0
+        cut.function_control_points = []
+        cut.function_params = {}
+
+    def _cut_function_metadata_payload(
+        self,
+        cut: Cut,
+    ) -> dict[str, Any] | None:
+        if not self._cut_is_function_curve(cut):
+            return None
+        point_count = max(
+            int(getattr(cut, "function_point_count", 0) or 0),
+            len(cut_polyline_points(cut)),
+            2,
+        )
+        return {
+            "function_expr": str(getattr(cut, "function_expr", "") or ""),
+            "function_x_start": float(getattr(cut, "function_x_start", cut.p0[0])),
+            "function_x_end": float(getattr(cut, "function_x_end", cut.p1[0])),
+            "function_point_count": point_count,
+            "function_control_points": [
+                (float(point[0]), float(point[1]))
+                for point in (getattr(cut, "function_control_points", []) or [])
+            ],
+            "function_params": {
+                str(key): float(value)
+                for key, value in dict(getattr(cut, "function_params", {}) or {}).items()
+            },
+        }
+
+    def _curve_transform_fit_mode(self, cut: Cut | None) -> str:
+        if self._cut_is_function_curve(cut):
+            return "polyline"
+        fit_mode = str(getattr(cut, "curve_fit", "polyline") or "polyline").strip().lower()
+        return fit_mode if fit_mode in {"polyline", "quadratic", "cubic"} else "polyline"
+
+    def _clear_cut_dynamic_geometry(self, cut_id: int) -> None:
+        state = self._cut_analysis(cut_id)
+        state["dynamic_enabled"] = False
+        state["dynamic_keyframes"] = {}
+        state["dynamic_reference_frame"] = clamp_int(
+            int(self.t_visual_var.get()),
+            0,
+            self.nt - 1,
+        )
+
+    def _normalize_curve_geometry_points(
+        self,
+        raw_points: list[tuple[float, float]],
+    ) -> tuple[list[tuple[float, float]], bool]:
+        normalized: list[tuple[float, float]] = []
+        limited = False
+        for point in raw_points:
+            raw_point = (float(point[0]), float(point[1]))
+            clamped = clamp_point(raw_point, self.nx, self.ny)
+            if (
+                abs(clamped[0] - raw_point[0]) > 1e-6
+                or abs(clamped[1] - raw_point[1]) > 1e-6
+            ):
+                limited = True
+            if normalized and distance(normalized[-1], clamped) < 0.35:
+                continue
+            normalized.append((float(clamped[0]), float(clamped[1])))
+        if len(normalized) < 2 or polyline_length(normalized) < 1.0:
+            raise ValueError("Curve geometry collapsed to a too-short cut.")
+        return normalized, limited
+
+    def _set_curve_cut_geometry(
+        self,
+        cut: Cut,
+        points: list[tuple[float, float]],
+        *,
+        curve_fit: str = "polyline",
+        function_meta: dict[str, Any] | None = None,
+    ) -> tuple[bool, bool]:
+        try:
+            normalized, limited = self._normalize_curve_geometry_points(points)
+        except ValueError as exc:
+            self._set_status(str(exc))
+            return False, False
+
+        fit_mode = str(curve_fit or "polyline").strip().lower() or "polyline"
+        if fit_mode == "function" and function_meta is None:
+            fit_mode = "polyline"
+        cut.mode = "curve"
+        cut.curve_fit = fit_mode
+        cut.curve_points = [
+            (float(point[0]), float(point[1])) for point in normalized
+        ]
+        cut.p0 = cut.curve_points[0]
+        cut.p1 = cut.curve_points[-1]
+        if fit_mode == "function" and function_meta is not None:
+            cut.function_expr = str(function_meta.get("function_expr", "") or "")
+            cut.function_x_start = float(
+                function_meta.get("function_x_start", cut.p0[0])
+            )
+            cut.function_x_end = float(
+                function_meta.get("function_x_end", cut.p1[0])
+            )
+            cut.function_point_count = max(
+                int(function_meta.get("function_point_count", len(cut.curve_points)) or 0),
+                2,
+            )
+            cut.function_control_points = [
+                (float(point[0]), float(point[1]))
+                for point in (function_meta.get("function_control_points") or [])
+            ]
+            cut.function_params = {
+                str(key): float(value)
+                for key, value in dict(function_meta.get("function_params") or {}).items()
+            }
+        else:
+            self._clear_cut_function_metadata(cut)
+        return True, limited
+
+    def _apply_curve_cut_geometry(
+        self,
+        cut: Cut,
+        points: list[tuple[float, float]],
+        status: str,
+        *,
+        curve_fit: str = "polyline",
+        function_meta: dict[str, Any] | None = None,
+    ) -> bool:
+        had_dynamic = self._cut_dynamic_enabled(cut.cut_id)
+        if had_dynamic:
+            self._clear_cut_dynamic_geometry(cut.cut_id)
+        updated, limited = self._set_curve_cut_geometry(
+            cut,
+            points,
+            curve_fit=curve_fit,
+            function_meta=function_meta,
+        )
+        if not updated:
+            return False
+        self.selected_cut_id = cut.cut_id
+        self._invalidate_cut_dependents(cut.cut_id)
+        self._record_session_change()
+        self.refresh_all()
+        suffix = ""
+        if limited:
+            suffix += " Limited by image bounds."
+        if had_dynamic:
+            suffix += " Dynamic geometry was disabled for this curved cut."
+        self._set_status(f"{status}{suffix}")
+        return True
+
+    def _shift_cut_geometry(self, cut: Cut, dx: float, dy: float, status: str) -> bool:
+        preview_cut = self._cut_preview(cut.cut_id) or cut
+        if self._cut_is_curve(preview_cut):
+            shifted_points = [
+                (float(point[0] + dx), float(point[1] + dy))
+                for point in cut_polyline_points(preview_cut)
+            ]
+            return self._apply_curve_cut_geometry(
+                cut,
+                shifted_points,
+                status,
+                curve_fit=self._curve_transform_fit_mode(cut),
+            )
+        p0, p1 = shift_cut(preview_cut, dx, dy, self.nx, self.ny)
+        return self._apply_cut_points(cut, p0, p1, status)
+
+    def _apply_cut_geometry_copy(
+        self,
+        target_cut: Cut,
+        source_cut: Cut,
+        status: str,
+    ) -> bool:
+        source_preview = self._cut_preview(source_cut.cut_id) or source_cut
+        if self._cut_is_curve(source_preview):
+            return self._apply_curve_cut_geometry(
+                target_cut,
+                cut_polyline_points(source_preview),
+                status,
+                curve_fit=str(getattr(source_preview, "curve_fit", "polyline")),
+                function_meta=self._cut_function_metadata_payload(source_preview),
+            )
+        return self._apply_cut_points(
+            target_cut,
+            source_preview.p0,
+            source_preview.p1,
+            status,
+        )
+
+    def _apply_curve_cut_endpoint_mapping(
+        self,
+        cut: Cut,
+        new_p0: tuple[float, float],
+        new_p1: tuple[float, float],
+        status: str,
+    ) -> bool:
+        preview_cut = self._cut_preview(cut.cut_id) or cut
+        points = cut_polyline_points(preview_cut)
+        if len(points) < 2:
+            self._set_status("Curved cut has no valid geometry.")
+            return False
+
+        old_p0 = points[0]
+        old_p1 = points[-1]
+        old_dx = float(old_p1[0] - old_p0[0])
+        old_dy = float(old_p1[1] - old_p0[1])
+        old_len = math.hypot(old_dx, old_dy)
+        if old_len <= 1e-9:
+            self._set_status("Curved cut is too short to remap.")
+            return False
+
+        new_p0 = clamp_point(new_p0, self.nx, self.ny)
+        new_p1 = clamp_point(new_p1, self.nx, self.ny)
+        if distance(new_p0, new_p1) < 1.0:
+            self._set_status("Cut too short after the requested operation.")
+            return False
+
+        new_dx = float(new_p1[0] - new_p0[0])
+        new_dy = float(new_p1[1] - new_p0[1])
+        new_len = math.hypot(new_dx, new_dy)
+        angle_delta = math.atan2(new_dy, new_dx) - math.atan2(old_dy, old_dx)
+        cos_a = math.cos(angle_delta)
+        sin_a = math.sin(angle_delta)
+        scale = new_len / old_len
+
+        transformed_points = []
+        for point in points:
+            rel_x = float(point[0] - old_p0[0])
+            rel_y = float(point[1] - old_p0[1])
+            rot_x = scale * (cos_a * rel_x - sin_a * rel_y)
+            rot_y = scale * (sin_a * rel_x + cos_a * rel_y)
+            transformed_points.append(
+                (float(new_p0[0] + rot_x), float(new_p0[1] + rot_y))
+            )
+
+        return self._apply_curve_cut_geometry(
+            cut,
+            transformed_points,
+            status,
+            curve_fit=self._curve_transform_fit_mode(cut),
+        )
+
+    def _function_cut_eval_env(self) -> dict[str, Any]:
+        return {
+            "sin": np.sin,
+            "cos": np.cos,
+            "tan": np.tan,
+            "asin": np.arcsin,
+            "acos": np.arccos,
+            "atan": np.arctan,
+            "arcsin": np.arcsin,
+            "arccos": np.arccos,
+            "arctan": np.arctan,
+            "sinh": np.sinh,
+            "cosh": np.cosh,
+            "tanh": np.tanh,
+            "exp": np.exp,
+            "log": np.log,
+            "log10": np.log10,
+            "log2": np.log2,
+            "log1p": np.log1p,
+            "sqrt": np.sqrt,
+            "abs": np.abs,
+            "floor": np.floor,
+            "ceil": np.ceil,
+            "round": np.round,
+            "sign": np.sign,
+            "where": np.where,
+            "clip": np.clip,
+            "minimum": np.minimum,
+            "maximum": np.maximum,
+            "pi": float(np.pi),
+            "e": float(np.e),
+        }
+
+    def _function_control_points(self, cut: Cut | None) -> list[tuple[float, float]]:
+        if cut is None:
+            return []
+        raw_points = list(getattr(cut, "function_control_points", []) or [])
+        normalized: list[tuple[float, float]] = []
+        for point in raw_points:
+            try:
+                clamped = clamp_point((float(point[0]), float(point[1])), self.nx, self.ny)
+            except Exception:
+                continue
+            normalized.append((float(clamped[0]), float(clamped[1])))
+        if normalized:
+            return sorted(normalized, key=lambda point: (point[0], point[1]))
+        if self._cut_is_function_curve(cut):
+            fallback = cut_polyline_points(cut)
+            if fallback:
+                step = max(len(fallback) // 6, 1)
+                return [
+                    (float(point[0]), float(point[1]))
+                    for point in fallback[::step]
+                ]
+        return []
+
+    def _normalize_function_cut_expression(self, expression: str) -> str:
+        text = str(expression or "").strip()
+        if not text:
+            raise ValueError("Enter a function y = f(x) first.")
+        if "=" in text:
+            lhs, rhs = text.split("=", 1)
+            lhs_key = lhs.strip().lower().replace(" ", "")
+            if lhs_key in {"y", "f(x)", "y(x)"}:
+                text = rhs.strip()
+        for prefix in ("numpy.", "np.", "math."):
+            text = text.replace(prefix, "")
+        if not text:
+            raise ValueError("Enter a valid function expression.")
+        return text
+
+    def _function_parameter_names_from_expression(self, expression: str) -> list[str]:
+        normalized_expression = self._normalize_function_cut_expression(expression)
+        ignored = set(self._function_cut_eval_env().keys()) | {"x"}
+        names: list[str] = []
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", normalized_expression):
+            if token in ignored or token in names:
+                continue
+            names.append(str(token))
+        return names
+
+    def _validate_function_cut_ast(
+        self,
+        tree: ast.AST,
+        allowed_names: set[str],
+        callable_names: set[str],
+    ) -> None:
+        allowed_nodes = (
+            ast.Expression,
+            ast.BinOp,
+            ast.UnaryOp,
+            ast.Call,
+            ast.Name,
+            ast.Load,
+            ast.Constant,
+            ast.Add,
+            ast.Sub,
+            ast.Mult,
+            ast.Div,
+            ast.Pow,
+            ast.Mod,
+            ast.USub,
+            ast.UAdd,
+            ast.Compare,
+            ast.Eq,
+            ast.NotEq,
+            ast.Lt,
+            ast.LtE,
+            ast.Gt,
+            ast.GtE,
+            ast.BitAnd,
+            ast.BitOr,
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed_nodes):
+                raise ValueError(
+                    f"Unsupported syntax in function cut: {type(node).__name__}."
+                )
+            if isinstance(node, ast.Name) and node.id not in allowed_names:
+                raise ValueError(f"Unsupported symbol in function cut: {node.id}")
+            if isinstance(node, ast.Call):
+                if not isinstance(node.func, ast.Name) or node.func.id not in callable_names:
+                    raise ValueError("Only simple allowed functions can be used in y = f(x).")
+
+    def _evaluate_parametric_function_cut_expression(
+        self,
+        expression: str,
+        x_values: np.ndarray,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[str, list[str], dict[str, float], np.ndarray]:
+        normalized_expression = self._normalize_function_cut_expression(expression)
+        param_names = self._function_parameter_names_from_expression(normalized_expression)
+        env = self._function_cut_eval_env()
+        callable_names = {
+            name for name, value in env.items() if callable(value)
+        }
+        allowed_names = set(env.keys()) | {"x"} | set(param_names)
+        tree = ast.parse(normalized_expression, mode="eval")
+        self._validate_function_cut_ast(tree, allowed_names, callable_names)
+
+        x_array = np.asarray(x_values, dtype=np.float64)
+        local_env = dict(env)
+        local_env["x"] = x_array
+        resolved_params: dict[str, float] = {}
+        params = dict(params or {})
+        for name in param_names:
+            default_value = 0.0
+            if name.lower() in {"c", "offset", "y0"}:
+                default_value = 1.0
+            resolved_params[name] = float(params.get(name, default_value))
+            local_env[name] = resolved_params[name]
+        result = eval(compile(tree, "<function-cut>", "eval"), {"__builtins__": {}}, local_env)
+        y_array = np.asarray(result, dtype=np.float64)
+        if y_array.ndim == 0:
+            y_array = np.full(x_array.shape, float(y_array), dtype=np.float64)
+        elif y_array.shape != x_array.shape:
+            if y_array.size != x_array.size:
+                raise ValueError("Function result must be scalar or match the sampled x grid.")
+            y_array = np.reshape(y_array, x_array.shape)
+        if not np.all(np.isfinite(y_array)):
+            raise ValueError("Function produced NaN/Inf values inside the requested x range.")
+        return normalized_expression, param_names, resolved_params, y_array
+
+    def _fit_function_params_to_points(
+        self,
+        expression: str,
+        control_points: list[tuple[float, float]],
+        initial_params: dict[str, Any] | None = None,
+    ) -> tuple[str, list[str], dict[str, float], list[tuple[float, float]]]:
+        normalized_points = [
+            clamp_point((float(point[0]), float(point[1])), self.nx, self.ny)
+            for point in control_points
+        ]
+        normalized_points = sorted(
+            normalized_points,
+            key=lambda point: (point[0], point[1]),
+        )
+        if len(normalized_points) < 2:
+            raise ValueError("Function fit needs at least two clicked points.")
+
+        x_values = np.asarray([float(point[0]) for point in normalized_points], dtype=np.float64)
+        y_values = np.asarray([float(point[1]) for point in normalized_points], dtype=np.float64)
+        if abs(float(np.nanmax(x_values)) - float(np.nanmin(x_values))) < 1e-9:
+            raise ValueError("Function fit needs points with different x positions.")
+
+        normalized_expression = self._normalize_function_cut_expression(expression)
+        param_names = self._function_parameter_names_from_expression(normalized_expression)
+        env = self._function_cut_eval_env()
+        callable_names = {
+            name for name, value in env.items() if callable(value)
+        }
+        allowed_names = set(env.keys()) | {"x"} | set(param_names)
+        tree = ast.parse(normalized_expression, mode="eval")
+        self._validate_function_cut_ast(tree, allowed_names, callable_names)
+        if len(normalized_points) < max(len(param_names), 2):
+            raise ValueError(
+                f"Function fit needs at least {max(len(param_names), 2)} points for this expression."
+            )
+        if not param_names:
+            return normalized_expression, [], {}, normalized_points
+
+        initial_params = dict(initial_params or {})
+        initial_values = []
+        y_median = float(np.nanmedian(y_values))
+        for name in param_names:
+            if name in initial_params:
+                initial_values.append(float(initial_params[name]))
+            elif name.lower() in {"c", "offset", "y0"}:
+                initial_values.append(y_median)
+            else:
+                initial_values.append(0.0)
+
+        def residual(vector: np.ndarray) -> np.ndarray:
+            params_map = {
+                name: float(vector[index]) for index, name in enumerate(param_names)
+            }
+            _expr, _names, _resolved, modeled = self._evaluate_parametric_function_cut_expression(
+                normalized_expression,
+                x_values,
+                params=params_map,
+            )
+            return np.asarray(modeled - y_values, dtype=np.float64)
+
+        result = least_squares(
+            residual,
+            x0=np.asarray(initial_values, dtype=np.float64),
+            max_nfev=4000,
+        )
+        fitted_params = {
+            name: float(result.x[index]) for index, name in enumerate(param_names)
+        }
+        return normalized_expression, param_names, fitted_params, normalized_points
+
+    def _build_function_curve_from_control_points(
+        self,
+        expression: str,
+        control_points: list[tuple[float, float]],
+        render_point_count: int,
+        *,
+        initial_params: dict[str, Any] | None = None,
+        params_override: dict[str, Any] | None = None,
+        move_control_points: bool = False,
+    ) -> tuple[str, list[tuple[float, float]], dict[str, Any]]:
+        sample_count = max(int(render_point_count), 2)
+        if params_override is None:
+            normalized_expression, param_names, fitted_params, normalized_points = (
+                self._fit_function_params_to_points(
+                    expression,
+                    control_points,
+                    initial_params=initial_params,
+                )
+            )
+        else:
+            normalized_points = [
+                clamp_point((float(point[0]), float(point[1])), self.nx, self.ny)
+                for point in control_points
+            ]
+            normalized_points = sorted(
+                normalized_points,
+                key=lambda point: (point[0], point[1]),
+            )
+            if len(normalized_points) < 2:
+                raise ValueError("Function cut needs at least two clicked points.")
+            x_points = np.asarray(
+                [float(point[0]) for point in normalized_points],
+                dtype=np.float64,
+            )
+            normalized_expression, param_names, fitted_params, modeled_points = (
+                self._evaluate_parametric_function_cut_expression(
+                    expression,
+                    x_points,
+                    params=params_override,
+                )
+            )
+            if move_control_points:
+                normalized_points = [
+                    clamp_point((float(x_value), float(y_value)), self.nx, self.ny)
+                    for x_value, y_value in zip(x_points.tolist(), modeled_points.tolist())
+                ]
+            fitted_params = dict(fitted_params)
+
+        x_values_points = np.asarray(
+            [float(point[0]) for point in normalized_points],
+            dtype=np.float64,
+        )
+        start_value = float(np.nanmin(x_values_points))
+        end_value = float(np.nanmax(x_values_points))
+        if abs(end_value - start_value) < 1e-9:
+            raise ValueError("Function cut needs points with a finite x span.")
+        x_values = np.linspace(
+            start_value,
+            end_value,
+            sample_count,
+            dtype=np.float64,
+        )
+        _expr, _names, _params, y_values = self._evaluate_parametric_function_cut_expression(
+            expression,
+            x_values,
+            params=fitted_params,
+        )
+        points, _limited = self._normalize_curve_geometry_points(
+            list(zip(x_values.tolist(), y_values.tolist()))
+        )
+        return normalized_expression, points, {
+            "function_expr": normalized_expression,
+            "function_x_start": float(start_value),
+            "function_x_end": float(end_value),
+            "function_point_count": sample_count,
+            "function_control_points": [
+                (float(point[0]), float(point[1])) for point in normalized_points
+            ],
+            "function_params": {
+                str(name): float(fitted_params.get(name, 0.0)) for name in param_names
+            },
+        }
+
+    def _refresh_function_param_editor(
+        self,
+        expression: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        if not hasattr(self, "function_param_frame"):
+            return
+        for child in self.function_param_frame.winfo_children():
+            child.destroy()
+        self.function_param_vars = {}
+
+        expression_text = str(expression or self.function_cut_expression_var.get() or "").strip()
+        if not expression_text:
+            self.ttk.Label(
+                self.function_param_frame,
+                text="Write the function expression first.",
+                justify="left",
+                wraplength=300,
+            ).grid(row=0, column=0, sticky="w")
+            return
+
+        try:
+            param_names = self._function_parameter_names_from_expression(expression_text)
+        except Exception as exc:
+            self.ttk.Label(
+                self.function_param_frame,
+                text=f"Invalid function: {exc}",
+                justify="left",
+                wraplength=300,
+            ).grid(row=0, column=0, sticky="w")
+            return
+
+        if not param_names:
+            self.ttk.Label(
+                self.function_param_frame,
+                text="This expression has no free parameters to fit.",
+                justify="left",
+                wraplength=300,
+            ).grid(row=0, column=0, sticky="w")
+            return
+
+        resolved_params = dict(params or {})
+        for index, name in enumerate(param_names):
+            self.ttk.Label(self.function_param_frame, text=name).grid(
+                row=index, column=0, sticky="w", pady=(0 if index == 0 else 6, 0)
+            )
+            var = self.tk.StringVar(
+                value=f"{float(resolved_params.get(name, 0.0)):.6g}"
+            )
+            self.function_param_vars[name] = var
+            entry = self.ttk.Entry(self.function_param_frame, textvariable=var, width=14)
+            entry.grid(
+                row=index,
+                column=1,
+                sticky="ew",
+                padx=(6, 0),
+                pady=(0 if index == 0 else 6, 0),
+            )
+            entry.bind("<Return>", self._on_function_param_entry_event)
+
+    def _sync_function_cut_controls_from_selected_cut(self) -> None:
+        if not hasattr(self, "function_cut_mode_var"):
+            return
+        cut = self._selected_cut()
+        if cut is None:
+            self.function_cut_mode_var.set("Selected curve: none")
+            self.function_fit_points_var.set(
+                f"Fit points: {len(self.function_cut_pending_points)}"
+            )
+            self.function_point_summary_var.set("Function points: none")
+            self.selected_function_point_index = None
+            self.function_point_x_var.set("")
+            self.function_point_y_var.set("")
+            self._refresh_function_param_editor()
+            if hasattr(self, "function_point_listbox"):
+                self.function_point_listbox.delete(0, self.tk.END)
+            return
+        preview_cut = self._cut_preview(cut.cut_id) or cut
+        self.function_cut_mode_var.set(
+            f"Selected curve: {self._cut_curve_mode_label(preview_cut)}"
+        )
+        self.function_fit_points_var.set(
+            f"Fit points: {len(self.function_cut_pending_points)}"
+        )
+        if self._cut_is_function_curve(preview_cut):
+            self.function_cut_expression_var.set(
+                str(getattr(preview_cut, "function_expr", "") or "")
+            )
+            point_count = max(
+                int(getattr(preview_cut, "function_point_count", 0) or 0),
+                len(cut_polyline_points(preview_cut)),
+                2,
+            )
+            self.function_cut_points_var.set(str(point_count))
+            self._refresh_function_param_editor(
+                str(getattr(preview_cut, "function_expr", "") or ""),
+                dict(getattr(preview_cut, "function_params", {}) or {}),
+            )
+        else:
+            self._refresh_function_param_editor()
+        self._refresh_function_point_editor()
+
+    def _load_selected_cut_into_function_editor(self) -> None:
+        cut = self._selected_cut()
+        if cut is None:
+            self._set_status("Select a cut first.")
+            return
+        preview_cut = self._cut_preview(cut.cut_id) or cut
+        if self._cut_is_function_curve(preview_cut):
+            self.function_cut_expression_var.set(
+                str(getattr(preview_cut, "function_expr", "") or "")
+            )
+            self.function_cut_points_var.set(
+                str(
+                    max(
+                        int(getattr(preview_cut, "function_point_count", 0) or 0),
+                        len(cut_polyline_points(preview_cut)),
+                        2,
+                    )
+                )
+            )
+            self._refresh_function_param_editor(
+                str(getattr(preview_cut, "function_expr", "") or ""),
+                dict(getattr(preview_cut, "function_params", {}) or {}),
+            )
+            self._refresh_function_point_editor()
+            self._set_status(f"Loaded functional settings from {cut.name}.")
+            return
+        self._refresh_function_param_editor(
+            str(self.function_cut_expression_var.get() or ""),
+        )
+        self._refresh_function_point_editor()
+        self._set_status(
+            "Loaded the selected cut into the function editor. Click fit points to create the functional fit."
+        )
+
+    def _start_draw_function_cut(self) -> None:
+        expression = str(self.function_cut_expression_var.get() or "").strip()
+        if not expression:
+            self._set_status("Write the function expression before clicking fit points.")
+            return
+        self._refresh_function_param_editor(expression)
+        self._cancel_curve_cut_draw()
+        self._cancel_feature_axis_draw()
+        self.draw_mode = False
+        self.force_new_cut = False
+        self.pending_point = None
+        self.hover_point = None
+        self.drag_state = None
+        self.function_cut_draw_mode = True
+        self.function_cut_pending_points = []
+        self.function_cut_hover_point = None
+        self.function_fit_points_var.set("Fit points: 0")
+        self._set_status(
+            "Function fit mode: left-click to add fit points. Finish Fit or right-click closes it."
+        )
+        self.refresh_map()
+
+    def _cancel_function_cut_draw(self) -> None:
+        if not self.function_cut_draw_mode and not self.function_cut_pending_points:
+            return
+        self.function_cut_draw_mode = False
+        self.function_cut_pending_points = []
+        self.function_cut_hover_point = None
+        self.function_fit_points_var.set("Fit points: 0")
+        self._set_status("Function fit point capture cancelled.")
+        self.refresh_map()
+
+    def _append_function_cut_point(self, x: float, y: float) -> None:
+        point = clamp_point((x, y), self.nx, self.ny)
+        if self.function_cut_pending_points and distance(self.function_cut_pending_points[-1], point) < 1.0:
+            self._set_status("Choose a point farther away to define the function fit.")
+            return
+        self.function_cut_pending_points.append(point)
+        self.function_cut_hover_point = point
+        self.function_fit_points_var.set(
+            f"Fit points: {len(self.function_cut_pending_points)}"
+        )
+        self._set_status(
+            f"Added function-fit point {len(self.function_cut_pending_points)} at ({point[0]:.1f}, {point[1]:.1f})."
+        )
+        self.refresh_map()
+
+    def _finish_pending_function_cut(self) -> None:
+        expression = str(self.function_cut_expression_var.get() or "").strip()
+        if not expression:
+            self._set_status("Write the function expression before fitting.")
+            return
+        if not self.function_cut_draw_mode and not self.function_cut_pending_points:
+            self._set_status("No function-fit points are being drawn.")
+            return
+        render_point_count = max(self._safe_int_text(self.function_cut_points_var.get(), 0), 2)
+        target_cut = self._selected_cut() if self._cut_is_function_curve(self._selected_cut()) else None
+        initial_params = (
+            dict(getattr(target_cut, "function_params", {}) or {})
+            if target_cut is not None
+            else None
+        )
+        try:
+            normalized_expression, curve_points, function_meta = (
+                self._build_function_curve_from_control_points(
+                    expression,
+                    list(self.function_cut_pending_points),
+                    render_point_count,
+                    initial_params=initial_params,
+                )
+            )
+        except Exception as exc:
+            self._set_status(f"Could not fit the function to the clicked points: {exc}")
+            return
+
+        self.function_cut_draw_mode = False
+        self.function_cut_pending_points = []
+        self.function_cut_hover_point = None
+        self.function_fit_points_var.set("Fit points: 0")
+
+        if target_cut is None:
+            cut = self._create_cut(curve_points[0], curve_points[-1])
+            updated, limited = self._set_curve_cut_geometry(
+                cut,
+                curve_points,
+                curve_fit="function",
+                function_meta=function_meta,
+            )
+            if not updated:
+                self.cuts.pop(cut.cut_id, None)
+                self.next_cut_id = max(self.next_cut_id - 1, 1)
+                return
+            panel = self.active_panel
+            panel.cut_id = cut.cut_id
+            self._seed_cut_td_params_from_panel(cut.cut_id, panel)
+            self.selected_cut_id = cut.cut_id
+            status_prefix = f"Created function cut {cut.name} from {len(function_meta['function_control_points'])} fit point(s)."
+        else:
+            self._apply_curve_cut_geometry(
+                target_cut,
+                curve_points,
+                f"Updated {target_cut.name} from {len(function_meta['function_control_points'])} fit point(s).",
+                curve_fit="function",
+                function_meta=function_meta,
+            )
+            limited = False
+            status_prefix = ""
+
+        if target_cut is None:
+            self.refresh_all()
+            limited_text = " Limited by image bounds." if limited else ""
+            self._set_status(
+                f"{status_prefix} y={normalized_expression}.{limited_text}"
+            )
+
+    def _refit_selected_function_cut(self) -> None:
+        cut = self._selected_editable_cut("refit function cut")
+        if cut is None or not self._cut_is_function_curve(cut):
+            self._set_status("Select a function cut first.")
+            return
+        control_points = self._function_control_points(cut)
+        if len(control_points) < 2:
+            self._set_status("The selected function cut has no editable fit points.")
+            return
+        render_point_count = max(self._safe_int_text(self.function_cut_points_var.get(), 0), 2)
+        try:
+            normalized_expression, curve_points, function_meta = (
+                self._build_function_curve_from_control_points(
+                    str(self.function_cut_expression_var.get() or getattr(cut, "function_expr", "")),
+                    control_points,
+                    render_point_count,
+                    initial_params=dict(getattr(cut, "function_params", {}) or {}),
+                )
+            )
+        except Exception as exc:
+            self._set_status(f"Could not refit the selected function cut: {exc}")
+            return
+        self._apply_curve_cut_geometry(
+            cut,
+            curve_points,
+            f"Refit {cut.name} to its stored control points.",
+            curve_fit="function",
+            function_meta=function_meta,
+        )
+        self.function_cut_expression_var.set(normalized_expression)
+
+    def _apply_function_params_to_selected_cut(self) -> None:
+        cut = self._selected_editable_cut("apply function parameters")
+        if cut is None or not self._cut_is_function_curve(cut):
+            self._set_status("Select a function cut first.")
+            return
+        expression = str(self.function_cut_expression_var.get() or getattr(cut, "function_expr", "")).strip()
+        if not expression:
+            self._set_status("Write the function expression first.")
+            return
+        control_points = self._function_control_points(cut)
+        if len(control_points) < 2:
+            self._set_status("The selected function cut has no control points to move.")
+            return
+        params_override: dict[str, float] = {}
+        try:
+            for name in self._function_parameter_names_from_expression(expression):
+                var = self.function_param_vars.get(name)
+                params_override[name] = float(str(var.get() if var is not None else "0").strip())
+        except Exception as exc:
+            self._set_status(f"Invalid function parameter value: {exc}")
+            return
+
+        render_point_count = max(self._safe_int_text(self.function_cut_points_var.get(), 0), 2)
+        try:
+            normalized_expression, curve_points, function_meta = (
+                self._build_function_curve_from_control_points(
+                    expression,
+                    control_points,
+                    render_point_count,
+                    params_override=params_override,
+                    move_control_points=True,
+                )
+            )
+        except Exception as exc:
+            self._set_status(f"Could not apply function parameters: {exc}")
+            return
+        self._apply_curve_cut_geometry(
+            cut,
+            curve_points,
+            f"Applied function parameters to {cut.name}.",
+            curve_fit="function",
+            function_meta=function_meta,
+        )
+        self.function_cut_expression_var.set(normalized_expression)
+
+    def _refresh_function_point_editor(self) -> None:
+        if not hasattr(self, "function_point_listbox"):
+            return
+        self.function_point_listbox.delete(0, self.tk.END)
+        cut = self._selected_cut()
+        if cut is None or not self._cut_is_function_curve(cut):
+            self.function_point_summary_var.set("Function points: select a function cut.")
+            self.selected_function_point_index = None
+            self.function_point_x_var.set("")
+            self.function_point_y_var.set("")
+            return
+        control_points = self._function_control_points(cut)
+        self.function_point_summary_var.set(
+            f"Function points: {len(control_points)} control point(s). Edit x/y to refit."
+        )
+        for index, point in enumerate(control_points, start=1):
+            self.function_point_listbox.insert(
+                self.tk.END,
+                f"{index:02d}: ({float(point[0]):.2f}, {float(point[1]):.2f})",
+            )
+        if not control_points:
+            self.selected_function_point_index = None
+            self.function_point_x_var.set("")
+            self.function_point_y_var.set("")
+            return
+        if (
+            self.selected_function_point_index is None
+            or self.selected_function_point_index >= len(control_points)
+        ):
+            self.selected_function_point_index = 0
+        self.function_point_listbox.selection_clear(0, self.tk.END)
+        self.function_point_listbox.selection_set(self.selected_function_point_index)
+        self.function_point_listbox.activate(self.selected_function_point_index)
+        point = control_points[self.selected_function_point_index]
+        self.function_point_x_var.set(f"{float(point[0]):.3f}")
+        self.function_point_y_var.set(f"{float(point[1]):.3f}")
+
+    def _on_function_point_list_select(self, _event: Any) -> None:
+        cut = self._selected_cut()
+        if cut is None or not self._cut_is_function_curve(cut):
+            return
+        selection = self.function_point_listbox.curselection()
+        if not selection:
+            return
+        control_points = self._function_control_points(cut)
+        index = int(selection[0])
+        if index >= len(control_points):
+            return
+        self.selected_function_point_index = index
+        point = control_points[index]
+        self.function_point_x_var.set(f"{float(point[0]):.3f}")
+        self.function_point_y_var.set(f"{float(point[1]):.3f}")
+
+    def _apply_selected_function_control_point(self) -> None:
+        cut = self._selected_editable_cut("edit function point")
+        if cut is None or not self._cut_is_function_curve(cut):
+            return
+        control_points = self._function_control_points(cut)
+        index = self.selected_function_point_index
+        if index is None or index < 0 or index >= len(control_points):
+            self._set_status("Select a function point first.")
+            return
+        x_value = self._parse_float_var(self.function_point_x_var.get(), "function point x")
+        y_value = self._parse_float_var(self.function_point_y_var.get(), "function point y")
+        if x_value is None or y_value is None:
+            return
+        control_points[index] = clamp_point((float(x_value), float(y_value)), self.nx, self.ny)
+        render_point_count = max(self._safe_int_text(self.function_cut_points_var.get(), 0), 2)
+        try:
+            normalized_expression, curve_points, function_meta = (
+                self._build_function_curve_from_control_points(
+                    str(self.function_cut_expression_var.get() or getattr(cut, "function_expr", "")),
+                    control_points,
+                    render_point_count,
+                    initial_params=dict(getattr(cut, "function_params", {}) or {}),
+                )
+            )
+        except Exception as exc:
+            self._set_status(f"Could not refit after editing the point: {exc}")
+            return
+        self._apply_curve_cut_geometry(
+            cut,
+            curve_points,
+            f"Updated function point {index + 1} of {cut.name}.",
+            curve_fit="function",
+            function_meta=function_meta,
+        )
+        self.function_cut_expression_var.set(normalized_expression)
+
+    def _remove_selected_function_control_point(self) -> None:
+        cut = self._selected_editable_cut("remove function point")
+        if cut is None or not self._cut_is_function_curve(cut):
+            return
+        control_points = self._function_control_points(cut)
+        index = self.selected_function_point_index
+        if index is None or index < 0 or index >= len(control_points):
+            self._set_status("Select a function point first.")
+            return
+        remaining = [point for idx, point in enumerate(control_points) if idx != index]
+        param_count = len(
+            self._function_parameter_names_from_expression(
+                str(self.function_cut_expression_var.get() or getattr(cut, "function_expr", ""))
+            )
+        )
+        if len(remaining) < max(param_count, 2):
+            self._set_status(
+                f"Need at least {max(param_count, 2)} point(s) to keep fitting this function."
+            )
+            return
+        render_point_count = max(self._safe_int_text(self.function_cut_points_var.get(), 0), 2)
+        try:
+            normalized_expression, curve_points, function_meta = (
+                self._build_function_curve_from_control_points(
+                    str(self.function_cut_expression_var.get() or getattr(cut, "function_expr", "")),
+                    remaining,
+                    render_point_count,
+                    initial_params=dict(getattr(cut, "function_params", {}) or {}),
+                )
+            )
+        except Exception as exc:
+            self._set_status(f"Could not refit after removing the point: {exc}")
+            return
+        self.selected_function_point_index = max(0, min(index, len(remaining) - 1))
+        self._apply_curve_cut_geometry(
+            cut,
+            curve_points,
+            f"Removed a function control point from {cut.name}.",
+            curve_fit="function",
+            function_meta=function_meta,
+        )
+        self.function_cut_expression_var.set(normalized_expression)
+
+    def _prompt_curve_cut_fit_mode(self) -> str | None:
+        top = self.tk.Toplevel(self.root)
+        top.title("Curved Cut Fit")
+        top.transient(self.root)
+        top.grab_set()
+        top.resizable(False, False)
+
+        choice: dict[str, str | None] = {"mode": None}
+
+        def close_with(mode: str | None) -> None:
+            choice["mode"] = mode
+            if top.winfo_exists():
+                top.destroy()
+
+        frame = self.ttk.Frame(top, padding=14)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+
+        self.ttk.Label(
+            frame,
+            text="Como quieres ajustar los puntos del curved cut?",
+            justify="left",
+            wraplength=380,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        self.ttk.Label(
+            frame,
+            text=(
+                "Polyline = sigue los puntos tal como fueron dibujados.\n"
+                "Quadratic/Cubic = ajuste polinomico parametrico y sampling subpixel."
+            ),
+            justify="left",
+            wraplength=380,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        self.ttk.Button(
+            frame,
+            text="Polyline",
+            command=lambda: close_with("polyline"),
+        ).grid(row=2, column=0, sticky="ew", padx=(0, 6), pady=(12, 0))
+        self.ttk.Button(
+            frame,
+            text="Quadratic",
+            command=lambda: close_with("quadratic"),
+        ).grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=(12, 0))
+        self.ttk.Button(
+            frame,
+            text="Cubic",
+            command=lambda: close_with("cubic"),
+        ).grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(8, 0))
+        self.ttk.Button(
+            frame,
+            text="Cancelar",
+            command=lambda: close_with(None),
+        ).grid(row=3, column=1, sticky="ew", padx=(6, 0), pady=(8, 0))
+
+        top.protocol("WM_DELETE_WINDOW", lambda: close_with(None))
+        top.bind("<Escape>", lambda _event: close_with(None))
+        top.bind("<Return>", lambda _event: close_with("cubic"))
+        top.update_idletasks()
+        top.focus_set()
+        self.root.wait_window(top)
+        return choice["mode"]
+
+    def _build_curve_cut_points(
+        self,
+        control_points: list[tuple[float, float]],
+        fit_mode: str,
+    ) -> list[tuple[float, float]]:
+        points = [clamp_point(point, self.nx, self.ny) for point in control_points]
+        if len(points) < 2 or polyline_length(points) < 1.0:
+            raise ValueError("Curved cut needs at least two separated points.")
+
+        arc_lengths = polyline_arc_lengths(points)
+        total_length = max(float(arc_lengths[-1]) if len(arc_lengths) else 0.0, 1.0)
+        sample_count = max(int(round(total_length * 3.0)) + 1, 48)
+
+        if str(fit_mode) == "polyline":
+            sample_distances = np.linspace(0.0, total_length, sample_count, dtype=np.float64)
+            sampled_points = [
+                clamp_point(
+                    polyline_point_at_length(points, arc_lengths, float(distance_value)),
+                    self.nx,
+                    self.ny,
+                )
+                for distance_value in sample_distances
+            ]
+        else:
+            xs = np.asarray([float(point[0]) for point in points], dtype=np.float64)
+            ys = np.asarray([float(point[1]) for point in points], dtype=np.float64)
+            if total_length <= 1e-9:
+                params = np.linspace(0.0, 1.0, len(points), dtype=np.float64)
+            else:
+                params = arc_lengths / total_length
+            degree = 2 if str(fit_mode) == "quadratic" else 3
+            degree = max(1, min(int(degree), len(points) - 1))
+            x_coeff = np.polyfit(params, xs, deg=degree)
+            y_coeff = np.polyfit(params, ys, deg=degree)
+            sample_params = np.linspace(0.0, 1.0, sample_count, dtype=np.float64)
+            sampled_points = [
+                clamp_point(
+                    (
+                        float(np.polyval(x_coeff, param_value)),
+                        float(np.polyval(y_coeff, param_value)),
+                    ),
+                    self.nx,
+                    self.ny,
+                )
+                for param_value in sample_params
+            ]
+
+        normalized: list[tuple[float, float]] = []
+        for point in sampled_points:
+            if normalized and distance(normalized[-1], point) < 0.35:
+                continue
+            normalized.append((float(point[0]), float(point[1])))
+        if len(normalized) < 2 or polyline_length(normalized) < 1.0:
+            raise ValueError("Curved cut fit collapsed to a too-short geometry.")
+        return normalized
+
+    def _start_draw_curve_cut(self) -> None:
+        self._cancel_function_cut_draw()
+        self._cancel_feature_axis_draw()
+        self.draw_mode = False
+        self.force_new_cut = False
+        self.pending_point = None
+        self.hover_point = None
+        self.drag_state = None
+        self.curve_cut_draw_mode = True
+        self.curve_cut_pending_points = []
+        self.curve_cut_hover_point = None
+        self._set_status(
+            "Curved cut mode: left-click to add points. Finish Curved or right-click closes it."
+        )
+        self.refresh_map()
+
+    def _cancel_curve_cut_draw(self) -> None:
+        if not self.curve_cut_draw_mode and not self.curve_cut_pending_points:
+            return
+        self.curve_cut_draw_mode = False
+        self.curve_cut_pending_points = []
+        self.curve_cut_hover_point = None
+        self._set_status("Curved cut drawing cancelled.")
+        self.refresh_map()
+
+    def _append_curve_cut_point(self, x: float, y: float) -> None:
+        point = clamp_point((x, y), self.nx, self.ny)
+        if self.curve_cut_pending_points and distance(self.curve_cut_pending_points[-1], point) < 1.0:
+            self._set_status("Choose a point farther away to define the curved cut.")
+            return
+        self.curve_cut_pending_points.append(point)
+        self.curve_cut_hover_point = point
+        self._set_status(
+            f"Added curved-cut point {len(self.curve_cut_pending_points)} at ({point[0]:.1f}, {point[1]:.1f})."
+        )
+        self.refresh_map()
+
+    def _finish_pending_curve_cut(self) -> None:
+        if not self.curve_cut_draw_mode and not self.curve_cut_pending_points:
+            self._set_status("No curved cut is being drawn.")
+            return
+        normalized_points: list[tuple[float, float]] = []
+        for point in self.curve_cut_pending_points:
+            clamped = clamp_point(point, self.nx, self.ny)
+            if normalized_points and distance(normalized_points[-1], clamped) < 1.0:
+                continue
+            normalized_points.append(clamped)
+        if len(normalized_points) < 2 or polyline_length(normalized_points) < 1.0:
+            self._set_status("Curved cut is too short; add at least two separated points.")
+            return
+        fit_mode = self._prompt_curve_cut_fit_mode()
+        if fit_mode is None:
+            self._set_status("Curved cut creation cancelled.")
+            return
+        try:
+            sampled_points = self._build_curve_cut_points(normalized_points, fit_mode)
+        except ValueError as exc:
+            self._set_status(str(exc))
+            return
+        cut = self._create_cut(sampled_points[0], sampled_points[-1])
+        cut.mode = "curve"
+        cut.curve_fit = str(fit_mode)
+        cut.curve_points = [(float(point[0]), float(point[1])) for point in sampled_points]
+        self._clear_cut_function_metadata(cut)
+        panel = self.active_panel
+        panel.cut_id = cut.cut_id
+        self._seed_cut_td_params_from_panel(cut.cut_id, panel)
+        self.selected_cut_id = cut.cut_id
+        self.curve_cut_draw_mode = False
+        self.curve_cut_pending_points = []
+        self.curve_cut_hover_point = None
+        self._invalidate_cut_dependents(cut.cut_id)
+        self._record_session_change()
+        self.refresh_all()
+        self._set_status(
+            f"Created curved cut {cut.name} with fit={fit_mode} and {len(sampled_points)} sampled points."
+        )
+
     def _create_feature_axis(
         self, points: list[tuple[float, float]], mode: str
     ) -> FeatureAxis:
@@ -12595,6 +19321,8 @@ class TDMosaicApp:
         return axis
 
     def _start_draw_feature_axis(self, mode: str) -> None:
+        self._cancel_function_cut_draw()
+        self._cancel_curve_cut_draw()
         self.draw_mode = False
         self.force_new_cut = False
         self.pending_point = None
@@ -12782,6 +19510,8 @@ class TDMosaicApp:
         self._set_status(message)
 
     def _start_draw_cut(self) -> None:
+        self._cancel_function_cut_draw()
+        self._cancel_curve_cut_draw()
         self._cancel_feature_axis_draw()
         self.draw_mode = True
         self.force_new_cut = False
@@ -12794,6 +19524,8 @@ class TDMosaicApp:
         self.refresh_map()
 
     def _start_add_cut(self) -> None:
+        self._cancel_function_cut_draw()
+        self._cancel_curve_cut_draw()
         self._cancel_feature_axis_draw()
         self.draw_mode = True
         self.force_new_cut = True
@@ -12844,6 +19576,10 @@ class TDMosaicApp:
                 else:
                     cut.p0 = p0
                     cut.p1 = p1
+                    cut.mode = "line"
+                    cut.curve_fit = "line"
+                    cut.curve_points = []
+                    self._clear_cut_function_metadata(cut)
         else:
             cut = self._create_cut(p0, p1)
             panel.cut_id = cut.cut_id
@@ -12860,6 +19596,12 @@ class TDMosaicApp:
         self._set_status(f"{cut.name} assigned to {panel.name}.")
 
     def _cancel_pending_cut(self) -> None:
+        if self.function_cut_draw_mode or self.function_cut_pending_points:
+            self._cancel_function_cut_draw()
+            return
+        if self.curve_cut_draw_mode or self.curve_cut_pending_points:
+            self._cancel_curve_cut_draw()
+            return
         if self.feature_draw_mode is not None or self.feature_pending_points:
             self._cancel_feature_axis_draw()
             return
@@ -12896,6 +19638,31 @@ class TDMosaicApp:
             "p0": preview_cut.p0,
             "p1": preview_cut.p1,
             "color": cut.color,
+            "mode": str(getattr(preview_cut, "mode", "line")),
+            "curve_fit": str(getattr(preview_cut, "curve_fit", "line")),
+            "curve_points": [
+                [float(point[0]), float(point[1])]
+                for point in (getattr(preview_cut, "curve_points", []) or [])
+            ],
+            "function_expr": str(getattr(preview_cut, "function_expr", "") or ""),
+            "function_x_start": float(
+                getattr(preview_cut, "function_x_start", preview_cut.p0[0])
+            ),
+            "function_x_end": float(
+                getattr(preview_cut, "function_x_end", preview_cut.p1[0])
+            ),
+            "function_point_count": max(
+                int(getattr(preview_cut, "function_point_count", 0) or 0),
+                0,
+            ),
+            "function_control_points": [
+                [float(point[0]), float(point[1])]
+                for point in (getattr(preview_cut, "function_control_points", []) or [])
+            ],
+            "function_params": {
+                str(key): float(value)
+                for key, value in dict(getattr(preview_cut, "function_params", {}) or {}).items()
+            },
         }
         self._set_status(f"Copied {cut.name}.")
 
@@ -12910,6 +19677,57 @@ class TDMosaicApp:
             clamp_point((p0[0] + 3.0, p0[1] + 3.0), self.nx, self.ny),
             clamp_point((p1[0] + 3.0, p1[1] + 3.0), self.nx, self.ny),
         )
+        if str(self.clipboard_cut.get("mode", "line")) == "curve":
+            curve_points = [
+                clamp_point((float(point[0]) + 3.0, float(point[1]) + 3.0), self.nx, self.ny)
+                for point in (self.clipboard_cut.get("curve_points") or [])
+            ]
+            if len(curve_points) >= 2:
+                pasted_fit = str(self.clipboard_cut.get("curve_fit", "polyline"))
+                if pasted_fit == "function":
+                    shifted_control_points = [
+                        clamp_point(
+                            (float(point[0]) + 3.0, float(point[1]) + 3.0),
+                            self.nx,
+                            self.ny,
+                        )
+                        for point in (self.clipboard_cut.get("function_control_points") or [])
+                    ]
+                    function_expr = str(self.clipboard_cut.get("function_expr", "") or "")
+                    function_params = dict(self.clipboard_cut.get("function_params") or {})
+                    render_point_count = max(
+                        int(self.clipboard_cut.get("function_point_count", len(curve_points)) or 0),
+                        2,
+                    )
+                    if function_expr and len(shifted_control_points) >= 2:
+                        try:
+                            _expr, refit_curve_points, function_meta = (
+                                self._build_function_curve_from_control_points(
+                                    function_expr,
+                                    shifted_control_points,
+                                    render_point_count,
+                                    initial_params=function_params,
+                                )
+                            )
+                            updated, _limited = self._set_curve_cut_geometry(
+                                new_cut,
+                                refit_curve_points,
+                                curve_fit="function",
+                                function_meta=function_meta,
+                            )
+                            if not updated:
+                                pasted_fit = "polyline"
+                        except Exception:
+                            pasted_fit = "polyline"
+                    else:
+                        pasted_fit = "polyline"
+                if pasted_fit != "function":
+                    new_cut.mode = "curve"
+                    new_cut.curve_fit = pasted_fit
+                    new_cut.curve_points = [(float(point[0]), float(point[1])) for point in curve_points]
+                    new_cut.p0 = new_cut.curve_points[0]
+                    new_cut.p1 = new_cut.curve_points[-1]
+                    self._clear_cut_function_metadata(new_cut)
         panel = self.active_panel
         panel.cut_id = new_cut.cut_id
         self._seed_cut_td_params_from_panel(new_cut.cut_id, panel)
@@ -12960,18 +19778,39 @@ class TDMosaicApp:
         self, x: float, y: float
     ) -> tuple[str, int] | None:
         ordered = []
-        if self.selected_cut_id is not None and self.selected_cut_id in self.cuts:
+        map_cut_ids, _map_note = self._main_map_cut_ids()
+        map_cut_lookup = {int(cut_id) for cut_id in map_cut_ids}
+        if (
+            self.selected_cut_id is not None
+            and self.selected_cut_id in self.cuts
+            and int(self.selected_cut_id) in map_cut_lookup
+        ):
             ordered.append(self.cuts[self.selected_cut_id])
-        for cut in self.cuts.values():
-            if self.selected_cut_id == cut.cut_id:
+        for cut_id in map_cut_ids:
+            if self.selected_cut_id == cut_id:
                 continue
-            ordered.append(cut)
+            ordered.append(self.cuts[int(cut_id)])
 
         best: tuple[float, str, int] | None = None
         for cut in ordered:
             if not cut.visible:
                 continue
             preview_cut = self._cut_preview(cut.cut_id) or cut
+            if self._cut_is_curve(preview_cut):
+                points = cut_polyline_points(preview_cut)
+                best_curve_dist: float | None = None
+                for idx in range(len(points) - 1):
+                    dist_value = distance_point_to_segment(
+                        (x, y),
+                        points[idx],
+                        points[idx + 1],
+                    )
+                    if best_curve_dist is None or dist_value < best_curve_dist:
+                        best_curve_dist = float(dist_value)
+                if best_curve_dist is not None and best_curve_dist <= 3.0:
+                    if best is None or best_curve_dist < best[0]:
+                        best = (best_curve_dist, "line", cut.cut_id)
+                continue
             d0 = distance((x, y), preview_cut.p0)
             d1 = distance((x, y), preview_cut.p1)
             ds = distance_point_to_segment((x, y), preview_cut.p0, preview_cut.p1)
@@ -13018,6 +19857,28 @@ class TDMosaicApp:
         x, y = self._map_display_to_data(x, y)
         x = clamp_value(x, 0.0, self.nx - 1.0)
         y = clamp_value(y, 0.0, self.ny - 1.0)
+
+        if self.function_cut_draw_mode:
+            if button == 3:
+                if len(self.function_cut_pending_points) >= 2:
+                    self._finish_pending_function_cut()
+                else:
+                    self._cancel_function_cut_draw()
+                return
+            if button == 1:
+                self._append_function_cut_point(x, y)
+            return
+
+        if self.curve_cut_draw_mode:
+            if button == 3:
+                if len(self.curve_cut_pending_points) >= 2:
+                    self._finish_pending_curve_cut()
+                else:
+                    self._cancel_curve_cut_draw()
+                return
+            if button == 1:
+                self._append_curve_cut_point(x, y)
+            return
 
         if self.feature_draw_mode is not None:
             if button == 3:
@@ -13068,6 +19929,14 @@ class TDMosaicApp:
         x, y = self._map_display_to_data(float(event.xdata), float(event.ydata))
         x = clamp_value(x, 0.0, self.nx - 1.0)
         y = clamp_value(y, 0.0, self.ny - 1.0)
+        if self.function_cut_draw_mode:
+            self.function_cut_hover_point = (x, y)
+            self.refresh_map()
+            return
+        if self.curve_cut_draw_mode:
+            self.curve_cut_hover_point = (x, y)
+            self.refresh_map()
+            return
         if self.feature_draw_mode is not None:
             self.feature_hover_point = (x, y)
             self.refresh_map()
@@ -13086,6 +19955,17 @@ class TDMosaicApp:
             return
 
         part = self.drag_state["part"]
+        if self._cut_is_curve(cut):
+            last_x, last_y = self.drag_state["last"]
+            dx = x - last_x
+            dy = y - last_y
+            if not self._shift_curve_cut_geometry(cut, dx, dy):
+                return
+            self.drag_state["last"] = (x, y)
+            self.drag_state["dirty"] = True
+            self._invalidate_cut_dependents(cut.cut_id)
+            self.refresh_all()
+            return
         preview_cut = self._cut_preview(cut.cut_id) or cut
         if part == "p0":
             new_p0, new_p1 = (x, y), preview_cut.p1
@@ -13140,6 +20020,8 @@ class TDMosaicApp:
         if self.map_swap_xy_var.get():
             frame = frame.T
         vmin, vmax = frame_limits(frame)
+        active_experiment = self._selected_experiment()
+        active_experiment_cut_lookup = self._experiment_cut_lookup(active_experiment)
 
         ax = self.map_ax
         ax.clear()
@@ -13190,8 +20072,10 @@ class TDMosaicApp:
                 bbox={"facecolor": "white", "alpha": 0.55, "edgecolor": "none"},
             )
 
-        for cut in self.cuts.values():
-            if not cut.visible:
+        map_cut_ids, map_cut_note = self._main_map_cut_ids()
+        for cut_id in map_cut_ids:
+            cut = self.cuts.get(int(cut_id))
+            if cut is None or not cut.visible:
                 continue
             preview_cut = self._cut_preview(cut.cut_id) or cut
             is_selected = cut.cut_id == self.selected_cut_id
@@ -13199,14 +20083,28 @@ class TDMosaicApp:
             alpha = 1.0 if is_selected else 0.85
             p0_disp = self._map_data_to_display(preview_cut.p0[0], preview_cut.p0[1])
             p1_disp = self._map_data_to_display(preview_cut.p1[0], preview_cut.p1[1])
-            ax.plot(
-                [p0_disp[0], p1_disp[0]],
-                [p0_disp[1], p1_disp[1]],
-                color=cut.color,
-                linewidth=lw,
-                alpha=alpha,
-                linestyle="--" if self._cut_dynamic_enabled(cut.cut_id) else "-",
-            )
+            if self._cut_is_curve(preview_cut):
+                display_points = [
+                    self._map_data_to_display(point[0], point[1])
+                    for point in cut_polyline_points(preview_cut)
+                ]
+                ax.plot(
+                    [point[0] for point in display_points],
+                    [point[1] for point in display_points],
+                    color=cut.color,
+                    linewidth=lw,
+                    alpha=alpha,
+                    linestyle="-",
+                )
+            else:
+                ax.plot(
+                    [p0_disp[0], p1_disp[0]],
+                    [p0_disp[1], p1_disp[1]],
+                    color=cut.color,
+                    linewidth=lw,
+                    alpha=alpha,
+                    linestyle="--" if self._cut_dynamic_enabled(cut.cut_id) else "-",
+                )
             ax.scatter(
                 [p0_disp[0], p1_disp[0]],
                 [p0_disp[1], p1_disp[1]],
@@ -13216,16 +20114,34 @@ class TDMosaicApp:
             )
             mid_x = 0.5 * (p0_disp[0] + p1_disp[0])
             mid_y = 0.5 * (p0_disp[1] + p1_disp[1])
-            ax.text(
-                mid_x,
-                mid_y,
-                cut.name + (" [dyn]" if self._cut_dynamic_enabled(cut.cut_id) else ""),
-                color=cut.color,
-                fontsize=8,
-                ha="center",
-                va="bottom",
-                bbox={"facecolor": "white", "alpha": 0.55, "edgecolor": "none"},
-            )
+            if int(cut.cut_id) not in active_experiment_cut_lookup:
+                ax.text(
+                    mid_x,
+                    mid_y,
+                    cut.name + (" [dyn]" if self._cut_dynamic_enabled(cut.cut_id) else ""),
+                    color=cut.color,
+                    fontsize=8,
+                    ha="center",
+                    va="bottom",
+                    bbox={"facecolor": "white", "alpha": 0.55, "edgecolor": "none"},
+                    zorder=6,
+                )
+            if is_selected and self._cut_is_function_curve(preview_cut):
+                function_points = self._function_control_points(preview_cut)
+                if function_points:
+                    display_function_points = [
+                        self._map_data_to_display(point[0], point[1])
+                        for point in function_points
+                    ]
+                    ax.scatter(
+                        [point[0] for point in display_function_points],
+                        [point[1] for point in display_function_points],
+                        facecolors="white",
+                        edgecolors=cut.color,
+                        s=42,
+                        linewidths=1.4,
+                        zorder=5,
+                    )
 
         if self.pending_point is not None:
             pending_disp = self._map_data_to_display(
@@ -13249,6 +20165,42 @@ class TDMosaicApp:
                     color="yellow",
                     linestyle="--",
                     linewidth=1.5,
+                    alpha=0.9,
+                )
+
+        if self.function_cut_pending_points:
+            function_display_points = [
+                self._map_data_to_display(point[0], point[1])
+                for point in self.function_cut_pending_points
+            ]
+            ax.scatter(
+                [point[0] for point in function_display_points],
+                [point[1] for point in function_display_points],
+                color="limegreen",
+                s=38,
+                zorder=5,
+            )
+            if len(function_display_points) >= 2:
+                ax.plot(
+                    [point[0] for point in function_display_points],
+                    [point[1] for point in function_display_points],
+                    color="limegreen",
+                    linewidth=1.4,
+                    linestyle="--",
+                    alpha=0.9,
+                )
+            if self.function_cut_hover_point is not None and function_display_points:
+                hover_disp = self._map_data_to_display(
+                    self.function_cut_hover_point[0],
+                    self.function_cut_hover_point[1],
+                )
+                last_disp = function_display_points[-1]
+                ax.plot(
+                    [last_disp[0], hover_disp[0]],
+                    [last_disp[1], hover_disp[1]],
+                    color="limegreen",
+                    linewidth=1.1,
+                    linestyle=":",
                     alpha=0.9,
                 )
 
@@ -13289,6 +20241,41 @@ class TDMosaicApp:
                     alpha=0.9,
                 )
 
+        if self.curve_cut_pending_points:
+            curve_display_points = [
+                self._map_data_to_display(point[0], point[1])
+                for point in self.curve_cut_pending_points
+            ]
+            ax.plot(
+                [point[0] for point in curve_display_points],
+                [point[1] for point in curve_display_points],
+                color="gold",
+                linewidth=2.1,
+                linestyle="--",
+                alpha=0.95,
+            )
+            ax.scatter(
+                [point[0] for point in curve_display_points],
+                [point[1] for point in curve_display_points],
+                color="gold",
+                s=34,
+                zorder=4,
+            )
+            if self.curve_cut_hover_point is not None:
+                hover_disp = self._map_data_to_display(
+                    self.curve_cut_hover_point[0],
+                    self.curve_cut_hover_point[1],
+                )
+                last_disp = curve_display_points[-1]
+                ax.plot(
+                    [last_disp[0], hover_disp[0]],
+                    [last_disp[1], hover_disp[1]],
+                    color="gold",
+                    linewidth=1.1,
+                    linestyle=":",
+                    alpha=0.9,
+                )
+
         disp_nx, disp_ny = self._map_display_shape()
         if self.map_flip_x_var.get():
             ax.set_xlim(disp_nx - 0.5, -0.5)
@@ -13306,7 +20293,7 @@ class TDMosaicApp:
         else:
             ax.set_xlabel("x [pixel]")
             ax.set_ylabel("y [pixel]")
-        ax.set_title(f"Map at t={int(self.t_visual_var.get())}")
+        ax.set_title(f"Map at t={int(self.t_visual_var.get())}{map_cut_note}")
 
     def _panel_td(self, panel: TDPanel) -> tuple[np.ndarray | None, dict[str, Any] | None]:
         if panel.cut_id is None or panel.cut_id not in self.cuts:
@@ -13600,6 +20587,253 @@ class TDMosaicApp:
         if panel is None or panel.cut_id is None or panel.cut_id not in self.cuts:
             return None
         return cut_cache_key(self.cuts[panel.cut_id], panel) + self._cut_geometry_signature(panel.cut_id)
+
+    def _td_window_plot_to_td_coords(
+        self, panel_id: int, event: Any
+    ) -> tuple[float, float] | None:
+        existing = self.td_windows.get(panel_id)
+        if (
+            existing is None
+            or event.inaxes is not existing.get("ax")
+            or event.xdata is None
+            or event.ydata is None
+        ):
+            return None
+        if self.td_swap_axes_var.get():
+            return float(event.xdata), float(event.ydata)
+        return float(event.ydata), float(event.xdata)
+
+    def _build_velocity_trace_record(
+        self,
+        panel_id: int,
+        trace_id: int,
+        start_t: float,
+        start_d: float,
+        end_t: float,
+        end_d: float,
+    ) -> dict[str, Any]:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            raise ValueError("Velocity trace window is not available.")
+        cad_s = self._safe_float_text(
+            existing["crest_cad_var"].get(), DEFAULT_CREST_TRACKING["cad"]
+        )
+        res_arcsec_px = self._safe_float_text(
+            existing["crest_res_var"].get(), DEFAULT_CREST_TRACKING["res"]
+        )
+        km_per_arcsec = self._safe_float_text(
+            existing["wavelet_km_per_arcsec_var"].get(),
+            DEFAULT_WAVELET_FILTER["km_per_arcsec"],
+        )
+        delta_frames = float(end_t) - float(start_t)
+        if abs(delta_frames) <= 1e-6:
+            raise ValueError("Velocity traces need a non-zero time span.")
+        delta_dist_px = float(end_d) - float(start_d)
+        duration_s = abs(delta_frames) * max(float(cad_s), 0.0)
+        speed_px_frame = delta_dist_px / delta_frames
+        speed_px_s = (
+            float("nan") if cad_s <= 0.0 else delta_dist_px / (delta_frames * cad_s)
+        )
+        speed_arcsec_s = (
+            float("nan")
+            if not np.isfinite(speed_px_s) or res_arcsec_px <= 0.0
+            else speed_px_s * res_arcsec_px
+        )
+        speed_km_s = (
+            float("nan")
+            if not np.isfinite(speed_arcsec_s) or km_per_arcsec <= 0.0
+            else speed_arcsec_s * km_per_arcsec
+        )
+        return {
+            "trace_id": int(trace_id),
+            "label": f"V{int(trace_id):02d}",
+            "t0": float(start_t),
+            "d0": float(start_d),
+            "t1": float(end_t),
+            "d1": float(end_d),
+            "delta_frames": float(delta_frames),
+            "delta_dist_px": float(delta_dist_px),
+            "duration_s": float(duration_s),
+            "speed_px_frame": float(speed_px_frame),
+            "speed_px_s": float(speed_px_s),
+            "speed_arcsec_s": float(speed_arcsec_s),
+            "speed_km_s": float(speed_km_s),
+            "speed_km_s_abs": float(abs(speed_km_s)) if np.isfinite(speed_km_s) else float("nan"),
+            "cad_s": float(cad_s),
+            "res_arcsec_px": float(res_arcsec_px),
+            "km_per_arcsec": float(km_per_arcsec),
+        }
+
+    def _refresh_td_window_velocity_trace_table(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            return
+        tree = existing.get("velocity_trace_tree")
+        summary_var = existing.get("velocity_trace_summary_var")
+        if tree is None or summary_var is None:
+            return
+        children = tree.get_children()
+        if children:
+            tree.delete(*children)
+        traces = [
+            dict(item) for item in (existing.get("velocity_traces") or []) if isinstance(item, dict)
+        ]
+        selected_id = existing.get("velocity_selected_trace_id")
+        visible_ids: list[int] = []
+        for trace in traces:
+            trace_id = int(trace.get("trace_id", -1))
+            visible_ids.append(trace_id)
+            tree.insert(
+                "",
+                "end",
+                iid=f"velocity-{trace_id}",
+                values=(
+                    str(trace_id),
+                    str(trace.get("label") or f"V{trace_id:02d}"),
+                    f"{float(trace.get('t0', float('nan'))):.2f}",
+                    f"{float(trace.get('t1', float('nan'))):.2f}",
+                    f"{float(trace.get('d0', float('nan'))):.2f}",
+                    f"{float(trace.get('d1', float('nan'))):.2f}",
+                    f"{float(trace.get('speed_px_frame', float('nan'))):.3f}",
+                    f"{float(trace.get('speed_km_s', float('nan'))):.3f}",
+                ),
+            )
+        if selected_id not in visible_ids:
+            selected_id = visible_ids[0] if visible_ids else None
+            existing["velocity_selected_trace_id"] = selected_id
+        if selected_id is not None:
+            iid = f"velocity-{int(selected_id)}"
+            if iid in tree.get_children():
+                tree.selection_set(iid)
+                tree.focus(iid)
+        draw_mode = bool(existing.get("velocity_trace_draw_mode"))
+        pending = existing.get("velocity_trace_pending")
+        summary_var.set(
+            f"Velocity traces: {len(traces)} | draw mode={'on' if draw_mode else 'off'}"
+            + (" | select two TD points" if draw_mode and pending is None else "")
+            + (" | choose the second TD point" if draw_mode and pending is not None else "")
+        )
+
+    def _toggle_td_window_velocity_trace_mode(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        panel = self._td_window_panel(panel_id)
+        if existing is None or panel is None:
+            return
+        enabled = not bool(existing.get("velocity_trace_draw_mode", False))
+        existing["velocity_trace_draw_mode"] = enabled
+        existing["velocity_trace_pending"] = None
+        existing["velocity_trace_hover"] = None
+        button_var = existing.get("velocity_trace_button_var")
+        if button_var is not None:
+            button_var.set("Cancel draw" if enabled else "Draw velocity trace")
+        self._refresh_td_window_velocity_trace_table(panel_id)
+        self._refresh_td_window(panel_id)
+        self._set_status(
+            (
+                f"{panel.name}: click two TD points to define a velocity trace."
+                if enabled
+                else f"{panel.name}: velocity trace draw mode cancelled."
+            )
+        )
+
+    def _delete_td_window_selected_velocity_trace(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        panel = self._td_window_panel(panel_id)
+        if existing is None or panel is None:
+            return
+        selected_id = existing.get("velocity_selected_trace_id")
+        if selected_id is None:
+            self._set_status(f"Select a velocity trace first in {panel.name}.")
+            return
+        traces = [
+            dict(item)
+            for item in (existing.get("velocity_traces") or [])
+            if isinstance(item, dict)
+        ]
+        new_traces = [
+            trace for trace in traces if int(trace.get("trace_id", -1)) != int(selected_id)
+        ]
+        if len(new_traces) == len(traces):
+            self._set_status(f"Selected velocity trace is no longer available in {panel.name}.")
+            return
+        existing["velocity_traces"] = new_traces
+        existing["velocity_selected_trace_id"] = (
+            int(new_traces[0]["trace_id"]) if new_traces else None
+        )
+        self._record_session_change()
+        self._refresh_td_window_velocity_trace_table(panel_id)
+        self._refresh_td_window(panel_id)
+        self._set_status(f"Deleted velocity trace {int(selected_id)} from {panel.name}.")
+
+    def _clear_td_window_velocity_traces(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        panel = self._td_window_panel(panel_id)
+        if existing is None or panel is None:
+            return
+        existing["velocity_traces"] = []
+        existing["velocity_selected_trace_id"] = None
+        existing["velocity_trace_draw_mode"] = False
+        existing["velocity_trace_pending"] = None
+        existing["velocity_trace_hover"] = None
+        button_var = existing.get("velocity_trace_button_var")
+        if button_var is not None:
+            button_var.set("Draw velocity trace")
+        self._record_session_change()
+        self._refresh_td_window_velocity_trace_table(panel_id)
+        self._refresh_td_window(panel_id)
+        self._set_status(f"Cleared manual velocity traces for {panel.name}.")
+
+    def _on_td_window_velocity_trace_select(self, panel_id: int, _event: Any = None) -> None:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            return
+        tree = existing.get("velocity_trace_tree")
+        if tree is None:
+            return
+        selection = tree.selection()
+        if not selection:
+            existing["velocity_selected_trace_id"] = None
+        else:
+            try:
+                existing["velocity_selected_trace_id"] = int(str(selection[0]).split("-", 1)[1])
+            except Exception:
+                existing["velocity_selected_trace_id"] = None
+        self._refresh_td_window(panel_id)
+
+    def _draw_td_window_velocity_traces(self, ax: Any, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            return
+        selected_id = existing.get("velocity_selected_trace_id")
+        for trace in existing.get("velocity_traces") or []:
+            if not isinstance(trace, dict):
+                continue
+            trace_id = int(trace.get("trace_id", -1))
+            color = "gold" if trace_id == selected_id else "deepskyblue"
+            linewidth = 2.5 if trace_id == selected_id else 1.8
+            alpha = 0.95 if trace_id == selected_id else 0.8
+            t0 = float(trace.get("t0", float("nan")))
+            t1 = float(trace.get("t1", float("nan")))
+            d0 = float(trace.get("d0", float("nan")))
+            d1 = float(trace.get("d1", float("nan")))
+            if not all(np.isfinite(value) for value in (t0, t1, d0, d1)):
+                continue
+            if self.td_swap_axes_var.get():
+                ax.plot([t0, t1], [d0, d1], color=color, linewidth=linewidth, alpha=alpha)
+                ax.text(t1, d1, str(trace.get("label") or f"V{trace_id:02d}"), color=color, fontsize=8)
+            else:
+                ax.plot([d0, d1], [t0, t1], color=color, linewidth=linewidth, alpha=alpha)
+                ax.text(d1, t1, str(trace.get("label") or f"V{trace_id:02d}"), color=color, fontsize=8)
+
+        pending = existing.get("velocity_trace_pending")
+        hover = existing.get("velocity_trace_hover")
+        if pending is not None and hover is not None:
+            start_t, start_d = pending
+            end_t, end_d = hover
+            if self.td_swap_axes_var.get():
+                ax.plot([start_t, end_t], [start_d, end_d], color="yellow", linewidth=1.4, linestyle="--", alpha=0.95)
+            else:
+                ax.plot([start_d, end_d], [start_t, end_t], color="yellow", linewidth=1.4, linestyle="--", alpha=0.95)
 
     def _clear_td_window_wavelet_filter(
         self, panel_id: int, stale: bool = False, refresh: bool = False
@@ -14412,6 +21646,95 @@ class TDMosaicApp:
         )
         return best
 
+    def _keep_best_wavelet_segment_per_source(
+        self,
+        segments: list[dict[str, Any]],
+        params: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        indexed_segments = [
+            (idx, self._clone_wavelet_payload(segment))
+            for idx, segment in enumerate(segments or [])
+        ]
+        grouped: dict[tuple[int, int], list[tuple[int, dict[str, Any]]]] = {}
+        for idx, segment in indexed_segments:
+            key = (
+                int(segment.get("thread_index", -1)),
+                int(segment.get("seg_id", -1)),
+            )
+            grouped.setdefault(key, []).append((idx, segment))
+
+        kept_indices: set[int] = set()
+        removed_count = 0
+        for group_segments in grouped.values():
+            if len(group_segments) == 1:
+                kept_indices.add(group_segments[0][0])
+                continue
+            best_segment = self._best_wavelet_segment(
+                [item[1] for item in group_segments],
+                params=params,
+            )
+            best_idx = group_segments[0][0]
+            if best_segment is not None:
+                for idx, segment in group_segments:
+                    if (
+                        int(segment.get("thread_index", -999))
+                        == int(best_segment.get("thread_index", -1))
+                        and int(segment.get("seg_id", -999))
+                        == int(best_segment.get("seg_id", -1))
+                        and int(segment.get("wseg_id", -999))
+                        == int(best_segment.get("wseg_id", -1))
+                        and int(segment.get("mode_rank", -999))
+                        == int(best_segment.get("mode_rank", -1))
+                    ):
+                        best_idx = idx
+                        break
+            kept_indices.add(best_idx)
+            removed_count += len(group_segments) - 1
+
+        kept_segments = [
+            segment for idx, segment in indexed_segments if idx in kept_indices
+        ]
+        return kept_segments, removed_count
+
+    def _compact_wavelet_segment_row(
+        self, segment: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        analysis = dict(segment or {})
+        return {
+            "thread_index": int(analysis.get("thread_index", -1)),
+            "seg_id": int(analysis.get("seg_id", -1)),
+            "wseg_id": int(analysis.get("wseg_id", -1)),
+            "accepted": bool(analysis.get("accepted")),
+            "has_segment": bool(analysis.get("has_segment")),
+            "decision_reason": str(analysis.get("decision_reason", "") or ""),
+            "decision_warnings": list(analysis.get("decision_warnings") or []),
+            "peak_period_s": float(analysis.get("peak_period_s", float("nan"))),
+            "freq_mhz": float(analysis.get("freq_mhz", float("nan"))),
+            "fit_amp_arcsec": float(analysis.get("fit_amp_arcsec", float("nan"))),
+            "fit_amp_km": float(analysis.get("fit_amp_km", float("nan"))),
+            "velocity_amp_km_s": float(
+                analysis.get("velocity_amp_km_s", float("nan"))
+            ),
+            "specific_energy_j_kg": float(
+                analysis.get("specific_energy_j_kg", float("nan"))
+            ),
+            "energy_flux_w_m2": float(
+                analysis.get("energy_flux_w_m2", float("nan"))
+            ),
+            "duration_s": float(analysis.get("duration_s", float("nan"))),
+            "power_ratio": float(analysis.get("power_ratio", float("nan"))),
+            "fit_rms_over_amp": float(
+                analysis.get(
+                    "fit_rms_over_amp",
+                    analysis.get("rms_amp_ratio", float("nan")),
+                )
+            ),
+            "fit_point_count": int(analysis.get("fit_point_count", 0) or 0),
+            "interp_point_count": int(
+                analysis.get("interp_point_count", 0) or 0
+            ),
+        }
+
     def _lightweight_wavelet_filter_result(
         self,
         *,
@@ -14442,7 +21765,9 @@ class TDMosaicApp:
             "preserved_locked_event_ids": [
                 int(event_id) for event_id in preserved_locked_event_ids
             ],
-            "segments": [],
+            "segments": [
+                self._compact_wavelet_segment_row(segment) for segment in segments
+            ],
         }
 
     def _replacement_wavelet_run_payload(
@@ -14453,9 +21778,14 @@ class TDMosaicApp:
         warnings: list[str] | None = None,
     ) -> dict[str, Any]:
         warning_messages = [str(item) for item in (warnings or []) if str(item)]
-        filtered_segments = [
-            self._clone_wavelet_payload(segment) for segment in (segments or [])
-        ]
+        filtered_segments, removed_count = self._keep_best_wavelet_segment_per_source(
+            segments or [],
+            params=params,
+        )
+        if removed_count > 0:
+            warning_messages.append(
+                f"kept only best fit per source segment: removed {int(removed_count)}"
+            )
         next_event_id = 1
         events: list[dict[str, Any]] = []
         for segment in filtered_segments:
@@ -15608,6 +22938,11 @@ class TDMosaicApp:
                 )
             )
         else:
+            params = (
+                dict(events[0].get("current_params") or events[0].get("base_params") or {})
+                if events
+                else None
+            )
             best_segment = self._best_wavelet_segment(
                 [event.get("analysis") or {} for event in events],
                 params=params,
@@ -16980,6 +24315,61 @@ class TDMosaicApp:
     def _on_td_window_press(self, panel_id: int, event: Any) -> None:
         existing = self.td_windows.get(panel_id)
         panel = self._td_window_panel(panel_id)
+        coords = self._td_window_plot_to_td_coords(panel_id, event)
+        if existing is not None and panel is not None and bool(existing.get("velocity_trace_draw_mode")):
+            if coords is None:
+                return
+            clicked_t, clicked_d = coords
+            pending = existing.get("velocity_trace_pending")
+            if pending is None:
+                existing["velocity_trace_pending"] = (float(clicked_t), float(clicked_d))
+                existing["velocity_trace_hover"] = (float(clicked_t), float(clicked_d))
+                self._refresh_td_window_velocity_trace_table(panel_id)
+                self._refresh_td_window(panel_id)
+                self._set_status(
+                    f"{panel.name}: choose the second TD point for the velocity trace."
+                )
+                return
+            start_t, start_d = pending
+            try:
+                trace = self._build_velocity_trace_record(
+                    panel_id,
+                    int(existing.get("velocity_next_trace_id", 1)),
+                    float(start_t),
+                    float(start_d),
+                    float(clicked_t),
+                    float(clicked_d),
+                )
+            except ValueError as exc:
+                existing["velocity_trace_pending"] = None
+                existing["velocity_trace_hover"] = None
+                self._refresh_td_window_velocity_trace_table(panel_id)
+                self._refresh_td_window(panel_id)
+                self._set_status(str(exc))
+                return
+            traces = [
+                dict(item)
+                for item in (existing.get("velocity_traces") or [])
+                if isinstance(item, dict)
+            ]
+            traces.append(trace)
+            existing["velocity_traces"] = traces
+            existing["velocity_next_trace_id"] = int(trace["trace_id"]) + 1
+            existing["velocity_selected_trace_id"] = int(trace["trace_id"])
+            existing["velocity_trace_draw_mode"] = False
+            existing["velocity_trace_pending"] = None
+            existing["velocity_trace_hover"] = None
+            button_var = existing.get("velocity_trace_button_var")
+            if button_var is not None:
+                button_var.set("Draw velocity trace")
+            self._record_session_change()
+            self._refresh_td_window_velocity_trace_table(panel_id)
+            self._refresh_td_window(panel_id)
+            self._set_status(
+                f"{panel.name}: saved velocity trace {int(trace['trace_id'])} "
+                f"({float(trace['speed_km_s']):.3f} km/s)."
+            )
+            return
         if (
             existing is None
             or panel is None
@@ -17019,6 +24409,13 @@ class TDMosaicApp:
     def _on_td_window_motion(self, panel_id: int, event: Any) -> None:
         existing = self.td_windows.get(panel_id)
         panel = self._td_window_panel(panel_id)
+        if existing is not None and bool(existing.get("velocity_trace_draw_mode")):
+            coords = self._td_window_plot_to_td_coords(panel_id, event)
+            if coords is None:
+                return
+            existing["velocity_trace_hover"] = (float(coords[0]), float(coords[1]))
+            self._refresh_td_window(panel_id)
+            return
         if (
             existing is None
             or panel is None
@@ -17052,6 +24449,8 @@ class TDMosaicApp:
         cut = self._td_window_cut(panel_id, "set detached center")
         if cut is None:
             return
+        if not self._curve_cut_edit_supported(cut, "set detached center"):
+            return
         center_x = self._parse_float_var(existing["center_x_var"].get(), "center x")
         center_y = self._parse_float_var(existing["center_y_var"].get(), "center y")
         if center_x is None or center_y is None:
@@ -17060,11 +24459,10 @@ class TDMosaicApp:
         old_center = cut_center(cut)
         dx = float(center_x) - old_center[0]
         dy = float(center_y) - old_center[1]
-        p0, p1 = shift_cut(cut, dx, dy, self.nx, self.ny)
-        self._apply_cut_points(
+        self._shift_cut_geometry(
             cut,
-            p0,
-            p1,
+            dx,
+            dy,
             f"Moved center of {cut.name} from detached TD window.",
         )
 
@@ -17075,11 +24473,22 @@ class TDMosaicApp:
         cut = self._td_window_cut(panel_id, "apply detached vertices")
         if cut is None:
             return
+        if not self._curve_cut_edit_supported(cut, "apply detached vertices"):
+            return
         x1 = self._parse_float_var(existing["cut_x1_var"].get(), "x1")
         y1 = self._parse_float_var(existing["cut_y1_var"].get(), "y1")
         x2 = self._parse_float_var(existing["cut_x2_var"].get(), "x2")
         y2 = self._parse_float_var(existing["cut_y2_var"].get(), "y2")
         if None in {x1, y1, x2, y2}:
+            return
+
+        if self._cut_is_curve(cut):
+            self._apply_curve_cut_endpoint_mapping(
+                cut,
+                (float(x1), float(y1)),
+                (float(x2), float(y2)),
+                f"Applied detached vertex coordinates to {cut.name}.",
+            )
             return
 
         self._apply_cut_points(
@@ -17095,6 +24504,8 @@ class TDMosaicApp:
             return
         cut = self._td_window_cut(panel_id, "set detached angle")
         if cut is None:
+            return
+        if not self._curve_cut_edit_supported(cut, "set detached angle"):
             return
         angle_deg = self._parse_float_var(existing["cut_angle_var"].get(), "angle")
         if angle_deg is None:
@@ -17114,6 +24525,8 @@ class TDMosaicApp:
         cut = self._td_window_cut(panel_id, "adjust detached angle")
         if cut is None:
             return
+        if not self._curve_cut_edit_supported(cut, "adjust detached angle"):
+            return
         anchor_mode = str(existing["cut_anchor_var"].get()).strip()
         self._set_cut_angle(
             cut,
@@ -17128,6 +24541,8 @@ class TDMosaicApp:
             return
         cut = self._td_window_cut(panel_id, "set detached length")
         if cut is None:
+            return
+        if not self._curve_cut_edit_supported(cut, "set detached length"):
             return
         length_value = self._parse_float_var(existing["cut_length_var"].get(), "length")
         if length_value is None:
@@ -17146,6 +24561,8 @@ class TDMosaicApp:
             return
         cut = self._td_window_cut(panel_id, "adjust detached length")
         if cut is None:
+            return
+        if not self._curve_cut_edit_supported(cut, "adjust detached length"):
             return
         length_mode = str(existing["cut_length_mode_var"].get()).strip()
         self._set_cut_length(
@@ -17972,6 +25389,69 @@ class TDMosaicApp:
             ),
         ).grid(row=4, column=6, columnspan=4, sticky="ew", padx=(4, 0), pady=(8, 0))
 
+        velocity_trace_button_var = self.tk.StringVar(value="Draw velocity trace")
+        velocity_trace_summary_var = self.tk.StringVar(value="Velocity traces: 0")
+        velocity_frame = self.ttk.LabelFrame(
+            edit_frame, text="Velocity Traces", padding=8
+        )
+        velocity_frame.grid(row=14, column=0, columnspan=8, sticky="ew", pady=(12, 0))
+        velocity_frame.columnconfigure(0, weight=1)
+        velocity_frame.columnconfigure(1, weight=1)
+        velocity_frame.columnconfigure(2, weight=1)
+        velocity_frame.columnconfigure(3, weight=1)
+        self.ttk.Label(
+            velocity_frame,
+            textvariable=velocity_trace_summary_var,
+            justify="left",
+            wraplength=520,
+        ).grid(row=0, column=0, columnspan=4, sticky="w")
+        self.ttk.Button(
+            velocity_frame,
+            textvariable=velocity_trace_button_var,
+            command=lambda pid=panel_id: self._toggle_td_window_velocity_trace_mode(pid),
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(8, 0))
+        self.ttk.Button(
+            velocity_frame,
+            text="Delete selected",
+            command=lambda pid=panel_id: self._delete_td_window_selected_velocity_trace(pid),
+        ).grid(row=1, column=1, sticky="ew", padx=4, pady=(8, 0))
+        self.ttk.Button(
+            velocity_frame,
+            text="Clear all",
+            command=lambda pid=panel_id: self._clear_td_window_velocity_traces(pid),
+        ).grid(row=1, column=2, sticky="ew", padx=4, pady=(8, 0))
+        self.ttk.Label(
+            velocity_frame,
+            text="Uses cad, arcsec/px and km/arcsec to return physical speeds.",
+            wraplength=320,
+            justify="left",
+        ).grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(8, 0))
+        velocity_columns = ("id", "label", "t0", "t1", "d0", "d1", "pxfr", "kms")
+        velocity_trace_tree = self.ttk.Treeview(
+            velocity_frame,
+            columns=velocity_columns,
+            show="headings",
+            height=6,
+        )
+        velocity_trace_tree.grid(row=2, column=0, columnspan=4, sticky="nsew", pady=(8, 0))
+        velocity_scrollbar = self.ttk.Scrollbar(
+            velocity_frame, orient="vertical", command=velocity_trace_tree.yview
+        )
+        velocity_scrollbar.grid(row=2, column=4, sticky="ns", pady=(8, 0))
+        velocity_trace_tree.configure(yscrollcommand=velocity_scrollbar.set)
+        for column, label, width in (
+            ("id", "ID", 52),
+            ("label", "Label", 70),
+            ("t0", "t0", 74),
+            ("t1", "t1", 74),
+            ("d0", "d0", 74),
+            ("d1", "d1", 74),
+            ("pxfr", "px/frame", 96),
+            ("kms", "km/s", 96),
+        ):
+            velocity_trace_tree.heading(column, text=label)
+            velocity_trace_tree.column(column, width=width, stretch=True)
+
         edit_container.grid_remove()
 
         main_plot_frame = self.ttk.Frame(top, padding=(8, 0, 8, 8))
@@ -18087,6 +25567,10 @@ class TDMosaicApp:
             "<Return>",
             lambda _event, pid=panel_id: self._split_td_window_selected_wavelet_event(pid),
         )
+        velocity_trace_tree.bind(
+            "<<TreeviewSelect>>",
+            lambda _event, pid=panel_id: self._on_td_window_velocity_trace_select(pid),
+        )
 
         self.td_windows[panel_id] = {
             "top": top,
@@ -18121,6 +25605,17 @@ class TDMosaicApp:
             "roi_d_span_var": roi_d_span_var,
             "roi_center_t": self._clone_wavelet_payload(panel_state.get("roi_center_t")),
             "roi_center_d": self._clone_wavelet_payload(panel_state.get("roi_center_d")),
+            "velocity_traces": self._clone_wavelet_payload(
+                panel_state.get("velocity_traces") or []
+            ),
+            "velocity_next_trace_id": int(panel_state.get("velocity_next_trace_id", 1)),
+            "velocity_selected_trace_id": panel_state.get("velocity_selected_trace_id"),
+            "velocity_trace_draw_mode": False,
+            "velocity_trace_pending": None,
+            "velocity_trace_hover": None,
+            "velocity_trace_tree": velocity_trace_tree,
+            "velocity_trace_summary_var": velocity_trace_summary_var,
+            "velocity_trace_button_var": velocity_trace_button_var,
             "roi_dragging": False,
             "roi_drag_offset_t": 0.0,
             "roi_drag_offset_d": 0.0,
@@ -18224,6 +25719,7 @@ class TDMosaicApp:
         self._sync_td_window_controls(panel_id)
         self._refresh_td_window(panel_id)
         self._refresh_td_window_wavelet_views(panel_id, redraw_td=False)
+        self._refresh_td_window_velocity_trace_table(panel_id)
         self._update_wavelet_job_widgets(panel_id)
         self._set_status(
             f"Opened TD window for {self.panels[panel_id - 1].name}. "
@@ -18275,7 +25771,9 @@ class TDMosaicApp:
         )
         td, meta = self._panel_td(self.panels[panel_id - 1])
         self._draw_td_window_crest_overlay(ax, panel_id, meta)
+        self._draw_td_window_velocity_traces(ax, panel_id)
         self._draw_td_window_roi(panel_id, td, meta)
+        self._refresh_td_window_velocity_trace_table(panel_id)
         existing["canvas"].draw_idle()
         roi_canvas = existing.get("roi_canvas")
         if roi_canvas is not None:
@@ -18377,6 +25875,9 @@ def main() -> None:
 
         app = TDMosaicApp(cube_path, cube_axis_order=cube_axis_order)
         if session_path is not None:
+            app._set_status(f"Loading session from {session_path}...")
+            app.root.update_idletasks()
+            app.root.update()
             app._load_session_from_path(
                 session_path,
                 session_cube_override=session_cube_override,

@@ -38,6 +38,14 @@ class _FakeAxis:
         self.plots.append({"args": args, "kwargs": kwargs})
 
 
+class _FakeVar:
+    def __init__(self) -> None:
+        self.value: object = None
+
+    def set(self, value: object) -> None:
+        self.value = value
+
+
 class TDMosaicWaveletOverlayTests(unittest.TestCase):
     def test_hidden_advanced_wavelet_filters_no_longer_apply_from_stale_state(self) -> None:
         app = TDMosaicApp.__new__(TDMosaicApp)
@@ -153,6 +161,128 @@ class TDMosaicWaveletOverlayTests(unittest.TestCase):
         self.assertFalse(state["wavelet_events"][0]["review_locked"])
         self.assertEqual(state["wavelet_next_event_id"], 2)
         self.assertEqual(state["wavelet_selected_event_id"], 1)
+
+    def test_replacement_wavelet_payload_keeps_only_best_fit_per_source_segment(self) -> None:
+        app = TDMosaicApp.__new__(TDMosaicApp)
+        params = {
+            "power_ratio_thresh": 1.75,
+            "min_points_segment": 5,
+            "rms_amp_ratio_max": 1.1,
+        }
+        better = {
+            "thread_index": 4,
+            "seg_id": 1,
+            "wseg_id": 0,
+            "accepted": True,
+            "has_segment": True,
+            "mode_rank": 0,
+            "duration_s": 36.0,
+            "peak_period_s": 22.0,
+            "fit_amp_arcsec": 0.080,
+            "fit_rms_over_amp": 0.20,
+            "fit_point_count": 12,
+            "power_ratio": 2.8,
+            "source_t_idx": np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float64),
+            "source_y_idx": np.array([0.0, 0.8, 0.0, -0.7, 0.0], dtype=np.float64),
+            "wave_t_idx": np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float64),
+            "wave_y_idx": np.array([0.0, 0.8, 0.0, -0.7, 0.0], dtype=np.float64),
+        }
+        alternate = {
+            "thread_index": 4,
+            "seg_id": 1,
+            "wseg_id": 1,
+            "accepted": True,
+            "has_segment": True,
+            "mode_rank": 1,
+            "duration_s": 34.0,
+            "peak_period_s": 22.0,
+            "fit_amp_arcsec": 0.050,
+            "fit_rms_over_amp": 0.48,
+            "fit_point_count": 12,
+            "power_ratio": 3.0,
+            "source_t_idx": np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float64),
+            "source_y_idx": np.array([0.0, 0.8, 0.0, -0.7, 0.0], dtype=np.float64),
+            "wave_t_idx": np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float64),
+            "wave_y_idx": np.array([0.0, 0.8, 0.0, -0.7, 0.0], dtype=np.float64),
+        }
+        other_source = {
+            "thread_index": 4,
+            "seg_id": 2,
+            "wseg_id": 0,
+            "accepted": True,
+            "has_segment": True,
+            "mode_rank": 0,
+            "duration_s": 20.0,
+            "peak_period_s": 18.0,
+            "fit_amp_arcsec": 0.040,
+            "fit_rms_over_amp": 0.25,
+            "fit_point_count": 8,
+            "power_ratio": 2.2,
+            "source_t_idx": np.array([10.0, 11.0, 12.0, 13.0], dtype=np.float64),
+            "source_y_idx": np.array([0.0, -0.4, 0.0, 0.3], dtype=np.float64),
+            "wave_t_idx": np.array([10.0, 11.0, 12.0, 13.0], dtype=np.float64),
+            "wave_y_idx": np.array([0.0, -0.4, 0.0, 0.3], dtype=np.float64),
+        }
+
+        payload = app._replacement_wavelet_run_payload(
+            [alternate, better, other_source],
+            params,
+        )
+
+        kept = payload["filtered_segments"]
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(
+            {(int(item["seg_id"]), int(item["wseg_id"])) for item in kept},
+            {(1, 0), (2, 0)},
+        )
+        self.assertIn(
+            "kept only best fit per source segment: removed 1",
+            payload["warnings"],
+        )
+
+    def test_refresh_wavelet_views_uses_event_params_for_best_candidate(self) -> None:
+        app = TDMosaicApp.__new__(TDMosaicApp)
+        app.td_windows = {
+            3: {
+                "wavelet_summary_var": _FakeVar(),
+                "wavelet_physics_var": _FakeVar(),
+                "wavelet_filter_result": {"segment_count": 1},
+            }
+        }
+        app._refresh_td_window_wavelet_table = lambda panel_id: None
+        app._td_window_wavelet_events = lambda panel_id: [
+            {
+                "event_id": 1,
+                "analysis": {
+                    "thread_index": 0,
+                    "seg_id": 1,
+                    "wseg_id": 0,
+                    "accepted": False,
+                    "has_segment": True,
+                    "mode_rank": 0,
+                    "duration_s": 18.0,
+                    "peak_period_s": 12.0,
+                    "fit_amp_arcsec": 0.04,
+                    "fit_rms_over_amp": 0.45,
+                    "fit_point_count": 7,
+                    "power_ratio": 1.4,
+                },
+                "current_params": {
+                    "power_ratio_thresh": 1.75,
+                    "min_points_segment": 5,
+                    "rms_amp_ratio_max": 1.1,
+                },
+            }
+        ]
+        app._background_wavelet_job_for_panel = lambda panel_id: (None, None)
+        app._td_window_wavelet_event_is_counted = lambda event: False
+        app._format_wavelet_segment_physics = lambda analysis, prefix: prefix
+        app._refresh_td_window_wavelet_diagnostics = lambda panel_id: None
+        app._refresh_td_window = lambda panel_id: None
+
+        app._refresh_td_window_wavelet_views(3, redraw_td=False)
+
+        self.assertEqual(app.td_windows[3]["wavelet_physics_var"].value, "Best candidate:")
 
     def test_overlay_segment_uses_wave_points_when_available(self) -> None:
         app = TDMosaicApp.__new__(TDMosaicApp)

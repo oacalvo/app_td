@@ -8,6 +8,7 @@ from app_code.td_wavelet_filter import (
     DEFAULT_WAVELET_FILTER,
     _candidate_decision,
     _apply_detrend,
+    _prefer_full_source_fit,
     _ridge_power_segments,
     analyze_tracked_segment_with_wavelet,
     fit_sine_with_trend,
@@ -218,6 +219,36 @@ class WaveletFilterTests(unittest.TestCase):
         self.assertGreater(recovered_amp, 1.35)
         self.assertLess(trend_error, 0.20)
 
+    def test_full_source_fit_can_override_wavelet_crop_when_cleaner(self) -> None:
+        source_support = {
+            "fit_params": {
+                "fit_amp_arcsec": 0.070,
+                "fit_period_s": 18.0,
+            },
+            "rms_amp_ratio": 0.34,
+            "fit_point_count": 18,
+            "duration_s": 30.0,
+            "span_amp_arcsec": 0.075,
+        }
+        wave_support = {
+            "fit_params": {
+                "fit_amp_arcsec": 0.062,
+                "fit_period_s": 18.0,
+            },
+            "rms_amp_ratio": 0.48,
+            "fit_point_count": 10,
+            "duration_s": 20.0,
+            "span_amp_arcsec": 0.074,
+        }
+
+        self.assertTrue(
+            _prefer_full_source_fit(
+                source_support,
+                wave_support,
+                min_points_segment=8,
+            )
+        )
+
     def test_wavelet_guided_oscillation_uses_ridge_seed_and_linear_trend(self) -> None:
         rng = np.random.default_rng(29)
         t_idx = np.arange(60, dtype=np.float64)
@@ -235,13 +266,13 @@ class WaveletFilterTests(unittest.TestCase):
             y_idx,
             14.0,
             ridge_periods=ridge_periods,
-            baseline_degree=0,
+            baseline_degree=1,
         )
         rigid_model, rigid_amp, rigid_omega = fit_sine_with_trend(
             t_idx,
             y_idx,
             14.0,
-            baseline_degree=0,
+            baseline_degree=1,
         )
 
         guided_period = (2.0 * np.pi) / abs(guided_omega)
@@ -250,10 +281,33 @@ class WaveletFilterTests(unittest.TestCase):
         rigid_mse = float(np.mean((y_idx - rigid_model) ** 2))
 
         self.assertGreater(guided_amp, 1.1)
-        self.assertLess(rigid_amp, 0.2)
+        self.assertLess(rigid_amp, guided_amp * 0.25)
         self.assertAlmostEqual(guided_period, true_period, delta=3.0)
         self.assertLess(rigid_period, 35.5)
         self.assertLess(guided_mse, rigid_mse * 0.3)
+
+    def test_wavelet_guided_oscillation_respects_zero_baseline_for_detrended_signal(self) -> None:
+        rng = np.random.default_rng(31)
+        t_idx = np.arange(54, dtype=np.float64)
+        true_period = 20.0
+        ridge_periods = true_period + 0.8 * np.sin(2.0 * np.pi * t_idx / float(t_idx[-1]))
+        y_detr = (
+            1.45 * np.sin(2.0 * np.pi * (t_idx - np.mean(t_idx)) / true_period + 0.2)
+            + 0.05 * rng.normal(size=t_idx.size)
+        )
+
+        model, fit_amp, omega = fit_wavelet_guided_oscillation(
+            t_idx,
+            y_detr,
+            18.0,
+            ridge_periods=ridge_periods,
+            baseline_degree=0,
+        )
+
+        fit_period = (2.0 * np.pi) / abs(omega)
+        self.assertGreater(fit_amp, 1.0)
+        self.assertAlmostEqual(fit_period, true_period, delta=2.5)
+        self.assertEqual(len(model), len(y_detr))
 
 
 if __name__ == "__main__":
