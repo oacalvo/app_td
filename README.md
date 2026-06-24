@@ -29,6 +29,12 @@ pip install -r requirements.txt
 
 Recommended Python version: `3.10+`
 
+In this workspace there is already a working virtual environment:
+
+```bash
+source ~/venvs/image_paper_uds/bin/activate
+```
+
 Launch the GUI and choose a FITS cube from the startup dialog:
 
 ```bash
@@ -75,7 +81,7 @@ After installing dependencies, you can run a small non-GUI check:
 python -m unittest discover -s tests
 ```
 
-This verifies the session startup helpers and the restart logic for sessions whose FITS cube was moved or replaced.
+This verifies core geometry, wavelet candidate handling, study generation, session startup helpers, and the restart logic for sessions whose FITS cube was moved or replaced.
 
 ## 🌤️ Launching the app
 
@@ -96,7 +102,7 @@ The input data cube. Internally the app works with a normalized `(t, y, x)` repr
 
 ### Cut
 
-A line segment sampled through the map. Each cut produces a TD diagram over a chosen time range, width, and weighting.
+A straight or curved path sampled through the map. Each cut produces a TD diagram over a chosen time range, width, and weighting. For curved cuts, the horizontal TD coordinate is distance along the curve arc, not straight endpoint distance.
 
 ### Feature Axis
 
@@ -198,6 +204,18 @@ This tab also contains `Feature Axis / Auto Cuts`, where you can:
 
 This is the main tool for systematic sampling across position or angle.
 
+### Curved cuts
+
+Curved cuts are stored as polylines. The TD sampler resamples them by accumulated arc length, then samples the cube at each curve point. If `width > 1`, the app averages across local perpendicular offsets computed from the curve tangent.
+
+Important details:
+
+- distance in the TD is curve distance in pixels
+- exported trace points are mapped back to `(map_x, map_y)` along the same curve
+- very tight curvature can make neighboring width samples overlap
+- dynamic keyframed geometry is only available for straight cuts
+- exhaustive studies currently require a straight base cut
+
 ### Geometry
 
 Direct geometric editing of the selected cut:
@@ -209,6 +227,8 @@ Direct geometric editing of the selected cut:
 - endpoint coordinates
 
 It also includes `Dynamic Cut`, which allows time-varying geometry using keyframes. This is useful when the feature you want to cut through drifts over time.
+
+Dynamic cuts are straight-line cuts only. Curved cuts can be drawn and sampled, but they are not keyframed over time.
 
 ### Measure
 
@@ -307,6 +327,18 @@ The wavelet stage can now keep more than one spectral mode per tracked thread. T
 
 Each candidate stores a `mode` index, and the event table shows it explicitly.
 
+The app keeps distinct candidates from the same NUWT source trace when they belong to different modes or different non-overlapping time windows. It only collapses strongly overlapping duplicates inside the same mode.
+
+### When oscillations look cut off
+
+There are three different mechanisms that can shorten what you see in the final event overlay:
+
+- `max jump` splits a NUWT thread before wavelet analysis when the tracked position jumps too far between frames
+- `segment frac` keeps only the part of the wavelet ridge whose smoothed power is above a fraction of the ridge maximum
+- `min pts seg` and `min pts cut` reject short pieces after the split
+
+If the oscillation is visually continuous but the accepted event is too short, first lower `segment frac`, then lower `min pts seg`, and finally raise `max jump` if the source NUWT thread is being split. If the full NUWT trace fits the oscillation better than the cropped ridge window, the app can use the full source fit and marks that candidate with the `used NUWT source fit` warning.
+
 ### Running the analysis
 
 Typical order:
@@ -368,6 +400,39 @@ Bulk review actions include:
 - `Reset visible`
 
 This is the section to use when you want to increase the final curated table quality by manual intervention.
+
+### Manual velocity traces
+
+The detached TD window also has a `Velocity traces` tool. It is separate from NUWT and separate from the wavelet event fit.
+
+Use it when you want a direct two-point measurement in the TD:
+
+1. click `Draw velocity trace`
+2. click the first TD point
+3. click the second TD point
+4. inspect the saved row in the velocity table
+
+Each trace stores:
+
+- `t0`, `t1`
+- `d0`, `d1`
+- displacement in pixels
+- speed in pixels per frame
+- speed in km/s when `cad` and `res` are set
+
+These manual traces are useful for quick dynamics checks, phase-speed estimates, and comparison against wavelet-derived velocity amplitude. They are not produced by the `wave` package and do not replace the wavelet event table.
+
+### Trace-derived event dynamics
+
+Wavelet/NUWT event trace exports include both the original source trace and the selected wave trace when available. The app maps each trace point to:
+
+- frame index
+- TD distance index
+- TD distance in pixels
+- map coordinates `(map_x, map_y)`
+- current cut endpoint coordinates
+
+Use these trace tables when you need time of life, displacement, or position history for a curated event. `duration_s` comes from the selected event support, while displacement can be computed from the first and last trace points in the exported `source` or `wave` series.
 
 ### Advanced filtering
 
@@ -531,6 +596,37 @@ This is the best export if you want a table of linked waves and their grouped pr
 
 The `Saved FITS` browser lets you inspect products previously exported by the app from the current export folder. It can preview saved maps, TD products, and table-like outputs.
 
+## Exhaustive studies
+
+The study tools generate a controlled grid of straight cuts from one selected straight base cut. They are intended for systematic scans over displacement and angle.
+
+Study inputs:
+
+- base cut
+- displacement step
+- displacement min/max, or full lateral sweep
+- angle min/max/step
+- TD width and weighting
+- output folder
+- save options for TD FITS, JSON tables, and important images
+
+The app can group generated cuts as stacks by displacement or by angle. In full-cube angular mode, each angle gets its own full family of parallel cuts across the frame.
+
+The study pipeline has three stages:
+
+1. `Run NUWT`
+2. `Run Wavelet`
+3. `Rebuild Tables`
+
+Study outputs include per-cell products, stack summaries, trace tables, velocity trace tables, status JSON, and manifest JSON. The trace tables are the right place to inspect displacement and lifetime across many generated cuts.
+
+Current study limitations:
+
+- the base cut must be straight
+- curved cuts are sampled in normal TD workflows but are not valid study bases
+- full-frame rotations can make cuts longer than the base cut when they are extended to frame edges
+- very large grids are intentionally warned or blocked because they generate many files
+
 ## Sessions and autosave
 
 The app supports:
@@ -564,12 +660,15 @@ The intended analysis logic is:
 - `Propagation` is a summary and classification tool, not a fully automatic physical propagation solver.
 - The in-app statistics tools compare well by cut, stack, panel, status, class, and link group.
 - If you want dedicated plots directly against geometric quantities such as cut angle or map position `(x, y)`, the current workflow is best done from exported tables or by extending the metrics layer further.
+- Dynamic keyframes and exhaustive studies currently use straight cuts only.
+- Curved cuts are sampled and exported by arc length, but tight curves should be checked visually because wide averaging uses local perpendicular offsets.
 - Manual review is still the final authority for ambiguous or overlapping events.
 
 ## Code structure
 
 - [`td_mosaic_app.py`](./td_mosaic_app.py): top-level launcher
 - [`app_code/td_mosaic_app.py`](./app_code/td_mosaic_app.py): main GUI and workflow logic
+- [`app_code/core.py`](./app_code/core.py): cube loading, straight/curved cut geometry, TD sampling, and display helpers
 - [`app_code/td_wavelet_filter.py`](./app_code/td_wavelet_filter.py): wavelet segmentation and event extraction
 - [`app_code/nuwt`](./app_code/nuwt): Python port of the core Auto-NUWT routines
 

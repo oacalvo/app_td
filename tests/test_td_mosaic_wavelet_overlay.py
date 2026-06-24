@@ -162,7 +162,7 @@ class TDMosaicWaveletOverlayTests(unittest.TestCase):
         self.assertEqual(state["wavelet_next_event_id"], 2)
         self.assertEqual(state["wavelet_selected_event_id"], 1)
 
-    def test_replacement_wavelet_payload_keeps_only_best_fit_per_source_segment(self) -> None:
+    def test_replacement_wavelet_payload_preserves_distinct_modes_per_source_segment(self) -> None:
         app = TDMosaicApp.__new__(TDMosaicApp)
         params = {
             "power_ratio_thresh": 1.75,
@@ -205,6 +205,12 @@ class TDMosaicWaveletOverlayTests(unittest.TestCase):
             "wave_t_idx": np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float64),
             "wave_y_idx": np.array([0.0, 0.8, 0.0, -0.7, 0.0], dtype=np.float64),
         }
+        duplicate = {
+            **better,
+            "fit_amp_arcsec": 0.060,
+            "fit_rms_over_amp": 0.35,
+            "power_ratio": 2.3,
+        }
         other_source = {
             "thread_index": 4,
             "seg_id": 2,
@@ -225,20 +231,64 @@ class TDMosaicWaveletOverlayTests(unittest.TestCase):
         }
 
         payload = app._replacement_wavelet_run_payload(
-            [alternate, better, other_source],
+            [alternate, better, duplicate, other_source],
             params,
         )
 
         kept = payload["filtered_segments"]
-        self.assertEqual(len(kept), 2)
+        self.assertEqual(len(kept), 3)
         self.assertEqual(
-            {(int(item["seg_id"]), int(item["wseg_id"])) for item in kept},
-            {(1, 0), (2, 0)},
+            {
+                (int(item["seg_id"]), int(item["mode_rank"]), int(item["wseg_id"]))
+                for item in kept
+            },
+            {(1, 0, 0), (1, 1, 1), (2, 0, 0)},
         )
         self.assertIn(
-            "kept only best fit per source segment: removed 1",
+            "removed overlapping duplicate wavelet candidate(s): 1",
             payload["warnings"],
         )
+
+    def test_best_wavelet_event_id_includes_mode_rank(self) -> None:
+        app = TDMosaicApp.__new__(TDMosaicApp)
+        params = {
+            "power_ratio_thresh": 1.75,
+            "min_points_segment": 5,
+            "rms_amp_ratio_max": 1.1,
+        }
+        base = {
+            "thread_index": 2,
+            "seg_id": 3,
+            "wseg_id": 0,
+            "accepted": True,
+            "has_segment": True,
+            "duration_s": 24.0,
+            "peak_period_s": 12.0,
+            "fit_point_count": 12,
+            "source_t_idx": np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64),
+            "source_y_idx": np.array([0.0, 0.3, 0.0, -0.3], dtype=np.float64),
+            "wave_t_idx": np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64),
+            "wave_y_idx": np.array([0.0, 0.3, 0.0, -0.3], dtype=np.float64),
+        }
+        weaker = {
+            **base,
+            "mode_rank": 0,
+            "fit_amp_arcsec": 0.040,
+            "fit_rms_over_amp": 0.55,
+            "power_ratio": 2.0,
+        }
+        stronger = {
+            **base,
+            "mode_rank": 1,
+            "fit_amp_arcsec": 0.080,
+            "fit_rms_over_amp": 0.18,
+            "power_ratio": 2.6,
+        }
+
+        payload = app._replacement_wavelet_run_payload([weaker, stronger], params)
+
+        self.assertEqual(len(payload["events"]), 2)
+        self.assertEqual(payload["best_event_id"], 2)
 
     def test_refresh_wavelet_views_uses_event_params_for_best_candidate(self) -> None:
         app = TDMosaicApp.__new__(TDMosaicApp)

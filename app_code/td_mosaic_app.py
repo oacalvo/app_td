@@ -1250,6 +1250,8 @@ class TDMosaicApp:
         displacement_count: int,
         angle_count: int,
     ) -> str | None:
+        if not hasattr(self, "tk") or not hasattr(self, "root"):
+            return "displacement"
         top = self.tk.Toplevel(self.root)
         top.title("Study Stack Layout")
         top.transient(self.root)
@@ -1311,6 +1313,8 @@ class TDMosaicApp:
         return choice["mode"]
 
     def _warn_experiment_full_cube_angles(self, study_name: str) -> bool | None:
+        if not hasattr(self, "messagebox") or not hasattr(self, "root"):
+            return False
         answer = self.messagebox.askyesnocancel(
             "Full Cube Study",
             (
@@ -1423,6 +1427,8 @@ class TDMosaicApp:
         )
 
     def _warn_experiment_full_frame_rotations(self, study_name: str) -> bool | None:
+        if not hasattr(self, "messagebox") or not hasattr(self, "root"):
+            return False
         answer = self.messagebox.askyesnocancel(
             "Full Frame Rotations",
             (
@@ -1773,8 +1779,9 @@ class TDMosaicApp:
         return panels[0] if panels else None
 
     def _cut_analysis_snapshot(self, cut_id: int) -> dict[str, Any]:
+        td_windows = getattr(self, "td_windows", {}) or {}
         for panel in self._panels_for_cut(cut_id):
-            if panel.panel_id in self.td_windows:
+            if panel.panel_id in td_windows:
                 return self._panel_analysis_snapshot(panel.panel_id)
         return self._clone_wavelet_payload(self._cut_analysis(cut_id))
 
@@ -1991,6 +1998,27 @@ class TDMosaicApp:
             return int(float(text)) if text else int(default)
         except Exception:
             return int(default)
+
+    def _var_value(self, attr_name: str, default: Any = "") -> Any:
+        var = getattr(self, attr_name, None)
+        if var is None:
+            return default
+        try:
+            return var.get()
+        except Exception:
+            return default
+
+    def _safe_bool_value(self, value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if not text:
+            return bool(default)
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return bool(default)
 
     def _timestamp_now(self) -> str:
         return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -16370,13 +16398,23 @@ class TDMosaicApp:
         if self._cut_is_curve(base_cut):
             self._set_status("Exhaustive studies currently require a straight base cut.")
             return
-        full_sweep = bool(self.experiment_full_sweep_var.get())
-        step_value = self._parse_float_var(
-            self.experiment_displacement_step_var.get(), "displacement step"
+        full_sweep = self._safe_bool_value(
+            self._var_value("experiment_full_sweep_var", False),
+            False,
         )
-        angle_min = self._parse_float_var(self.experiment_angle_min_var.get(), "angle min")
-        angle_max = self._parse_float_var(self.experiment_angle_max_var.get(), "angle max")
-        angle_step = self._parse_float_var(self.experiment_angle_step_var.get(), "angle step")
+        step_value = self._parse_float_var(
+            self._var_value("experiment_displacement_step_var", "8.0"),
+            "displacement step",
+        )
+        angle_min = self._parse_float_var(
+            self._var_value("experiment_angle_min_var", "0.0"), "angle min"
+        )
+        angle_max = self._parse_float_var(
+            self._var_value("experiment_angle_max_var", "0.0"), "angle max"
+        )
+        angle_step = self._parse_float_var(
+            self._var_value("experiment_angle_step_var", "5.0"), "angle step"
+        )
         if None in {step_value, angle_min, angle_max, angle_step}:
             return
         step_value = max(float(step_value), 1.0)
@@ -16440,12 +16478,27 @@ class TDMosaicApp:
             displacement_min_in = None
             displacement_max_in = None
             if not full_sweep:
-                displacement_min_in = self._parse_float_var(
-                    self.experiment_displacement_min_var.get(), "displacement min"
-                )
-                displacement_max_in = self._parse_float_var(
-                    self.experiment_displacement_max_var.get(), "displacement max"
-                )
+                if hasattr(self, "experiment_displacement_min_var") and hasattr(
+                    self, "experiment_displacement_max_var"
+                ):
+                    displacement_min_in = self._parse_float_var(
+                        self._var_value("experiment_displacement_min_var", "-40.0"),
+                        "displacement min",
+                    )
+                    displacement_max_in = self._parse_float_var(
+                        self._var_value("experiment_displacement_max_var", "40.0"),
+                        "displacement max",
+                    )
+                else:
+                    displacement_limit_in = self._parse_float_var(
+                        self._var_value("experiment_displacement_limit_var", "40.0"),
+                        "displacement limit",
+                    )
+                    if displacement_limit_in is None:
+                        return
+                    displacement_limit = abs(float(displacement_limit_in))
+                    displacement_min_in = -displacement_limit
+                    displacement_max_in = displacement_limit
                 if None in {displacement_min_in, displacement_max_in}:
                     return
             if full_sweep:
@@ -16545,7 +16598,9 @@ class TDMosaicApp:
         }
         experiment["study_crest_params"] = dict(crest_params)
         experiment["study_wavelet_params"] = dict(wavelet_params)
-        requested_output_dir = str(self.experiment_output_dir_var.get()).strip()
+        requested_output_dir = str(
+            self._var_value("experiment_output_dir_var", "")
+        ).strip()
         if requested_output_dir:
             experiment["export_root"] = str(Path(requested_output_dir).expanduser().resolve())
         else:
@@ -16556,11 +16611,24 @@ class TDMosaicApp:
                 f"_{self._safe_export_slug(base_name)}"
             )
             experiment["export_root"] = str(default_root.resolve())
-            self.experiment_output_dir_var.set(str(default_root.resolve()))
+            if hasattr(self, "experiment_output_dir_var"):
+                self.experiment_output_dir_var.set(str(default_root.resolve()))
         experiment["save_options"] = {
-            "save_td_fits": bool(self.experiment_save_td_fits_var.get()),
-            "save_stack_json": bool(self.experiment_save_stack_json_var.get()),
-            "save_important_images": bool(self.experiment_save_important_images_var.get()),
+            "save_td_fits": self._safe_bool_value(
+                self._var_value("experiment_save_td_fits_var", True),
+                True,
+            ),
+            "save_stack_json": self._safe_bool_value(
+                self._var_value(
+                    "experiment_save_stack_json_var",
+                    self._var_value("experiment_save_cell_json_var", True),
+                ),
+                True,
+            ),
+            "save_important_images": self._safe_bool_value(
+                self._var_value("experiment_save_important_images_var", True),
+                True,
+            ),
         }
         experiment_root = self._experiment_output_root(experiment)
         output_folders = [
@@ -21646,7 +21714,7 @@ class TDMosaicApp:
         )
         return best
 
-    def _keep_best_wavelet_segment_per_source(
+    def _keep_distinct_wavelet_segments(
         self,
         segments: list[dict[str, Any]],
         params: dict[str, Any] | None = None,
@@ -21655,11 +21723,12 @@ class TDMosaicApp:
             (idx, self._clone_wavelet_payload(segment))
             for idx, segment in enumerate(segments or [])
         ]
-        grouped: dict[tuple[int, int], list[tuple[int, dict[str, Any]]]] = {}
+        grouped: dict[tuple[int, int, int], list[tuple[int, dict[str, Any]]]] = {}
         for idx, segment in indexed_segments:
             key = (
                 int(segment.get("thread_index", -1)),
                 int(segment.get("seg_id", -1)),
+                int(segment.get("mode_rank", -1)),
             )
             grouped.setdefault(key, []).append((idx, segment))
 
@@ -21669,32 +21738,55 @@ class TDMosaicApp:
             if len(group_segments) == 1:
                 kept_indices.add(group_segments[0][0])
                 continue
-            best_segment = self._best_wavelet_segment(
-                [item[1] for item in group_segments],
-                params=params,
+
+            ranked = sorted(
+                group_segments,
+                key=lambda item: (
+                    self._wavelet_segment_confidence_score(item[1], params),
+                    float(item[1].get("duration_s", float("-inf"))),
+                    float(item[1].get("fit_amp_arcsec", float("-inf"))),
+                    float(item[1].get("power_ratio", float("-inf"))),
+                ),
+                reverse=True,
             )
-            best_idx = group_segments[0][0]
-            if best_segment is not None:
-                for idx, segment in group_segments:
-                    if (
-                        int(segment.get("thread_index", -999))
-                        == int(best_segment.get("thread_index", -1))
-                        and int(segment.get("seg_id", -999))
-                        == int(best_segment.get("seg_id", -1))
-                        and int(segment.get("wseg_id", -999))
-                        == int(best_segment.get("wseg_id", -1))
-                        and int(segment.get("mode_rank", -999))
-                        == int(best_segment.get("mode_rank", -1))
-                    ):
-                        best_idx = idx
+            selected: list[tuple[int, dict[str, Any]]] = []
+            for idx, segment in ranked:
+                duplicate = False
+                for _kept_idx, kept_segment in selected:
+                    overlap = self._wavelet_segment_time_overlap_fraction(
+                        segment, kept_segment
+                    )
+                    if overlap >= 0.8:
+                        duplicate = True
                         break
-            kept_indices.add(best_idx)
-            removed_count += len(group_segments) - 1
+                if duplicate:
+                    removed_count += 1
+                    continue
+                selected.append((idx, segment))
+                kept_indices.add(idx)
 
         kept_segments = [
             segment for idx, segment in indexed_segments if idx in kept_indices
         ]
         return kept_segments, removed_count
+
+    def _wavelet_segment_time_values(self, segment: dict[str, Any]) -> np.ndarray:
+        values = np.asarray(segment.get("wave_t_idx", []), dtype=np.float64)
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            values = np.asarray(segment.get("source_t_idx", []), dtype=np.float64)
+            finite = values[np.isfinite(values)]
+        return np.round(finite, 6)
+
+    def _wavelet_segment_time_overlap_fraction(
+        self, segment_a: dict[str, Any], segment_b: dict[str, Any]
+    ) -> float:
+        times_a = self._wavelet_segment_time_values(segment_a)
+        times_b = self._wavelet_segment_time_values(segment_b)
+        if times_a.size == 0 or times_b.size == 0:
+            return 0.0
+        overlap = np.intersect1d(times_a, times_b)
+        return float(overlap.size / max(min(times_a.size, times_b.size), 1))
 
     def _compact_wavelet_segment_row(
         self, segment: dict[str, Any] | None
@@ -21778,13 +21870,13 @@ class TDMosaicApp:
         warnings: list[str] | None = None,
     ) -> dict[str, Any]:
         warning_messages = [str(item) for item in (warnings or []) if str(item)]
-        filtered_segments, removed_count = self._keep_best_wavelet_segment_per_source(
+        filtered_segments, removed_count = self._keep_distinct_wavelet_segments(
             segments or [],
             params=params,
         )
         if removed_count > 0:
             warning_messages.append(
-                f"kept only best fit per source segment: removed {int(removed_count)}"
+                f"removed overlapping duplicate wavelet candidate(s): {int(removed_count)}"
             )
         next_event_id = 1
         events: list[dict[str, Any]] = []
@@ -21800,6 +21892,7 @@ class TDMosaicApp:
                     int(analysis.get("thread_index", -999)) == int(best_segment.get("thread_index", -1))
                     and int(analysis.get("seg_id", -999)) == int(best_segment.get("seg_id", -1))
                     and int(analysis.get("wseg_id", -999)) == int(best_segment.get("wseg_id", -1))
+                    and int(analysis.get("mode_rank", -999)) == int(best_segment.get("mode_rank", -1))
                 ):
                     best_event_id = int(event["event_id"])
                     break
