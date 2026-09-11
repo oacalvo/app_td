@@ -55,6 +55,20 @@ python td_mosaic_app.py --session /path/to/session.json
 
 Your FITS cube is user-provided and is not expected to live inside this repository.
 
+## Deployment / local runtime
+
+This project runs as a local desktop application. The repository currently has no web server, Docker image, or hosted deployment configuration.
+
+To run it on another workstation:
+
+1. copy or clone this repository
+2. create and activate a Python `3.10+` virtual environment
+3. install dependencies with `pip install -r requirements.txt`
+4. make sure Tk is available for your Python installation
+5. launch with `python td_mosaic_app.py`
+
+Session JSON files, FITS inputs, `manifest.json`, `status.json`, PNG outputs, FITS outputs, and exported tables are data products. They are not application deployment artifacts.
+
 ## Requirements
 
 Install the Python dependencies with:
@@ -71,7 +85,7 @@ The `requirements.txt` file contains:
 - `matplotlib`
 - `PyWavelets`
 
-The GUI uses `tkinter`, which is part of the Python standard library on many installations and is therefore not listed in `requirements.txt`.
+The GUI uses `tkinter`, which is part of the Python standard library on many installations and is therefore not listed in `requirements.txt`. On Linux systems where Tk is packaged separately, install the OS package for Tk before launching the GUI.
 
 ## 🔎 Smoke Check
 
@@ -147,12 +161,12 @@ A summary view built from curated observations and link groups. It helps compare
 
 The left sidebar is organized into these tabs:
 
-- `TD`
-- `Cuts`
-- `Geometry`
-- `Measure`
-- `Stacks`
-- `Export`
+- `Session / Export`
+- `Cuts / Geometry`
+- `TD / Stacks`
+- `Slope Velocity`
+- `Waves`
+- `Robust Study`
 
 The top action row includes:
 
@@ -163,13 +177,67 @@ The top action row includes:
 - `Export Report`
 - `Link Groups`
 - `Propagation`
-- `Batch Pipeline`
 - `Saved FITS`
 - `Open Cube`
 
 ## Sidebar tabs
 
-### TD
+### Session / Export
+
+This tab groups session recovery, cube switching, saved-product browsing, and exports.
+
+It includes:
+
+- `Save Session`
+- `Load Session`
+- `Open Cube`
+- `Saved FITS`
+- export folder
+- `Write FITS`
+- `Write PNG`
+- `Separate folders`
+- `Save current map`
+- `Selected cut`, `Stack`, `All cuts`
+- `Selected wave traces`, `Stack wave traces`, `All wave traces`
+- `Selected velocity`, `Stack velocities`, `All velocities`
+- `Selected macro`, `Stack macro`, `All macro`
+- `Open saved FITS browser`
+
+Export buttons unlock as matching products become available. TD cut exports require existing cuts and an enabled FITS/PNG output mode; wave trace exports require saved wavelet/NUWT events; velocity exports require saved manual velocity traces. Macro table exports are enabled only when the selected scope has both wave/event data and manual velocity data.
+
+The `?` buttons beside export/save groups open short explanations of what each save/export action writes and why it may be disabled.
+
+### Cuts / Geometry
+
+This tab combines cut creation, geometric editing, feature-axis generation, function-fit cuts, dynamic straight cuts, and relative measurements.
+
+Main cut management tools:
+
+- `Add Cut`
+- `Draw/Replace Cut`
+- `Delete Cut`
+- `Curved Cut`
+- `Finish Curved`
+- `Copy Cut`
+- `Paste Cut`
+- quick rotations
+- `Open Cut Browser`
+
+`Function Cut` can fit or edit parameterized curves. `Feature Axis / Auto Cuts` can draw a line or curve axis, choose spacing/length/angle offset, optionally create a stack, and generate many cuts at once.
+
+Direct geometric editing includes:
+
+- anchor mode
+- length mode
+- angle
+- length
+- endpoint coordinates
+
+`Dynamic Cut` allows time-varying straight-cut geometry using keyframes. Curved cuts can be drawn and sampled, but they are not keyframed over time.
+
+`Measurements / Relative Control` is for reference/target comparisons and relative control between cuts.
+
+### TD / Stacks
 
 Controls per-panel TD settings such as:
 
@@ -181,29 +249,6 @@ Controls per-panel TD settings such as:
 
 This is the fast way to build and compare TD panels in the main mosaic.
 
-### Cuts
-
-Main cut management tools:
-
-- `Add Cut`
-- `Draw/Replace Cut`
-- `Delete Cut`
-- `Copy Cut`
-- `Paste Cut`
-- quick rotations
-- `Open Cut Browser`
-
-This tab also contains `Feature Axis / Auto Cuts`, where you can:
-
-- draw a line or curve axis
-- choose cut spacing
-- choose generated cut length
-- set an angle offset relative to the local perpendicular
-- optionally create a stack automatically
-- generate many cuts at once
-
-This is the main tool for systematic sampling across position or angle.
-
 ### Curved cuts
 
 Curved cuts are stored as polylines. The TD sampler resamples them by accumulated arc length, then samples the cube at each curve point. If `width > 1`, the app averages across local perpendicular offsets computed from the curve tangent.
@@ -214,27 +259,7 @@ Important details:
 - exported trace points are mapped back to `(map_x, map_y)` along the same curve
 - very tight curvature can make neighboring width samples overlap
 - dynamic keyframed geometry is only available for straight cuts
-- exhaustive studies currently require a straight base cut
-
-### Geometry
-
-Direct geometric editing of the selected cut:
-
-- anchor mode
-- length mode
-- angle
-- length
-- endpoint coordinates
-
-It also includes `Dynamic Cut`, which allows time-varying geometry using keyframes. This is useful when the feature you want to cut through drifts over time.
-
-Dynamic cuts are straight-line cuts only. Curved cuts can be drawn and sampled, but they are not keyframed over time.
-
-### Measure
-
-This tab is for reference/target comparisons and relative control between cuts. Use it when you need to compare one cut against another in a controlled way.
-
-### Stacks
+- robust/exhaustive studies currently require a straight base cut
 
 Stacks let you group multiple cuts and browse them as one logical set. This is useful when:
 
@@ -242,46 +267,48 @@ Stacks let you group multiple cuts and browse them as one logical set. This is u
 - several cuts scan neighboring spatial positions
 - you want to inspect whether the same event persists or changes across the set
 
-### Export
+The `Run Stack` action runs NUWT plus wavelet analysis across the selected stack using the template cut parameters.
 
-This tab controls:
+### Slope Velocity
 
-- export folder
-- `Write FITS`
-- `Write PNG`
-- `Separate folders`
+This tab opens or closes the detached TD window directly on its `Slope Velocity` tools.
 
-It also exposes:
+### Waves
 
-- `Save current map`
-- `Selected cut`
-- `Stack`
-- `All cuts`
-- `Selected cut traces`
-- `Stack traces`
-- `All traces`
-- `Open saved FITS browser`
+This tab opens the detached TD window directly on its `Waves` tools and provides shortcuts to:
+
+- `Metrics`
+- `Link Groups`
+- `Propagation`
+- `Export Curated`
+- `Export Report`
+
+### Robust Study
+
+This tab contains the `Robust Cube Study` controls for generating systematic straight-cut grids, running NUWT, running the wavelet filter, rebuilding tables, and tracking progress.
 
 ## Detached TD window
 
 The detached TD window is the main analysis workspace for a single panel/cut.
 
-It contains:
+At the top of the editor, `Physical Scale` controls the shared physical conversion used by the analysis tools:
 
-- TD controls
-- ROI controls
-- explicit cut center and vertices
-- direct angle/length editing
-- `Crest Tracking (NUWT)`
-- `Wavelet Filter`
-- `Wavelet Events`
+- `cad [s]`
+- `res [arcsec/px]`
+- `km/arcsec`
+
+Use `Apply scale` after changing these values. New manual velocity traces, NUWT/wavelet runs, printed velocity diagnostics, and velocity exports use this shared scale.
+
+Its editor is organized into three tabs:
+
+- `TD / Cut`: TD controls, ROI controls, explicit cut center/vertices, and direct angle/length editing
+- `Slope Velocity`: manual velocity traces
+- `Waves`: `Crest Tracking (NUWT)`, `Wavelet Filter`, and `Wavelet Events`
 
 ### Pure NUWT section
 
 `Crest Tracking (NUWT)` is intentionally limited to the real tracking controls:
 
-- `cad [s]`
-- `res [arcsec/px]`
 - `grad`
 - `min thread`
 - `max dist jump`
@@ -289,7 +316,7 @@ It contains:
 - `invert`
 - `gauss fit (slow)`
 
-This section is meant to stay close to the original Auto-NUWT behavior.
+This section is meant to stay close to the original Auto-NUWT behavior. The cadence and pixel scale used by NUWT are set in the shared `Physical Scale` block above the tabs.
 
 The current Python port was aligned so that crest following behaves like the original Auto-NUWT logic: it follows the first valid crest in search order instead of using an extra ranking heuristic.
 
@@ -348,7 +375,7 @@ Typical order:
 3. inspect events in the table
 4. accept/reject/edit candidates
 
-There is also a `Batch Pipeline` action from the main window that runs NUWT plus wavelet analysis across all assigned panels.
+For stack-level batch work, use `Run Stack` in `TD / Stacks` to run NUWT plus wavelet analysis across the selected stack.
 
 ## Wavelet event review
 
@@ -403,22 +430,84 @@ This is the section to use when you want to increase the final curated table qua
 
 ### Manual velocity traces
 
-The detached TD window also has a `Velocity traces` tool. It is separate from NUWT and separate from the wavelet event fit.
+The detached TD window has a `Slope Velocity Traces` tool. It is separate from NUWT and separate from the wavelet event fit.
 
-Use it when you want a direct two-point measurement in the TD:
+Use it when you want direct slope measurements in the TD:
 
-1. click `Draw velocity trace`
-2. click the first TD point
-3. click the second TD point
-4. inspect the saved row in the velocity table
+1. open the `Slope Velocity` tab
+2. choose `Straight`, `Polyline`, or `Quadratic Fit`
+3. click `Draw velocity trace`
+4. click TD points on the plot
+5. finish with `Finish trace` or double-click once the trace has enough points
+6. inspect the saved row in the velocity table
+7. double-click a saved row to view every segment velocity
+
+`Straight` traces save after two points. `Polyline` traces need at least two points and can follow a multi-segment path; the detail view lists each segment speed. `Quadratic Fit` traces need at least three distinct time positions, can use more than three clicked points, and report fit acceleration.
+
+Use `Polyline` when you want to follow the clicked path faithfully. Use `Quadratic Fit` when the motion is reasonably described by one smooth parabola and you want an acceleration estimate.
+
+The shared `Physical Scale` block above the tabs shows the scale used for new traces. When a velocity trace is saved, the same scale is printed to the terminal and stored with the trace/export row.
+For quadratic traces, acceleration uses the same `km/px` scale as velocity and the shared cadence for the time conversion.
+Straight and polyline traces do not estimate acceleration; their acceleration field is left blank/NaN because those modes are velocity measurements, not curvature fits.
+
+#### Export manual velocities
+
+Manual velocity traces can be exported in two places:
+
+- inside the detached TD window, use `Slope Velocity` -> `Save table` for the currently open cut
+- in `Session / Export`, use `Selected velocity`, `Stack velocities`, or `All velocities`
+
+These exports always write a CSV/JSON table with the saved velocity rows. If `Write PNG` is enabled in `Session / Export`, the app also writes one TD quicklook PNG per exported cut that has manual velocity traces. The PNG shows the cut/map context and overlays the manual velocity lines on the TD plot.
+
+The velocity export is separate from `Selected wave traces`, `Stack wave traces`, and `All wave traces`, which are for wavelet/NUWT event traces.
+
+Use `Macro Tables` from `Session / Export` when the same selected cut, stack, or full session has both wave/event data and manual velocity traces. It writes grouped CSV/JSON bundles for wave events, wave trace points, wave physical parameters, velocity traces, velocity segments, and velocity physical parameters.
+
+#### Debug manual velocity tracing
+
+If the GUI appears to hang while drawing or saving a manual velocity trace, run the app with:
+
+```bash
+TD_MOSAIC_DEBUG_VELOCITY=1 python td_mosaic_app.py
+```
+
+This prints `[velocity-debug ...]` lines for click handling, record building, table refresh, redraw, and finish/save timing. If the hang only happens while moving the mouse during preview, add the motion flag:
+
+```bash
+TD_MOSAIC_DEBUG_VELOCITY=1 TD_MOSAIC_DEBUG_VELOCITY_MOTION=1 python td_mosaic_app.py
+```
+
+The motion flag is intentionally noisy; use it only when the basic velocity debug output stops before showing the problem.
+
+#### Geometry correction
+
+`Geometry correction` is optional and is off by default. Leave it as `Projected only` when you want the measured plane-of-image speed without interpretation.
+
+Use the scenarios as follows:
+
+- `Surface center-limb`: use when the motion is assumed to lie on the solar surface and is mainly along the center-limb direction. Provide `mu` or `theta deg`.
+- `Surface direction`: use when the motion is on the solar surface but not purely center-limb. Provide `mu` or `theta deg`, plus `alpha deg` for the projected motion direction relative to center-limb.
+- `Cut not aligned`: use when the TD cut is not aligned with the projected motion. Provide `phi deg`, the angle between the cut and the projected motion direction.
+- `Loop tilted`: use when the motion follows a loop or structure tilted out of the image plane. Provide `incl deg`, the tilt relative to the image plane.
+- `Radial motion`: use for outward radial motion away from disk center. Provide `theta deg` or `mu`; this correction is undefined at disk center.
+
+New velocity traces always keep the original measured `speed_km_s`. When geometry correction is enabled, the trace also stores `geometry_model`, `geometry_factor`, and `speed_corrected_km_s` so the corrected value remains separate from the raw projected measurement.
 
 Each trace stores:
 
+- trace kind and point count
+- all clicked TD points
+- per-segment velocities between consecutive clicked points
 - `t0`, `t1`
 - `d0`, `d1`
 - displacement in pixels
 - speed in pixels per frame
-- speed in km/s when `cad` and `res` are set
+- speed in km/s when cadence, arcsec/px, and km/arcsec are set
+- `km_per_pixel`
+- `km_s_per_px_frame`
+- geometry model, factor, and corrected speed when enabled
+- segment speed ranges for multi-point traces
+- acceleration for quadratic fits
 
 These manual traces are useful for quick dynamics checks, phase-speed estimates, and comparison against wavelet-derived velocity amplitude. They are not produced by the `wave` package and do not replace the wavelet event table.
 
@@ -596,7 +685,9 @@ This is the best export if you want a table of linked waves and their grouped pr
 
 The `Saved FITS` browser lets you inspect products previously exported by the app from the current export folder. It can preview saved maps, TD products, and table-like outputs.
 
-## Exhaustive studies
+## Robust/exhaustive studies
+
+The sidebar labels these tools as `Robust Study` and `Robust Cube Study`. Some code paths and older notes still call the same workflow an exhaustive study.
 
 The study tools generate a controlled grid of straight cuts from one selected straight base cut. They are intended for systematic scans over displacement and angle.
 
@@ -671,6 +762,8 @@ The intended analysis logic is:
 - [`app_code/core.py`](./app_code/core.py): cube loading, straight/curved cut geometry, TD sampling, and display helpers
 - [`app_code/td_wavelet_filter.py`](./app_code/td_wavelet_filter.py): wavelet segmentation and event extraction
 - [`app_code/nuwt`](./app_code/nuwt): Python port of the core Auto-NUWT routines
+
+For future code changes, use [`DEVELOPER_NOTES.md`](./DEVELOPER_NOTES.md) as the maintenance map before reading large parts of the codebase.
 
 ## Short version
 

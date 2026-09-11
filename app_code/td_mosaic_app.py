@@ -190,6 +190,29 @@ DEFAULT_WAVELET_FILTER = {
     "error_weight": 0.15,
 }
 
+VELOCITY_GEOMETRY_MODELS = (
+    ("projected", "Projected only"),
+    ("surface_center_limb", "Surface center-limb"),
+    ("surface_direction", "Surface direction"),
+    ("cut_alignment", "Cut not aligned"),
+    ("loop_inclination", "Loop tilted"),
+    ("radial_motion", "Radial motion"),
+)
+VELOCITY_GEOMETRY_LABELS = {
+    key: label for key, label in VELOCITY_GEOMETRY_MODELS
+}
+VELOCITY_GEOMETRY_LABEL_TO_KEY = {
+    label: key for key, label in VELOCITY_GEOMETRY_MODELS
+}
+VELOCITY_GEOMETRY_HINTS = {
+    "projected": "Use when geometry is unknown or no correction is desired.",
+    "surface_center_limb": "Use for surface motion mainly along the center-limb direction.",
+    "surface_direction": "Use for surface motion with a known projected direction angle.",
+    "cut_alignment": "Use when the TD cut is not aligned with the projected motion.",
+    "loop_inclination": "Use when the structure is tilted out of the image plane.",
+    "radial_motion": "Use for outward radial motion seen away from disk center.",
+}
+
 WAVELET_EVENT_TABLE_COLUMNS = (
     "id",
     "status",
@@ -258,6 +281,12 @@ MAX_WAVELET_HISTORY = 60
 WAVELET_SEGMENT_TIMEOUT_S = 8.0
 WAVELET_SEGMENT_POLL_S = 0.25
 DEBUG_STACK_WAVELET_TRACE = False
+DEBUG_VELOCITY_TRACE = str(
+    os.environ.get("TD_MOSAIC_DEBUG_VELOCITY", "")
+).strip().lower() in {"1", "true", "yes", "on"}
+DEBUG_VELOCITY_TRACE_MOTION = str(
+    os.environ.get("TD_MOSAIC_DEBUG_VELOCITY_MOTION", "")
+).strip().lower() in {"1", "true", "yes", "on"}
 
 PARAMETER_PRESETS = {
     "custom": {
@@ -484,6 +513,13 @@ def _trace_stack_wavelet(message: str) -> None:
         return
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[td-debug {timestamp}] {message}", file=sys.stderr, flush=True)
+
+
+def _trace_velocity(message: str) -> None:
+    if not DEBUG_VELOCITY_TRACE:
+        return
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[velocity-debug {timestamp}] {message}", file=sys.stderr, flush=True)
 
 
 def _wavelet_segment_process_main(task_queue: Any, result_queue: Any) -> None:
@@ -923,6 +959,15 @@ class TDMosaicApp:
             "velocity_traces": [],
             "velocity_next_trace_id": 1,
             "velocity_selected_trace_id": None,
+            "velocity_geometry": {
+                "enabled": False,
+                "model": "projected",
+                "mu": "1.0",
+                "theta_deg": "",
+                "alpha_deg": "0.0",
+                "phi_deg": "0.0",
+                "inclination_deg": "0.0",
+            },
             "dynamic_enabled": False,
             "dynamic_reference_frame": 0,
             "dynamic_keyframes": {},
@@ -2078,6 +2123,45 @@ class TDMosaicApp:
         self._refresh_saved_fits_browser()
         self._record_session_change()
 
+    def _normalize_valid_cut_ids(self, cut_ids: Any) -> list[int]:
+        valid_cut_ids: list[int] = []
+        for raw_cut_id in cut_ids or []:
+            try:
+                cut_id = int(raw_cut_id)
+            except Exception:
+                continue
+            if cut_id in self.cuts and cut_id not in valid_cut_ids:
+                valid_cut_ids.append(cut_id)
+        return valid_cut_ids
+
+    def _stack_cut_ids(self, stack: dict[str, Any] | None) -> list[int]:
+        if stack is None:
+            return []
+        return self._normalize_valid_cut_ids(stack.get("cut_ids") or [])
+
+    def _set_export_widget_enabled(self, widget: Any, enabled: bool) -> None:
+        if widget is None:
+            return
+        try:
+            widget.configure(state=("normal" if bool(enabled) else "disabled"))
+        except Exception:
+            pass
+
+    def _cut_has_wave_events(self, cut_id: int) -> bool:
+        if int(cut_id) not in self.cuts:
+            return False
+        state = self._cut_analysis_snapshot(int(cut_id))
+        return any(isinstance(event, dict) for event in (state.get("wavelet_events") or []))
+
+    def _cut_has_velocity_traces(self, cut_id: int) -> bool:
+        return bool(self._velocity_traces_for_cut(int(cut_id)))
+
+    def _scope_has_wave_events(self, cut_ids: list[int]) -> bool:
+        return any(self._cut_has_wave_events(cut_id) for cut_id in cut_ids)
+
+    def _scope_has_velocity_traces(self, cut_ids: list[int]) -> bool:
+        return any(self._cut_has_velocity_traces(cut_id) for cut_id in cut_ids)
+
     def _refresh_export_controls(self) -> None:
         if not hasattr(self, "export_info_var"):
             return
@@ -2097,9 +2181,11 @@ class TDMosaicApp:
             f"Current map frame: t={current_t}",
         ]
         cut = self._selected_cut()
+        selected_cut_ids: list[int] = []
         if cut is None:
             lines.append("Selected cut: none")
         else:
+            selected_cut_ids = [int(cut.cut_id)]
             params = self._cut_td_params(cut.cut_id)
             p0_now, p1_now = self._cut_geometry_for_frame(cut.cut_id, current_t)
             lines.append(
@@ -2109,12 +2195,88 @@ class TDMosaicApp:
                 f"({p1_now[0]:.1f},{p1_now[1]:.1f})"
             )
         stack = self._selected_stack()
+        stack_cut_ids = self._stack_cut_ids(stack)
         if stack is not None:
             lines.append(
                 f"Active stack {int(stack['stack_id'])}: {stack['name']} | "
-                f"cuts={len(stack.get('cut_ids') or [])}"
+                f"cuts={len(stack_cut_ids)}"
+            )
+        all_cut_ids = sorted(self.cuts.keys())
+        write_image_or_fits = bool(
+            self._export_kind_enabled("fits") or self._export_kind_enabled("png")
+        )
+        selected_has_cuts = bool(selected_cut_ids)
+        stack_has_cuts = bool(stack_cut_ids)
+        all_has_cuts = bool(all_cut_ids)
+        selected_has_waves = self._scope_has_wave_events(selected_cut_ids)
+        stack_has_waves = self._scope_has_wave_events(stack_cut_ids)
+        all_has_waves = self._scope_has_wave_events(all_cut_ids)
+        selected_has_velocities = self._scope_has_velocity_traces(selected_cut_ids)
+        stack_has_velocities = self._scope_has_velocity_traces(stack_cut_ids)
+        all_has_velocities = self._scope_has_velocity_traces(all_cut_ids)
+        selected_has_macro = selected_has_waves and selected_has_velocities
+        stack_has_macro = stack_has_waves and stack_has_velocities
+        all_has_macro = all_has_waves and all_has_velocities
+        if all_has_cuts:
+            lines.append(
+                "Saved analysis: "
+                f"waves={'yes' if all_has_waves else 'no'} | "
+                f"velocities={'yes' if all_has_velocities else 'no'} | "
+                f"macro={'ready' if all_has_macro else 'needs waves + velocities'}"
             )
         self.export_info_var.set("\n".join(lines))
+        self._set_export_widget_enabled(
+            getattr(self, "export_current_map_button", None),
+            write_image_or_fits,
+        )
+        self._set_export_widget_enabled(
+            getattr(self, "export_selected_cut_button", None),
+            selected_has_cuts and write_image_or_fits,
+        )
+        self._set_export_widget_enabled(
+            getattr(self, "export_stack_cut_button", None),
+            stack_has_cuts and write_image_or_fits,
+        )
+        self._set_export_widget_enabled(
+            getattr(self, "export_all_cut_button", None),
+            all_has_cuts and write_image_or_fits,
+        )
+        self._set_export_widget_enabled(
+            getattr(self, "export_selected_wave_button", None),
+            selected_has_waves and write_image_or_fits,
+        )
+        self._set_export_widget_enabled(
+            getattr(self, "export_stack_wave_button", None),
+            stack_has_waves and write_image_or_fits,
+        )
+        self._set_export_widget_enabled(
+            getattr(self, "export_all_wave_button", None),
+            all_has_waves and write_image_or_fits,
+        )
+        self._set_export_widget_enabled(
+            getattr(self, "export_selected_velocity_button", None),
+            selected_has_velocities,
+        )
+        self._set_export_widget_enabled(
+            getattr(self, "export_stack_velocity_button", None),
+            stack_has_velocities,
+        )
+        self._set_export_widget_enabled(
+            getattr(self, "export_all_velocity_button", None),
+            all_has_velocities,
+        )
+        self._set_export_widget_enabled(
+            getattr(self, "export_selected_macro_button", None),
+            selected_has_macro,
+        )
+        self._set_export_widget_enabled(
+            getattr(self, "export_stack_macro_button", None),
+            stack_has_macro,
+        )
+        self._set_export_widget_enabled(
+            getattr(self, "export_all_macro_button", None),
+            all_has_macro,
+        )
 
     def _point_on_segment_distance(
         self,
@@ -3315,6 +3477,7 @@ class TDMosaicApp:
         *,
         map_cut_ids: list[int] | None = None,
         selected_event_id: int | None = None,
+        show_analysis_overlay: bool = True,
     ) -> None:
         if cut_id not in self.cuts:
             raise ValueError(f"Unknown cut id {cut_id}.")
@@ -3364,7 +3527,396 @@ class TDMosaicApp:
             title_fontsize=10.0,
             selected_event_id=selected_event_id,
             title_prefix=("Trace: " if selected_event_id is not None else ""),
+            show_analysis_overlay=show_analysis_overlay,
         )
+        self._save_export_figure_png(fig, save_path)
+
+    def _velocity_traces_for_cut(self, cut_id: int) -> list[dict[str, Any]]:
+        if int(cut_id) not in self.cuts:
+            return []
+        state = self._cut_analysis_snapshot(int(cut_id))
+        return [
+            dict(trace)
+            for trace in (state.get("velocity_traces") or [])
+            if isinstance(trace, dict)
+        ]
+
+    def _velocity_trace_export_rows(self, cut_ids: list[int]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        numeric_keys = (
+            "t0",
+            "d0",
+            "t1",
+            "d1",
+            "delta_frames",
+            "delta_dist_px",
+            "duration_s",
+            "speed_px_frame",
+            "speed_px_s",
+            "speed_arcsec_s",
+            "speed_km_s",
+            "speed_km_s_abs",
+            "segment_speed_px_frame_min",
+            "segment_speed_px_frame_max",
+            "segment_speed_km_s_min",
+            "segment_speed_km_s_max",
+            "segment_speed_km_s_abs_mean",
+            "fit_t_center",
+            "acceleration_px_frame2",
+            "acceleration_km_s2",
+            "cad_s",
+            "res_arcsec_px",
+            "km_per_arcsec",
+            "km_per_pixel",
+            "km_s_per_px_frame",
+            "km_s2_per_px_frame2",
+            "geometry_factor",
+            "geometry_mu",
+            "geometry_theta_deg",
+            "geometry_alpha_deg",
+            "geometry_phi_deg",
+            "geometry_inclination_deg",
+            "speed_corrected_km_s",
+            "speed_corrected_km_s_abs",
+        )
+        for cut_id in [int(item) for item in cut_ids if int(item) in self.cuts]:
+            cut = self.cuts[cut_id]
+            for trace in self._velocity_traces_for_cut(cut_id):
+                points = [
+                    {"t": float(t_value), "d": float(d_value)}
+                    for t_value, d_value in self._velocity_trace_points_from_payload(trace)
+                ]
+                segments = self._velocity_trace_segment_rows(trace)
+                coefficients: list[float] = []
+                for value in trace.get("fit_coefficients_px") or []:
+                    try:
+                        coefficients.append(float(value))
+                    except Exception:
+                        continue
+                row: dict[str, Any] = {
+                    "source_cube": str(self.cube_path.name),
+                    "exported_at": self._timestamp_now(),
+                    "cut_id": int(cut_id),
+                    "cut_name": str(cut.name),
+                    "trace_id": self._safe_int_text(trace.get("trace_id", -1), -1),
+                    "label": str(trace.get("label") or ""),
+                    "trace_kind": str(trace.get("trace_kind") or "straight"),
+                    "point_count": self._safe_int_text(
+                        trace.get("point_count", len(points)), len(points)
+                    ),
+                    "fit_degree": self._safe_int_text(trace.get("fit_degree", 1), 1),
+                    "geometry_correction_enabled": self._safe_bool_value(
+                        trace.get("geometry_correction_enabled", False), False
+                    ),
+                    "geometry_model": str(trace.get("geometry_model") or "projected"),
+                    "geometry_model_label": str(
+                        trace.get("geometry_model_label") or "Projected only"
+                    ),
+                    "geometry_factor_valid": self._safe_bool_value(
+                        trace.get("geometry_factor_valid", True), True
+                    ),
+                    "geometry_note": str(trace.get("geometry_note") or ""),
+                    "points": points,
+                    "segments": segments,
+                    "fit_coefficients_px": coefficients,
+                }
+                for key in numeric_keys:
+                    row[key] = self._safe_float_text(trace.get(key, ""), float("nan"))
+                rows.append(row)
+        rows.sort(key=lambda row: (int(row["cut_id"]), int(row["trace_id"])))
+        return rows
+
+    def _velocity_segment_export_rows(self, cut_ids: list[int]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for cut_id in [int(item) for item in cut_ids if int(item) in self.cuts]:
+            cut = self.cuts[cut_id]
+            for trace in self._velocity_traces_for_cut(cut_id):
+                trace_id = self._safe_int_text(trace.get("trace_id", -1), -1)
+                for segment in self._velocity_trace_segment_rows(trace):
+                    rows.append(
+                        {
+                            "source_cube": str(self.cube_path.name),
+                            "cut_id": int(cut_id),
+                            "cut_name": str(cut.name),
+                            "trace_id": int(trace_id),
+                            "trace_label": str(trace.get("label") or f"V{trace_id:02d}"),
+                            "trace_kind": str(trace.get("trace_kind") or "straight"),
+                            **dict(segment),
+                        }
+                    )
+        rows.sort(
+            key=lambda row: (
+                int(row["cut_id"]),
+                int(row["trace_id"]),
+                int(row["segment_index"]),
+            )
+        )
+        return rows
+
+    def _velocity_physical_params_export_rows(
+        self, cut_ids: list[int]
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for cut_id in [int(item) for item in cut_ids if int(item) in self.cuts]:
+            cut = self.cuts[cut_id]
+            for trace in self._velocity_traces_for_cut(cut_id):
+                trace_id = self._safe_int_text(trace.get("trace_id", -1), -1)
+                rows.append(
+                    {
+                        "source_cube": str(self.cube_path.name),
+                        "cut_id": int(cut_id),
+                        "cut_name": str(cut.name),
+                        "trace_id": int(trace_id),
+                        "trace_label": str(trace.get("label") or f"V{trace_id:02d}"),
+                        "trace_kind": str(trace.get("trace_kind") or "straight"),
+                        "cad_s": self._safe_float_text(trace.get("cad_s", ""), float("nan")),
+                        "res_arcsec_px": self._safe_float_text(trace.get("res_arcsec_px", ""), float("nan")),
+                        "km_per_arcsec": self._safe_float_text(trace.get("km_per_arcsec", ""), float("nan")),
+                        "km_per_pixel": self._safe_float_text(trace.get("km_per_pixel", ""), float("nan")),
+                        "km_s_per_px_frame": self._safe_float_text(trace.get("km_s_per_px_frame", ""), float("nan")),
+                        "km_s2_per_px_frame2": self._safe_float_text(trace.get("km_s2_per_px_frame2", ""), float("nan")),
+                        "geometry_correction_enabled": self._safe_bool_value(
+                            trace.get("geometry_correction_enabled", False), False
+                        ),
+                        "geometry_model": str(trace.get("geometry_model") or "projected"),
+                        "geometry_model_label": str(trace.get("geometry_model_label") or "Projected only"),
+                        "geometry_factor": self._safe_float_text(trace.get("geometry_factor", ""), float("nan")),
+                        "geometry_factor_valid": self._safe_bool_value(
+                            trace.get("geometry_factor_valid", True), True
+                        ),
+                        "geometry_mu": self._safe_float_text(trace.get("geometry_mu", ""), float("nan")),
+                        "geometry_theta_deg": self._safe_float_text(trace.get("geometry_theta_deg", ""), float("nan")),
+                        "geometry_alpha_deg": self._safe_float_text(trace.get("geometry_alpha_deg", ""), float("nan")),
+                        "geometry_phi_deg": self._safe_float_text(trace.get("geometry_phi_deg", ""), float("nan")),
+                        "geometry_inclination_deg": self._safe_float_text(trace.get("geometry_inclination_deg", ""), float("nan")),
+                        "geometry_note": str(trace.get("geometry_note") or ""),
+                    }
+                )
+        rows.sort(key=lambda row: (int(row["cut_id"]), int(row["trace_id"])))
+        return rows
+
+    def _wave_event_export_rows(self, cut_ids: list[int]) -> list[dict[str, Any]]:
+        cut_id_set = {int(item) for item in cut_ids if int(item) in self.cuts}
+        rows = [
+            dict(row)
+            for row in self._collect_curated_event_rows()
+            if int(row.get("cut_id", -1)) in cut_id_set
+        ]
+        rows.sort(key=lambda row: (int(row.get("cut_id", -1)), int(row.get("event_id", -1))))
+        return rows
+
+    def _wave_trace_export_rows(self, cut_ids: list[int]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for cut_id in [int(item) for item in cut_ids if int(item) in self.cuts]:
+            cut = self.cuts[cut_id]
+            _td, meta = self._cut_td(cut_id)
+            if meta is not None and "error" in meta:
+                meta = None
+            state = self._cut_analysis_snapshot(cut_id)
+            for event in state.get("wavelet_events") or []:
+                if not isinstance(event, dict):
+                    continue
+                self._ensure_wavelet_event_fields(event)
+                event_id = int(event.get("event_id", -1))
+                status = self._td_window_wavelet_event_status(event)
+                counted = bool(self._td_window_wavelet_event_is_counted(event))
+                for trace_row in self._event_trace_rows(cut_id, event, meta=meta):
+                    rows.append(
+                        {
+                            "source_cube": str(self.cube_path.name),
+                            "cut_id": int(cut_id),
+                            "cut_name": str(cut.name),
+                            "event_id": int(event_id),
+                            "status": str(status),
+                            "counted": bool(counted),
+                            **dict(trace_row),
+                        }
+                    )
+        rows.sort(
+            key=lambda row: (
+                int(row["cut_id"]),
+                int(row["event_id"]),
+                str(row.get("series", "")),
+                float(row.get("t_idx", float("nan"))),
+                int(row.get("point_index", 0)),
+            )
+        )
+        return rows
+
+    def _wave_physical_params_export_rows(
+        self, cut_ids: list[int]
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for cut_id in [int(item) for item in cut_ids if int(item) in self.cuts]:
+            cut = self.cuts[cut_id]
+            state = self._cut_analysis_snapshot(cut_id)
+            crest_params, wavelet_params = self._merge_crest_and_wavelet_params(
+                state.get("crest_params"), state.get("wavelet_params")
+            )
+            event_count = len(
+                [event for event in state.get("wavelet_events") or [] if isinstance(event, dict)]
+            )
+            counted_count = 0
+            for event in state.get("wavelet_events") or []:
+                if isinstance(event, dict):
+                    self._ensure_wavelet_event_fields(event)
+                    counted_count += int(bool(self._td_window_wavelet_event_is_counted(event)))
+            cad_s = float(crest_params["cad"])
+            res_arcsec_px = float(crest_params["res"])
+            km_per_arcsec = float(wavelet_params["km_per_arcsec"])
+            km_per_pixel = (
+                float("nan")
+                if res_arcsec_px <= 0.0 or km_per_arcsec <= 0.0
+                else res_arcsec_px * km_per_arcsec
+            )
+            rows.append(
+                {
+                    "source_cube": str(self.cube_path.name),
+                    "cut_id": int(cut_id),
+                    "cut_name": str(cut.name),
+                    "preset_name": str(state.get("preset_name", "custom")),
+                    "event_count": int(event_count),
+                    "counted_event_count": int(counted_count),
+                    "cad_s": float(cad_s),
+                    "res_arcsec_px": float(res_arcsec_px),
+                    "km_per_arcsec": float(km_per_arcsec),
+                    "km_per_pixel": float(km_per_pixel),
+                    "grad": float(crest_params["grad"]),
+                    "min_tlen": int(crest_params["min_tlen"]),
+                    "max_dist_jump": int(crest_params["max_dist_jump"]),
+                    "max_time_skip": int(crest_params["max_time_skip"]),
+                    "invert": bool(crest_params["invert"]),
+                    "gauss": bool(crest_params["gauss"]),
+                    "p_min": float(wavelet_params["p_min"]),
+                    "p_max": float(wavelet_params["p_max"]),
+                    "power_ratio_thresh": float(wavelet_params["power_ratio_thresh"]),
+                    "segment_power_frac": float(wavelet_params["segment_power_frac"]),
+                    "min_points_segment": int(wavelet_params["min_points_segment"]),
+                    "min_amp_arcsec": float(wavelet_params["min_amp_arcsec"]),
+                    "max_jump_pix": float(wavelet_params["max_jump_pix"]),
+                    "min_points_cut_seg": int(wavelet_params["min_points_cut_seg"]),
+                    "rms_amp_ratio_max": float(wavelet_params["rms_amp_ratio_max"]),
+                    "density_kg_m3": float(wavelet_params["density_kg_m3"]),
+                    "phase_speed_km_s": float(wavelet_params["phase_speed_km_s"]),
+                    "min_prominence": float(wavelet_params.get("min_prominence", float("nan"))),
+                    "min_snr": float(wavelet_params.get("min_snr", float("nan"))),
+                    "continuity_weight": float(wavelet_params.get("continuity_weight", float("nan"))),
+                    "time_weight": float(wavelet_params.get("time_weight", float("nan"))),
+                    "quality_weight": float(wavelet_params.get("quality_weight", float("nan"))),
+                    "error_weight": float(wavelet_params.get("error_weight", float("nan"))),
+                }
+            )
+        rows.sort(key=lambda row: int(row["cut_id"]))
+        return rows
+
+    def _draw_velocity_trace_payloads(
+        self,
+        ax: Any,
+        traces: list[dict[str, Any]],
+        *,
+        selected_trace_id: int | None = None,
+    ) -> int:
+        palette = ("deepskyblue", "gold", "lime", "cyan", "magenta", "white")
+        drawn = 0
+        for trace in traces:
+            if not isinstance(trace, dict):
+                continue
+            points = self._velocity_trace_points_from_payload(trace)
+            if len(points) < 2:
+                continue
+            t_values = [point[0] for point in points]
+            d_values = [point[1] for point in points]
+            plot_t = t_values
+            plot_d = d_values
+            if str(trace.get("trace_kind") or "straight") == "quadratic":
+                coefficients = trace.get("fit_coefficients_px") or []
+                if len(coefficients) == 3:
+                    try:
+                        fit_t_center = float(trace.get("fit_t_center", 0.0))
+                        sample_t = np.linspace(float(min(t_values)), float(max(t_values)), 80)
+                        sample_d = np.polyval(
+                            np.asarray(coefficients, dtype=float),
+                            sample_t - fit_t_center,
+                        )
+                        plot_t = [float(value) for value in sample_t]
+                        plot_d = [float(value) for value in sample_d]
+                    except Exception:
+                        plot_t = t_values
+                        plot_d = d_values
+            trace_id = int(trace.get("trace_id", -1))
+            is_selected = selected_trace_id is not None and trace_id == int(selected_trace_id)
+            color = "gold" if is_selected else palette[drawn % len(palette)]
+            linewidth = 2.6 if is_selected else 1.8
+            alpha = 1.0 if is_selected else 0.85
+            label = str(trace.get("label") or f"V{trace_id:02d}")
+            if self.td_swap_axes_var.get():
+                ax.plot(plot_t, plot_d, color=color, linewidth=linewidth, alpha=alpha)
+                ax.scatter(t_values, d_values, color=color, s=14, alpha=alpha, zorder=4)
+                ax.text(
+                    t_values[-1],
+                    d_values[-1],
+                    label,
+                    color=color,
+                    fontsize=8,
+                    bbox={"facecolor": "black", "alpha": 0.35, "edgecolor": "none"},
+                )
+            else:
+                ax.plot(plot_d, plot_t, color=color, linewidth=linewidth, alpha=alpha)
+                ax.scatter(d_values, t_values, color=color, s=14, alpha=alpha, zorder=4)
+                ax.text(
+                    d_values[-1],
+                    t_values[-1],
+                    label,
+                    color=color,
+                    fontsize=8,
+                    bbox={"facecolor": "black", "alpha": 0.35, "edgecolor": "none"},
+                )
+            drawn += 1
+        return drawn
+
+    def _write_velocity_trace_quicklook_png(
+        self,
+        cut_id: int,
+        save_path: Path,
+        *,
+        map_cut_ids: list[int] | None = None,
+    ) -> None:
+        traces = self._velocity_traces_for_cut(int(cut_id))
+        if not traces:
+            raise ValueError(f"No manual velocity traces for cut {int(cut_id)}.")
+        if int(cut_id) not in self.cuts:
+            raise ValueError(f"Unknown cut id {int(cut_id)}.")
+
+        fig = self.Figure(figsize=(12.8, 5.8), dpi=160)
+        grid = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.12], wspace=0.24)
+        map_ax = fig.add_subplot(grid[0, 0])
+        td_ax = fig.add_subplot(grid[0, 1])
+        frame_idx = int(self.t_visual_var.get())
+        context_cut_ids = (
+            [int(current_cut_id) for current_cut_id in map_cut_ids if int(current_cut_id) in self.cuts]
+            if map_cut_ids is not None
+            else [int(cut_id)]
+        )
+        if int(cut_id) not in context_cut_ids:
+            context_cut_ids.append(int(cut_id))
+        self._draw_export_map_axis(
+            map_ax,
+            frame_idx,
+            cut_ids=context_cut_ids,
+            focus_cut_id=int(cut_id),
+            title=f"Velocity trace overview | cut {int(cut_id)} | t={frame_idx}",
+        )
+        self._draw_cut_td_axis(
+            td_ax,
+            int(cut_id),
+            use_zoom=False,
+            title_fontsize=10.0,
+            title_prefix="Velocity: ",
+            show_analysis_overlay=False,
+        )
+        drawn = self._draw_velocity_trace_payloads(td_ax, traces)
+        if drawn <= 0:
+            raise ValueError(f"No plottable manual velocity traces for cut {int(cut_id)}.")
         self._save_export_figure_png(fig, save_path)
 
     def _write_cut_td_fits(self, cut_id: int, save_path: Path) -> None:
@@ -4055,6 +4607,161 @@ class TDMosaicApp:
             f"Saved {fits_written} trace FITS file(s) and {png_written} PNG quicklook(s) for {label}."
         )
 
+    def _export_velocity_trace_ids(
+        self,
+        cut_ids: list[int],
+        label: str,
+        *,
+        slug: str | None = None,
+    ) -> None:
+        valid_cut_ids = [int(cut_id) for cut_id in cut_ids if int(cut_id) in self.cuts]
+        if not valid_cut_ids:
+            self._set_status(f"No valid cuts available for {label}.")
+            return
+        self._sync_all_panel_analysis_state_from_windows()
+        rows = self._velocity_trace_export_rows(valid_cut_ids)
+        if not rows:
+            self._set_status(f"No manual velocity traces available for {label}.")
+            return
+        try:
+            scope_slug = self._safe_export_slug(slug or label)
+            table_base = (
+                self._resolved_export_target_dir("tables")
+                / f"{self.cube_path.stem}_{scope_slug}_velocity_traces"
+            )
+            self._write_table_bundle(table_base, rows)
+            png_written = 0
+            if self._export_kind_enabled("png"):
+                for cut_id in valid_cut_ids:
+                    if not self._velocity_traces_for_cut(cut_id):
+                        continue
+                    cut = self.cuts[cut_id]
+                    png_name = (
+                        f"{self.cube_path.stem}_cut{cut_id:03d}_"
+                        f"{self._safe_export_slug(cut.name)}_velocity_traces.png"
+                    )
+                    png_path = self._resolved_export_target_dir("png") / png_name
+                    self._write_velocity_trace_quicklook_png(
+                        cut_id,
+                        png_path,
+                        map_cut_ids=valid_cut_ids,
+                    )
+                    png_written += 1
+        except Exception as exc:
+            self._set_status(f"Velocity trace export failed: {type(exc).__name__}: {exc}")
+            return
+        self._set_status(
+            f"Saved {len(rows)} manual velocity row(s) for {label} as CSV/JSON at {table_base}. "
+            f"PNG quicklooks: {png_written}."
+        )
+
+    def _export_macro_table_ids(
+        self,
+        cut_ids: list[int],
+        label: str,
+        *,
+        slug: str | None = None,
+    ) -> None:
+        valid_cut_ids = [int(cut_id) for cut_id in cut_ids if int(cut_id) in self.cuts]
+        if not valid_cut_ids:
+            self._set_status(f"No valid cuts available for {label}.")
+            return
+        self._sync_all_panel_analysis_state_from_windows()
+        has_waves = self._scope_has_wave_events(valid_cut_ids)
+        has_velocities = self._scope_has_velocity_traces(valid_cut_ids)
+        if not has_waves or not has_velocities:
+            missing = []
+            if not has_waves:
+                missing.append("wave/event traces")
+            if not has_velocities:
+                missing.append("manual velocity traces")
+            self._set_status(
+                f"Macro tables need both wave/event data and manual velocity data for {label}; "
+                f"missing {', '.join(missing)}."
+            )
+            return
+        scope_slug = self._safe_export_slug(slug or label)
+        root_dir = (
+            self._resolved_export_target_dir("tables")
+            / f"{self.cube_path.stem}_{scope_slug}_macro_tables"
+        )
+        try:
+            tables = {
+                "wave_event_table": self._wave_event_export_rows(valid_cut_ids),
+                "wave_trace_table": self._wave_trace_export_rows(valid_cut_ids),
+                "wave_physical_params_table": self._wave_physical_params_export_rows(valid_cut_ids),
+                "velocity_trace_table": self._velocity_trace_export_rows(valid_cut_ids),
+                "velocity_segment_table": self._velocity_segment_export_rows(valid_cut_ids),
+                "velocity_physical_params_table": self._velocity_physical_params_export_rows(valid_cut_ids),
+            }
+            for table_name, rows in tables.items():
+                self._write_table_bundle(root_dir / table_name, rows)
+            manifest = {
+                "source_cube": str(self.cube_path),
+                "exported_at": self._timestamp_now(),
+                "scope_label": str(label),
+                "cut_ids": [int(cut_id) for cut_id in valid_cut_ids],
+                "tables": {
+                    table_name: {
+                        "row_count": int(len(rows)),
+                        "json_path": str(root_dir / f"{table_name}.json"),
+                        "csv_path": str(root_dir / f"{table_name}.csv"),
+                    }
+                    for table_name, rows in tables.items()
+                },
+            }
+            self._write_json_file(root_dir / "manifest.json", manifest)
+        except Exception as exc:
+            self._set_status(f"Macro table export failed: {type(exc).__name__}: {exc}")
+            return
+        counts = ", ".join(
+            f"{name}={len(rows)}" for name, rows in tables.items()
+        )
+        self._set_status(
+            f"Exported macro tables for {label} at {root_dir} ({counts})."
+        )
+
+    def _show_save_export_help(self, topic: str) -> None:
+        messages = {
+            "velocity_save": (
+                "Save Velocity Table",
+                "Saves the manual Slope Velocity traces for the current cut as CSV/JSON. "
+                "Rows include the clicked points, segment speeds, saved physical scale, geometry correction, "
+                "and quadratic acceleration when applicable.\n\n"
+                "This button turns on after the current TD window has at least one saved velocity trace.\n\n"
+                "Use this while working on one TD window. Use Session / Export for selected/stack/all outputs."
+            ),
+            "map_export": (
+                "Save Current Map",
+                "Saves the currently displayed map frame using the active FITS and/or PNG switches. "
+                "It turns off when both Write FITS and Write PNG are disabled."
+            ),
+            "td_cut_export": (
+                "TD Cut Exports",
+                "Saves TD products for existing cuts. Selected cut uses the active cut, Stack uses the active stack, "
+                "and All cuts uses every cut in the session.\n\n"
+                "These buttons use the active FITS and/or PNG switches and turn off when there are no matching cuts."
+            ),
+            "trace_velocity_export": (
+                "Wave / Velocity Exports",
+                "Wave trace buttons export wavelet/NUWT event traces. They are event products and can write FITS/PNG according to the switches above.\n\n"
+                "Velocity buttons export manual Slope Velocity traces. They write CSV/JSON tables, plus PNG quicklooks when Write PNG is enabled.\n\n"
+                "Buttons turn on only when the selected cut, stack, or full session has matching saved data."
+            ),
+            "macro_tables": (
+                "Macro Tables",
+                "Writes a folder of CSV/JSON tables for the selected scope. It is meant for analysis notebooks and paper tables.\n\n"
+                "Tables: wave_event_table, wave_trace_table, wave_physical_params_table, "
+                "velocity_trace_table, velocity_segment_table, velocity_physical_params_table, and manifest.json.\n\n"
+                "Macro buttons turn on only when that scope has both wave/event data and manual velocity traces."
+            ),
+        }
+        title, message = messages.get(
+            str(topic),
+            ("Export Help", "No help is available for this item yet."),
+        )
+        self.messagebox.showinfo(title, message)
+
     def _export_selected_cut_fits(self) -> None:
         cut = self._selected_cut()
         if cut is None:
@@ -4094,6 +4801,76 @@ class TDMosaicApp:
 
     def _export_all_trace_fits(self) -> None:
         self._export_trace_ids_fits(sorted(self.cuts.keys()), "all cuts")
+
+    def _export_selected_cut_velocity_traces(self) -> None:
+        cut = self._selected_cut()
+        if cut is None:
+            self._set_status("Select a cut first.")
+            return
+        self._export_velocity_trace_ids(
+            [int(cut.cut_id)],
+            f"selected cut {cut.name}",
+            slug=f"selected_cut{int(cut.cut_id):03d}_{self._safe_export_slug(cut.name)}",
+        )
+
+    def _export_stack_velocity_traces(self) -> None:
+        stack = self._selected_stack()
+        if stack is None:
+            self._set_status("Select a stack first.")
+            return
+        self._export_velocity_trace_ids(
+            [int(cut_id) for cut_id in stack.get("cut_ids") or []],
+            f"stack {stack['name']}",
+            slug=f"stack{int(stack['stack_id']):03d}_{self._safe_export_slug(stack['name'])}",
+        )
+
+    def _export_all_velocity_traces(self) -> None:
+        self._export_velocity_trace_ids(
+            sorted(self.cuts.keys()),
+            "all cuts",
+            slug="all_cuts",
+        )
+
+    def _export_selected_cut_macro_tables(self) -> None:
+        cut = self._selected_cut()
+        if cut is None:
+            self._set_status("Select a cut first.")
+            return
+        self._export_macro_table_ids(
+            [int(cut.cut_id)],
+            f"selected cut {cut.name}",
+            slug=f"selected_cut{int(cut.cut_id):03d}_{self._safe_export_slug(cut.name)}",
+        )
+
+    def _export_stack_macro_tables(self) -> None:
+        stack = self._selected_stack()
+        if stack is None:
+            self._set_status("Select a stack first.")
+            return
+        self._export_macro_table_ids(
+            [int(cut_id) for cut_id in stack.get("cut_ids") or []],
+            f"stack {stack['name']}",
+            slug=f"stack{int(stack['stack_id']):03d}_{self._safe_export_slug(stack['name'])}",
+        )
+
+    def _export_all_macro_tables(self) -> None:
+        self._export_macro_table_ids(
+            sorted(self.cuts.keys()),
+            "all cuts",
+            slug="all_cuts",
+        )
+
+    def _export_td_window_velocity_traces(self, panel_id: int) -> None:
+        panel = self._td_window_panel(panel_id)
+        if panel is None or panel.cut_id is None or int(panel.cut_id) not in self.cuts:
+            self._set_status(f"{panel.name if panel is not None else 'Panel'}: no linked cut to export.")
+            return
+        cut = self.cuts[int(panel.cut_id)]
+        self._export_velocity_trace_ids(
+            [int(cut.cut_id)],
+            f"{panel.name} / {cut.name}",
+            slug=f"panel{int(panel_id):02d}_cut{int(cut.cut_id):03d}_{self._safe_export_slug(cut.name)}",
+        )
 
     def _next_link_group_label(self) -> str:
         label = f"LG{self.next_link_group_id:04d}"
@@ -4602,6 +5379,9 @@ class TDMosaicApp:
         snapshot["velocity_selected_trace_id"] = existing.get(
             "velocity_selected_trace_id"
         )
+        snapshot["velocity_geometry"] = self._velocity_geometry_settings_from_window(
+            existing
+        )
         return snapshot
 
     def _sync_panel_analysis_state_from_window(self, panel_id: int) -> None:
@@ -4699,6 +5479,9 @@ class TDMosaicApp:
             ),
             "velocity_selected_trace_id": normalized.get(
                 "velocity_selected_trace_id"
+            ),
+            "velocity_geometry": self._normalize_velocity_geometry_settings(
+                normalized.get("velocity_geometry")
             ),
         }
 
@@ -4880,6 +5663,7 @@ class TDMosaicApp:
         self._refresh_metrics_window()
         self._refresh_link_groups_window()
         self._refresh_propagation_window()
+        self._refresh_export_controls()
         self._schedule_stack_browser_refresh()
         _trace_stack_wavelet("record_session_change end")
 
@@ -12814,6 +13598,7 @@ class TDMosaicApp:
         title_fontsize: float = 9.0,
         selected_event_id: int | None = None,
         title_prefix: str = "",
+        show_analysis_overlay: bool = True,
     ) -> None:
         current_t = int(self.t_visual_var.get())
         td_aspect = "equal" if self.td_aspect_var.get() == "equal" else "auto"
@@ -12909,7 +13694,8 @@ class TDMosaicApp:
             ax.set_xlabel("distance [pixel]")
             ax.set_ylabel("time index")
 
-        self._draw_cut_analysis_overlay(ax, cut_id, meta, selected_event_id=selected_event_id)
+        if show_analysis_overlay:
+            self._draw_cut_analysis_overlay(ax, cut_id, meta, selected_event_id=selected_event_id)
         dynamic_note = " | dynamic" if self._cut_dynamic_enabled(cut_id) else ""
         ax.set_title(
             f"{title_prefix}{cut.name} | t={int(params['t_ini'])}:{int(params['t_fin'])}:{int(params['stride'])} | "
@@ -13993,44 +14779,44 @@ class TDMosaicApp:
         self.sidebar_notebook = self.ttk.Notebook(self.sidebar)
         self.sidebar_notebook.grid(row=0, column=0, sticky="nsew")
 
-        panel_tab_outer, self.sidebar_panel_tab, _ = self._create_scrolled_frame(
+        session_tab_outer, self.sidebar_session_tab, _ = self._create_scrolled_frame(
             self.sidebar_notebook, padding=4
         )
-        cuts_tab_outer, self.sidebar_cuts_tab, _ = self._create_scrolled_frame(
+        cuts_geometry_tab_outer, self.sidebar_cuts_geometry_tab, _ = self._create_scrolled_frame(
             self.sidebar_notebook, padding=4
         )
-        geometry_tab_outer, self.sidebar_geometry_tab, _ = self._create_scrolled_frame(
+        td_stacks_tab_outer, self.sidebar_td_stacks_tab, _ = self._create_scrolled_frame(
             self.sidebar_notebook, padding=4
         )
-        measure_tab_outer, self.sidebar_measure_tab, _ = self._create_scrolled_frame(
+        velocity_tab_outer, self.sidebar_velocity_tab, _ = self._create_scrolled_frame(
             self.sidebar_notebook, padding=4
         )
-        stacks_tab_outer, self.sidebar_stacks_tab, _ = self._create_scrolled_frame(
+        waves_tab_outer, self.sidebar_waves_tab, _ = self._create_scrolled_frame(
             self.sidebar_notebook, padding=4
         )
-        export_tab_outer, self.sidebar_export_tab, _ = self._create_scrolled_frame(
+        robust_study_tab_outer, self.sidebar_robust_study_tab, _ = self._create_scrolled_frame(
             self.sidebar_notebook, padding=4
         )
 
         for tab in (
-            self.sidebar_panel_tab,
-            self.sidebar_cuts_tab,
-            self.sidebar_geometry_tab,
-            self.sidebar_measure_tab,
-            self.sidebar_stacks_tab,
-            self.sidebar_export_tab,
+            self.sidebar_session_tab,
+            self.sidebar_cuts_geometry_tab,
+            self.sidebar_td_stacks_tab,
+            self.sidebar_velocity_tab,
+            self.sidebar_waves_tab,
+            self.sidebar_robust_study_tab,
         ):
             tab.columnconfigure(0, weight=1)
 
-        self.sidebar_notebook.add(panel_tab_outer, text="TD")
-        self.sidebar_notebook.add(cuts_tab_outer, text="Cuts")
-        self.sidebar_notebook.add(geometry_tab_outer, text="Geometry")
-        self.sidebar_notebook.add(measure_tab_outer, text="Measure")
-        self.sidebar_notebook.add(stacks_tab_outer, text="Stacks")
-        self.sidebar_notebook.add(export_tab_outer, text="Export")
+        self.sidebar_notebook.add(session_tab_outer, text="Session / Export")
+        self.sidebar_notebook.add(cuts_geometry_tab_outer, text="Cuts / Geometry")
+        self.sidebar_notebook.add(td_stacks_tab_outer, text="TD / Stacks")
+        self.sidebar_notebook.add(velocity_tab_outer, text="Slope Velocity")
+        self.sidebar_notebook.add(waves_tab_outer, text="Waves")
+        self.sidebar_notebook.add(robust_study_tab_outer, text="Robust Study")
 
         panel_frame = self.ttk.LabelFrame(
-            self.sidebar_panel_tab, text="Panel Settings", padding=8
+            self.sidebar_td_stacks_tab, text="Panel Settings", padding=8
         )
         panel_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         panel_frame.columnconfigure(0, weight=1)
@@ -14105,7 +14891,7 @@ class TDMosaicApp:
         self.weighting_box.grid(row=0, column=1, sticky="e")
         self.weighting_box.bind("<<ComboboxSelected>>", self._on_panel_param_event)
 
-        panels_box = self.ttk.LabelFrame(self.sidebar_panel_tab, text="Panels", padding=8)
+        panels_box = self.ttk.LabelFrame(self.sidebar_td_stacks_tab, text="Panels", padding=8)
         panels_box.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
         panels_box.columnconfigure(0, weight=1)
         panels_box.rowconfigure(0, weight=1)
@@ -14143,13 +14929,15 @@ class TDMosaicApp:
         panel_button_row.columnconfigure(0, weight=1)
         panel_button_row.columnconfigure(1, weight=1)
         self.ttk.Button(
-            panel_button_row, text="Open TD Window", command=self._open_td_window
+            panel_button_row,
+            text="Open TD Window",
+            command=lambda: self._open_td_window(tool_tab="td"),
         ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.ttk.Button(
             panel_button_row, text="Close TD Window", command=self._close_active_td_window
         ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
-        cuts_box = self.ttk.LabelFrame(self.sidebar_cuts_tab, text="Cuts", padding=8)
+        cuts_box = self.ttk.LabelFrame(self.sidebar_cuts_geometry_tab, text="Cuts", padding=8)
         cuts_box.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         cuts_box.columnconfigure(0, weight=1)
         cuts_box.rowconfigure(0, weight=1)
@@ -14159,7 +14947,7 @@ class TDMosaicApp:
         self.cut_listbox.bind("<<ListboxSelect>>", self._on_cut_list_select)
 
         button_frame = self.ttk.LabelFrame(
-            self.sidebar_cuts_tab, text="Cut Actions", padding=8
+            self.sidebar_cuts_geometry_tab, text="Cut Actions", padding=8
         )
         button_frame.grid(row=1, column=0, sticky="ew")
         button_frame.columnconfigure(0, weight=1)
@@ -14197,7 +14985,7 @@ class TDMosaicApp:
         ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         function_cut_frame = self.ttk.LabelFrame(
-            self.sidebar_cuts_tab, text="Function Cut", padding=8
+            self.sidebar_cuts_geometry_tab, text="Function Cut", padding=8
         )
         function_cut_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         function_cut_frame.columnconfigure(1, weight=1)
@@ -14310,7 +15098,7 @@ class TDMosaicApp:
         self.function_param_frame.columnconfigure(1, weight=1)
 
         feature_axis_box = self.ttk.LabelFrame(
-            self.sidebar_cuts_tab, text="Feature Axis / Auto Cuts", padding=8
+            self.sidebar_cuts_geometry_tab, text="Feature Axis / Auto Cuts", padding=8
         )
         feature_axis_box.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         feature_axis_box.columnconfigure(0, weight=1)
@@ -14403,9 +15191,9 @@ class TDMosaicApp:
         ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         geometry_frame = self.ttk.LabelFrame(
-            self.sidebar_geometry_tab, text="Geometry", padding=8
+            self.sidebar_cuts_geometry_tab, text="Geometry", padding=8
         )
-        geometry_frame.grid(row=0, column=0, sticky="ew")
+        geometry_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         geometry_frame.columnconfigure(1, weight=1)
 
         self.ttk.Label(
@@ -14507,9 +15295,9 @@ class TDMosaicApp:
         ).grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0))
 
         dynamic_frame = self.ttk.LabelFrame(
-            self.sidebar_geometry_tab, text="Dynamic Cut", padding=8
+            self.sidebar_cuts_geometry_tab, text="Dynamic Cut", padding=8
         )
-        dynamic_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        dynamic_frame.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         dynamic_frame.columnconfigure(0, weight=1)
         dynamic_frame.columnconfigure(1, weight=1)
         dynamic_frame.columnconfigure(2, weight=1)
@@ -14565,9 +15353,9 @@ class TDMosaicApp:
         ).grid(row=4, column=2, sticky="ew", pady=(6, 0), padx=(4, 0))
 
         measure_frame = self.ttk.LabelFrame(
-            self.sidebar_measure_tab, text="Measurements / Relative Control", padding=8
+            self.sidebar_cuts_geometry_tab, text="Measurements / Relative Control", padding=8
         )
-        measure_frame.grid(row=0, column=0, sticky="ew")
+        measure_frame.grid(row=6, column=0, sticky="ew", pady=(8, 0))
         measure_frame.columnconfigure(1, weight=1)
 
         self.ttk.Label(measure_frame, text="Reference").grid(row=0, column=0, sticky="w")
@@ -14737,9 +15525,9 @@ class TDMosaicApp:
             widget.bind("<Return>", self._on_geometry_entry_event)
 
         stacks_box = self.ttk.LabelFrame(
-            self.sidebar_stacks_tab, text="Stacks", padding=8
+            self.sidebar_td_stacks_tab, text="Stacks", padding=8
         )
-        stacks_box.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        stacks_box.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
         stacks_box.columnconfigure(0, weight=1)
         stacks_box.rowconfigure(0, weight=1)
 
@@ -14768,9 +15556,9 @@ class TDMosaicApp:
         ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         members_box = self.ttk.LabelFrame(
-            self.sidebar_stacks_tab, text="Stack Members", padding=8
+            self.sidebar_td_stacks_tab, text="Stack Members", padding=8
         )
-        members_box.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        members_box.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
         members_box.columnconfigure(0, weight=1)
         members_box.rowconfigure(0, weight=1)
         self.stack_member_listbox = self.tk.Listbox(
@@ -14805,9 +15593,9 @@ class TDMosaicApp:
         ).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
 
         experiments_box = self.ttk.LabelFrame(
-            self.sidebar_stacks_tab, text="Exhaustive Study", padding=8
+            self.sidebar_robust_study_tab, text="Robust Cube Study", padding=8
         )
-        experiments_box.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        experiments_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         experiments_box.columnconfigure(0, weight=1)
         experiments_box.columnconfigure(1, weight=1)
 
@@ -15023,10 +15811,91 @@ class TDMosaicApp:
             command=self._cancel_running_experiment,
         ).grid(row=7, column=0, sticky="ew", pady=(8, 0))
 
-        export_dir_box = self.ttk.LabelFrame(
-            self.sidebar_export_tab, text="Export Folder", padding=8
+        velocity_entry_box = self.ttk.LabelFrame(
+            self.sidebar_velocity_tab, text="Slope Velocity", padding=8
         )
-        export_dir_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        velocity_entry_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        velocity_entry_box.columnconfigure(0, weight=1)
+        velocity_entry_box.columnconfigure(1, weight=1)
+        self.ttk.Button(
+            velocity_entry_box,
+            text="Open TD Window",
+            command=lambda: self._open_td_window(tool_tab="velocity"),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.ttk.Button(
+            velocity_entry_box,
+            text="Close TD Window",
+            command=self._close_active_td_window,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        waves_entry_box = self.ttk.LabelFrame(
+            self.sidebar_waves_tab, text="Waves", padding=8
+        )
+        waves_entry_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for idx in range(2):
+            waves_entry_box.columnconfigure(idx, weight=1)
+        self.ttk.Button(
+            waves_entry_box,
+            text="Open TD Window",
+            command=lambda: self._open_td_window(tool_tab="waves"),
+        ).grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.ttk.Button(
+            waves_entry_box,
+            text="Metrics",
+            command=self._open_metrics_window,
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(6, 0))
+        self.ttk.Button(
+            waves_entry_box,
+            text="Link Groups",
+            command=self._open_link_groups_window,
+        ).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
+        self.ttk.Button(
+            waves_entry_box,
+            text="Propagation",
+            command=self._open_propagation_window,
+        ).grid(row=2, column=0, sticky="ew", padx=(0, 4), pady=(6, 0))
+        self.ttk.Button(
+            waves_entry_box,
+            text="Export Curated",
+            command=self._export_curated_results,
+        ).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
+        self.ttk.Button(
+            waves_entry_box,
+            text="Export Report",
+            command=self._export_curated_report,
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        session_box = self.ttk.LabelFrame(
+            self.sidebar_session_tab, text="Session", padding=8
+        )
+        session_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for idx in range(2):
+            session_box.columnconfigure(idx, weight=1)
+        self.ttk.Button(
+            session_box,
+            text="Save Session",
+            command=self._save_session,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.ttk.Button(
+            session_box,
+            text="Load Session",
+            command=self._load_session,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.ttk.Button(
+            session_box,
+            text="Open Cube",
+            command=self._choose_input_cube_and_restart,
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(6, 0))
+        self.ttk.Button(
+            session_box,
+            text="Saved FITS",
+            command=self._open_saved_fits_browser,
+        ).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
+
+        export_dir_box = self.ttk.LabelFrame(
+            self.sidebar_session_tab, text="Export Folder", padding=8
+        )
+        export_dir_box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         export_dir_box.columnconfigure(0, weight=1)
 
         export_dir_entry = self.ttk.Entry(
@@ -15068,82 +15937,166 @@ class TDMosaicApp:
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         export_map_box = self.ttk.LabelFrame(
-            self.sidebar_export_tab, text="Maps", padding=8
+            self.sidebar_session_tab, text="Maps", padding=8
         )
-        export_map_box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        export_map_box.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         export_map_box.columnconfigure(0, weight=1)
-        self.ttk.Button(
+        export_map_box.columnconfigure(1, weight=0)
+        self.export_current_map_button = self.ttk.Button(
             export_map_box,
             text="Save current map",
             command=self._export_current_map_fits,
-        ).grid(row=0, column=0, sticky="ew")
+        )
+        self.export_current_map_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.ttk.Button(
+            export_map_box,
+            text="?",
+            width=3,
+            command=lambda: self._show_save_export_help("map_export"),
+        ).grid(row=0, column=1, sticky="n", padx=(6, 0))
         self.ttk.Label(
             export_map_box,
             text="Exports the current map using the active FITS/PNG switches and folder layout above.",
             justify="left",
             wraplength=320,
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         export_cut_box = self.ttk.LabelFrame(
-            self.sidebar_export_tab, text="TD Cuts", padding=8
+            self.sidebar_session_tab, text="TD Cuts", padding=8
         )
-        export_cut_box.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        export_cut_box.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         export_cut_box.columnconfigure(0, weight=1)
         export_cut_box.columnconfigure(1, weight=1)
-        self.ttk.Button(
+        export_cut_box.columnconfigure(2, weight=0)
+        self.export_selected_cut_button = self.ttk.Button(
             export_cut_box,
             text="Selected cut",
             command=self._export_selected_cut_fits,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.ttk.Button(
+        )
+        self.export_selected_cut_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.export_stack_cut_button = self.ttk.Button(
             export_cut_box,
             text="Stack",
             command=self._export_stack_cut_fits,
-        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        )
+        self.export_stack_cut_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self.ttk.Button(
+            export_cut_box,
+            text="?",
+            width=3,
+            command=lambda: self._show_save_export_help("td_cut_export"),
+        ).grid(row=0, column=2, sticky="n", padx=(6, 0))
+        self.export_all_cut_button = self.ttk.Button(
             export_cut_box,
             text="All cuts",
             command=self._export_all_cut_fits,
-        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        )
+        self.export_all_cut_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.ttk.Label(
             export_cut_box,
             text="Each export can write the TD FITS, the PNG quicklook, or both. FITS and PNG can go to separate folders.",
             justify="left",
             wraplength=320,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         export_trace_box = self.ttk.LabelFrame(
-            self.sidebar_export_tab, text="Traces / Waves", padding=8
+            self.sidebar_session_tab, text="Traces / Waves", padding=8
         )
-        export_trace_box.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        export_trace_box.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         export_trace_box.columnconfigure(0, weight=1)
         export_trace_box.columnconfigure(1, weight=1)
-        self.ttk.Button(
+        export_trace_box.columnconfigure(2, weight=0)
+        self.export_selected_wave_button = self.ttk.Button(
             export_trace_box,
-            text="Selected cut traces",
+            text="Selected wave traces",
             command=self._export_selected_cut_trace_fits,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.ttk.Button(
+        )
+        self.export_selected_wave_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.export_stack_wave_button = self.ttk.Button(
             export_trace_box,
-            text="Stack traces",
+            text="Stack wave traces",
             command=self._export_stack_trace_fits,
-        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        )
+        self.export_stack_wave_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self.ttk.Button(
             export_trace_box,
-            text="All traces",
+            text="?",
+            width=3,
+            command=lambda: self._show_save_export_help("trace_velocity_export"),
+        ).grid(row=0, column=2, sticky="n", padx=(6, 0))
+        self.export_all_wave_button = self.ttk.Button(
+            export_trace_box,
+            text="All wave traces",
             command=self._export_all_trace_fits,
-        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        )
+        self.export_all_wave_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.export_selected_velocity_button = self.ttk.Button(
+            export_trace_box,
+            text="Selected velocity",
+            command=self._export_selected_cut_velocity_traces,
+        )
+        self.export_selected_velocity_button.grid(row=2, column=0, sticky="ew", padx=(0, 4), pady=(6, 0))
+        self.export_stack_velocity_button = self.ttk.Button(
+            export_trace_box,
+            text="Stack velocities",
+            command=self._export_stack_velocity_traces,
+        )
+        self.export_stack_velocity_button.grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
+        self.export_all_velocity_button = self.ttk.Button(
+            export_trace_box,
+            text="All velocities",
+            command=self._export_all_velocity_traces,
+        )
+        self.export_all_velocity_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.ttk.Label(
             export_trace_box,
-            text="Writes one product per event/trace. Use the switches above to choose FITS only, PNG only, or both.",
+            text="Wave traces write one product per event. Velocity traces write CSV/JSON tables and PNG quicklooks when PNG export is enabled.",
             justify="left",
             wraplength=320,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        export_macro_box = self.ttk.LabelFrame(
+            self.sidebar_session_tab, text="Macro Tables", padding=8
+        )
+        export_macro_box.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        export_macro_box.columnconfigure(0, weight=1)
+        export_macro_box.columnconfigure(1, weight=1)
+        export_macro_box.columnconfigure(2, weight=0)
+        self.export_selected_macro_button = self.ttk.Button(
+            export_macro_box,
+            text="Selected macro",
+            command=self._export_selected_cut_macro_tables,
+        )
+        self.export_selected_macro_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.export_stack_macro_button = self.ttk.Button(
+            export_macro_box,
+            text="Stack macro",
+            command=self._export_stack_macro_tables,
+        )
+        self.export_stack_macro_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.ttk.Button(
+            export_macro_box,
+            text="?",
+            width=3,
+            command=lambda: self._show_save_export_help("macro_tables"),
+        ).grid(row=0, column=2, sticky="n", padx=(6, 0))
+        self.export_all_macro_button = self.ttk.Button(
+            export_macro_box,
+            text="All macro",
+            command=self._export_all_macro_tables,
+        )
+        self.export_all_macro_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.ttk.Label(
+            export_macro_box,
+            text="Writes grouped CSV/JSON table bundles for waves, wave-trace points, physical parameters, manual velocities, and velocity segments.",
+            justify="left",
+            wraplength=320,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         export_review_box = self.ttk.LabelFrame(
-            self.sidebar_export_tab, text="Review Saved FITS", padding=8
+            self.sidebar_session_tab, text="Review Saved FITS", padding=8
         )
-        export_review_box.grid(row=4, column=0, sticky="ew")
+        export_review_box.grid(row=6, column=0, sticky="ew")
         export_review_box.columnconfigure(0, weight=1)
         self.ttk.Button(
             export_review_box,
@@ -20680,19 +21633,424 @@ class TDMosaicApp:
         end_t: float,
         end_d: float,
     ) -> dict[str, Any]:
+        return self._build_velocity_trace_record_from_points(
+            panel_id,
+            trace_id,
+            [(float(start_t), float(start_d)), (float(end_t), float(end_d))],
+            "straight",
+        )
+
+    def _velocity_trace_mode_key(self, existing: dict[str, Any]) -> str:
+        mode_var = existing.get("velocity_trace_mode_var")
+        mode_text = ""
+        if mode_var is not None:
+            try:
+                mode_text = str(mode_var.get())
+            except Exception:
+                mode_text = ""
+        mode_text = mode_text.strip().lower()
+        if "quad" in mode_text or "acceler" in mode_text:
+            return "quadratic"
+        if "poly" in mode_text or "curve" in mode_text or "path" in mode_text:
+            return "polyline"
+        return "straight"
+
+    def _velocity_trace_mode_label(self, mode_key: str) -> str:
+        if mode_key == "quadratic":
+            return "Quadratic Fit"
+        if mode_key == "polyline":
+            return "Polyline"
+        return "Straight"
+
+    def _velocity_trace_points_from_payload(self, trace: dict[str, Any]) -> list[tuple[float, float]]:
+        points: list[tuple[float, float]] = []
+        for item in trace.get("points") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                t_value = float(item.get("t", float("nan")))
+                d_value = float(item.get("d", float("nan")))
+            except Exception:
+                continue
+            if np.isfinite(t_value) and np.isfinite(d_value):
+                points.append((t_value, d_value))
+        if len(points) >= 2:
+            return points
+        try:
+            fallback = [
+                (float(trace.get("t0", float("nan"))), float(trace.get("d0", float("nan")))),
+                (float(trace.get("t1", float("nan"))), float(trace.get("d1", float("nan")))),
+            ]
+        except Exception:
+            return []
+        return [point for point in fallback if all(np.isfinite(value) for value in point)]
+
+    def _velocity_geometry_model_key(self, value: Any) -> str:
+        text = str(value or "").strip()
+        if text in VELOCITY_GEOMETRY_LABEL_TO_KEY:
+            return VELOCITY_GEOMETRY_LABEL_TO_KEY[text]
+        key = text.lower().replace("/", "_").replace("-", "_").replace(" ", "_")
+        aliases = {
+            "": "projected",
+            "none": "projected",
+            "projected_only": "projected",
+            "surface_center_limb": "surface_center_limb",
+            "surface": "surface_center_limb",
+            "surface_direction": "surface_direction",
+            "known_direction": "surface_direction",
+            "cut_not_aligned": "cut_alignment",
+            "cut_alignment": "cut_alignment",
+            "loop_tilted": "loop_inclination",
+            "loop_inclination": "loop_inclination",
+            "radial": "radial_motion",
+            "radial_motion": "radial_motion",
+        }
+        return aliases.get(key, "projected")
+
+    def _default_velocity_geometry_state(self) -> dict[str, Any]:
+        return {
+            "enabled": False,
+            "model": "projected",
+            "mu": "1.0",
+            "theta_deg": "",
+            "alpha_deg": "0.0",
+            "phi_deg": "0.0",
+            "inclination_deg": "0.0",
+        }
+
+    def _normalize_velocity_geometry_settings(
+        self, settings: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        default = self._default_velocity_geometry_state()
+        raw = dict(settings or {})
+        normalized = {**default, **raw}
+        normalized["enabled"] = self._safe_bool_value(
+            normalized.get("enabled"), bool(default["enabled"])
+        )
+        normalized["model"] = self._velocity_geometry_model_key(
+            normalized.get("model", default["model"])
+        )
+        for key in ("mu", "theta_deg", "alpha_deg", "phi_deg", "inclination_deg"):
+            normalized[key] = str(normalized.get(key, default[key]) or "").strip()
+        return normalized
+
+    def _velocity_geometry_settings_from_window(
+        self, existing: dict[str, Any]
+    ) -> dict[str, Any]:
+        enabled_var = existing.get("velocity_geometry_enabled_var")
+        model_var = existing.get("velocity_geometry_model_var")
+        mu_var = existing.get("velocity_geometry_mu_var")
+        theta_var = existing.get("velocity_geometry_theta_var")
+        alpha_var = existing.get("velocity_geometry_alpha_var")
+        phi_var = existing.get("velocity_geometry_phi_var")
+        inclination_var = existing.get("velocity_geometry_inclination_var")
+        return self._normalize_velocity_geometry_settings(
+            {
+                "enabled": enabled_var.get() if enabled_var is not None else False,
+                "model": model_var.get() if model_var is not None else "projected",
+                "mu": mu_var.get() if mu_var is not None else "1.0",
+                "theta_deg": theta_var.get() if theta_var is not None else "",
+                "alpha_deg": alpha_var.get() if alpha_var is not None else "0.0",
+                "phi_deg": phi_var.get() if phi_var is not None else "0.0",
+                "inclination_deg": (
+                    inclination_var.get() if inclination_var is not None else "0.0"
+                ),
+            }
+        )
+
+    def _velocity_geometry_correction(
+        self, settings: dict[str, Any]
+    ) -> dict[str, Any]:
+        normalized = self._normalize_velocity_geometry_settings(settings)
+        model = str(normalized["model"])
+        enabled = bool(normalized["enabled"]) and model != "projected"
+        label = VELOCITY_GEOMETRY_LABELS.get(model, VELOCITY_GEOMETRY_LABELS["projected"])
+        hint = VELOCITY_GEOMETRY_HINTS.get(model, "")
+        mu = self._safe_float_text(normalized.get("mu", ""), 1.0)
+        theta_text = str(normalized.get("theta_deg", "")).strip()
+        theta_deg = self._safe_float_text(theta_text, float("nan"))
+        alpha_deg = self._safe_float_text(normalized.get("alpha_deg", ""), 0.0)
+        phi_deg = self._safe_float_text(normalized.get("phi_deg", ""), 0.0)
+        inclination_deg = self._safe_float_text(
+            normalized.get("inclination_deg", ""), 0.0
+        )
+        if theta_text and np.isfinite(theta_deg):
+            mu = math.cos(math.radians(theta_deg))
+        elif np.isfinite(mu) and -1.0 <= mu <= 1.0:
+            theta_deg = math.degrees(math.acos(mu))
+
+        factor = 1.0
+        valid = True
+        note = hint
+        if enabled:
+            if model in {"surface_center_limb", "surface_direction"}:
+                if not np.isfinite(mu) or mu <= 0.0:
+                    valid = False
+                    note = "Set mu > 0 for surface corrections."
+                elif model == "surface_center_limb":
+                    factor = 1.0 / mu
+                else:
+                    alpha_rad = math.radians(alpha_deg if np.isfinite(alpha_deg) else 0.0)
+                    factor = math.sqrt((math.cos(alpha_rad) / mu) ** 2 + math.sin(alpha_rad) ** 2)
+            elif model == "cut_alignment":
+                phi_rad = math.radians(phi_deg if np.isfinite(phi_deg) else 0.0)
+                denom = abs(math.cos(phi_rad))
+                if denom <= 1e-6:
+                    valid = False
+                    note = "Set phi away from 90 deg for cut-alignment correction."
+                else:
+                    factor = 1.0 / denom
+            elif model == "loop_inclination":
+                incl_rad = math.radians(
+                    inclination_deg if np.isfinite(inclination_deg) else 0.0
+                )
+                denom = abs(math.cos(incl_rad))
+                if denom <= 1e-6:
+                    valid = False
+                    note = "Set inclination away from 90 deg."
+                else:
+                    factor = 1.0 / denom
+            elif model == "radial_motion":
+                if not np.isfinite(theta_deg):
+                    valid = False
+                    note = "Set theta or mu for radial-motion correction."
+                else:
+                    denom = abs(math.sin(math.radians(theta_deg)))
+                    if denom <= 1e-6:
+                        valid = False
+                        note = "Radial correction is undefined at disk center."
+                    else:
+                        factor = 1.0 / denom
+        if not valid:
+            factor = float("nan")
+        return {
+            "geometry_correction_enabled": bool(enabled),
+            "geometry_model": model,
+            "geometry_model_label": label,
+            "geometry_factor": float(factor),
+            "geometry_factor_valid": bool(valid),
+            "geometry_note": str(note),
+            "geometry_mu": float(mu),
+            "geometry_theta_deg": float(theta_deg),
+            "geometry_alpha_deg": float(alpha_deg),
+            "geometry_phi_deg": float(phi_deg),
+            "geometry_inclination_deg": float(inclination_deg),
+        }
+
+    def _velocity_geometry_summary_text(self, settings: dict[str, Any]) -> str:
+        correction = self._velocity_geometry_correction(settings)
+        if not correction["geometry_correction_enabled"]:
+            return "Geometry: Projected only. Saved speeds remain plane-of-image values."
+        factor = float(correction.get("geometry_factor", float("nan")))
+        label = str(correction.get("geometry_model_label", "Geometry"))
+        if np.isfinite(factor):
+            return (
+                f"Geometry: {label} | factor="
+                f"{self._format_velocity_trace_value(factor, 5)} | "
+                "new traces store corrected speed."
+            )
+        note = str(correction.get("geometry_note", "") or "check parameters")
+        return f"Geometry: {label} | {note}"
+
+    def _update_td_window_velocity_geometry_controls(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            return
+        settings = self._velocity_geometry_settings_from_window(existing)
+        params_frame = existing.get("velocity_geometry_params_frame")
+        if params_frame is not None:
+            if bool(settings["enabled"]):
+                params_frame.grid()
+            else:
+                params_frame.grid_remove()
+        summary_var = existing.get("velocity_geometry_summary_var")
+        if summary_var is not None:
+            summary_var.set(self._velocity_geometry_summary_text(settings))
+
+    def _on_td_window_velocity_geometry_change(
+        self, panel_id: int, _event: Any = None
+    ) -> None:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            return
+        self._update_td_window_velocity_geometry_controls(panel_id)
+        self._refresh_td_window_velocity_trace_table(panel_id)
+
+    def _velocity_physical_scale_from_window(self, existing: dict[str, Any]) -> dict[str, float]:
+        cad_var = existing.get("crest_cad_var")
+        res_var = existing.get("crest_res_var")
+        km_arcsec_var = existing.get("wavelet_km_per_arcsec_var")
+        cad_s = self._safe_float_text(
+            cad_var.get() if cad_var is not None else "",
+            DEFAULT_CREST_TRACKING["cad"],
+        )
+        res_arcsec_px = self._safe_float_text(
+            res_var.get() if res_var is not None else "",
+            DEFAULT_CREST_TRACKING["res"],
+        )
+        km_per_arcsec = self._safe_float_text(
+            km_arcsec_var.get() if km_arcsec_var is not None else "",
+            DEFAULT_WAVELET_FILTER["km_per_arcsec"],
+        )
+        km_per_pixel = (
+            float("nan")
+            if res_arcsec_px <= 0.0 or km_per_arcsec <= 0.0
+            else res_arcsec_px * km_per_arcsec
+        )
+        km_s_per_px_frame = (
+            float("nan")
+            if cad_s <= 0.0 or not np.isfinite(km_per_pixel)
+            else km_per_pixel / cad_s
+        )
+        km_s2_per_px_frame2 = (
+            float("nan")
+            if cad_s <= 0.0 or not np.isfinite(km_per_pixel)
+            else km_per_pixel / (cad_s * cad_s)
+        )
+        return {
+            "cad_s": float(cad_s),
+            "res_arcsec_px": float(res_arcsec_px),
+            "km_per_arcsec": float(km_per_arcsec),
+            "km_per_pixel": float(km_per_pixel),
+            "km_s_per_px_frame": float(km_s_per_px_frame),
+            "km_s2_per_px_frame2": float(km_s2_per_px_frame2),
+        }
+
+    def _format_velocity_trace_value(self, value: Any, precision: int = 4) -> str:
+        try:
+            number = float(value)
+        except Exception:
+            return "nan"
+        if not np.isfinite(number):
+            return "nan"
+        return f"{number:.{precision}g}"
+
+    def _velocity_physics_summary_text(self, scale: dict[str, float]) -> str:
+        return (
+            "Physical scale: "
+            f"cad={self._format_velocity_trace_value(scale.get('cad_s'), 5)} s/frame | "
+            f"res={self._format_velocity_trace_value(scale.get('res_arcsec_px'), 5)} arcsec/px | "
+            f"km/arcsec={self._format_velocity_trace_value(scale.get('km_per_arcsec'), 6)} | "
+            f"km/px={self._format_velocity_trace_value(scale.get('km_per_pixel'), 6)} | "
+            f"1 px/frame={self._format_velocity_trace_value(scale.get('km_s_per_px_frame'), 6)} km/s | "
+            f"1 px/frame^2={self._format_velocity_trace_value(scale.get('km_s2_per_px_frame2'), 6)} km/s^2"
+        )
+
+    def _refresh_td_window_physical_scale_summary(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            return
+        scale_var = existing.get("physical_scale_var")
+        if scale_var is None:
+            return
+        scale_var.set(
+            self._velocity_physics_summary_text(
+                self._velocity_physical_scale_from_window(existing)
+            )
+        )
+
+    def _apply_td_window_physical_scale(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        panel = self._td_window_panel(panel_id)
+        if existing is None or panel is None:
+            return
+        scale = self._velocity_physical_scale_from_window(existing)
+        if (
+            not np.isfinite(scale["cad_s"])
+            or not np.isfinite(scale["res_arcsec_px"])
+            or not np.isfinite(scale["km_per_arcsec"])
+            or scale["cad_s"] <= 0.0
+            or scale["res_arcsec_px"] <= 0.0
+            or scale["km_per_arcsec"] <= 0.0
+        ):
+            self._refresh_td_window_physical_scale_summary(panel_id)
+            self._set_status(
+                f"{panel.name}: physical scale needs cad, arcsec/px, and km/arcsec > 0."
+            )
+            return
+        self._update_td_window_preset_from_values(panel_id)
+        self._record_session_change()
+        self._refresh_td_window_physical_scale_summary(panel_id)
+        self._refresh_td_window_velocity_trace_table(panel_id)
+        self._refresh_td_window_wavelet_views(panel_id, redraw_td=False)
+        self._set_status(
+            f"{panel.name}: physical scale applied. New velocity traces use "
+            f"{self._format_velocity_trace_value(scale['km_per_pixel'], 6)} km/px."
+        )
+
+    def _print_velocity_trace_record(self, panel: TDPanel, trace: dict[str, Any]) -> None:
+        accel = float(trace.get("acceleration_km_s2", float("nan")))
+        accel_text = (
+            ""
+            if not np.isfinite(accel)
+            else f" acceleration_km_s2={self._format_velocity_trace_value(accel, 6)}"
+        )
+        correction_text = ""
+        if bool(trace.get("geometry_correction_enabled", False)):
+            correction_text = (
+                f" geometry_model={trace.get('geometry_model', 'projected')} "
+                f"geometry_factor={self._format_velocity_trace_value(trace.get('geometry_factor'), 6)} "
+                f"speed_corrected_km_s={self._format_velocity_trace_value(trace.get('speed_corrected_km_s'), 6)}"
+            )
+        print(
+            "[velocity trace] "
+            f"panel={panel.name!r} "
+            f"trace_id={int(trace.get('trace_id', -1))} "
+            f"kind={trace.get('trace_kind', 'straight')} "
+            f"points={int(trace.get('point_count', 2) or 2)} "
+            f"cad_s={self._format_velocity_trace_value(trace.get('cad_s'), 5)} "
+            f"res_arcsec_px={self._format_velocity_trace_value(trace.get('res_arcsec_px'), 5)} "
+            f"km_per_arcsec={self._format_velocity_trace_value(trace.get('km_per_arcsec'), 6)} "
+            f"km_per_pixel={self._format_velocity_trace_value(trace.get('km_per_pixel'), 6)} "
+            f"km_s_per_px_frame={self._format_velocity_trace_value(trace.get('km_s_per_px_frame'), 6)} "
+            f"speed_px_frame={self._format_velocity_trace_value(trace.get('speed_px_frame'), 6)} "
+            f"speed_km_s={self._format_velocity_trace_value(trace.get('speed_km_s'), 6)}"
+            f"{correction_text}"
+            f"{accel_text}",
+            flush=True,
+        )
+
+    def _build_velocity_trace_record_from_points(
+        self,
+        panel_id: int,
+        trace_id: int,
+        points: list[tuple[float, float]],
+        trace_kind: str,
+    ) -> dict[str, Any]:
+        debug_t0 = time.monotonic()
+        _trace_velocity(
+            f"build_record start panel={panel_id} trace_id={trace_id} "
+            f"kind={trace_kind} points={len(points)}"
+        )
         existing = self.td_windows.get(panel_id)
         if existing is None:
             raise ValueError("Velocity trace window is not available.")
-        cad_s = self._safe_float_text(
-            existing["crest_cad_var"].get(), DEFAULT_CREST_TRACKING["cad"]
-        )
-        res_arcsec_px = self._safe_float_text(
-            existing["crest_res_var"].get(), DEFAULT_CREST_TRACKING["res"]
-        )
-        km_per_arcsec = self._safe_float_text(
-            existing["wavelet_km_per_arcsec_var"].get(),
-            DEFAULT_WAVELET_FILTER["km_per_arcsec"],
-        )
+        clean_points = [
+            (float(t_value), float(d_value))
+            for t_value, d_value in points
+            if np.isfinite(float(t_value)) and np.isfinite(float(d_value))
+        ]
+        trace_kind = str(trace_kind or "straight")
+        if trace_kind not in {"straight", "polyline", "quadratic"}:
+            trace_kind = "straight"
+        if trace_kind == "straight" and len(clean_points) > 2:
+            clean_points = clean_points[:2]
+        min_points = 3 if trace_kind == "quadratic" else 2
+        if len(clean_points) < min_points:
+            raise ValueError(
+                f"{self._velocity_trace_mode_label(trace_kind)} traces need at least {min_points} TD points."
+            )
+        physical_scale = self._velocity_physical_scale_from_window(existing)
+        geometry_settings = self._velocity_geometry_settings_from_window(existing)
+        geometry_correction = self._velocity_geometry_correction(geometry_settings)
+        cad_s = physical_scale["cad_s"]
+        res_arcsec_px = physical_scale["res_arcsec_px"]
+        km_per_arcsec = physical_scale["km_per_arcsec"]
+        km_per_pixel = physical_scale["km_per_pixel"]
+        px_frame_to_km_s = physical_scale["km_s_per_px_frame"]
+        px_frame2_to_km_s2 = physical_scale["km_s2_per_px_frame2"]
+        start_t, start_d = clean_points[0]
+        end_t, end_d = clean_points[-1]
         delta_frames = float(end_t) - float(start_t)
         if abs(delta_frames) <= 1e-6:
             raise ValueError("Velocity traces need a non-zero time span.")
@@ -20712,9 +22070,96 @@ class TDMosaicApp:
             if not np.isfinite(speed_arcsec_s) or km_per_arcsec <= 0.0
             else speed_arcsec_s * km_per_arcsec
         )
+        segment_px_frame: list[float] = []
+        for (t_a, d_a), (t_b, d_b) in zip(clean_points[:-1], clean_points[1:]):
+            dt = float(t_b) - float(t_a)
+            if abs(dt) <= 1e-6:
+                raise ValueError("Each velocity trace segment needs a non-zero time span.")
+            segment_px_frame.append((float(d_b) - float(d_a)) / dt)
+        segment_km_s = [
+            float("nan") if not np.isfinite(px_frame_to_km_s) else value * px_frame_to_km_s
+            for value in segment_px_frame
+        ]
+        finite_segment_km_s = [value for value in segment_km_s if np.isfinite(value)]
+        acceleration_px_frame2 = float("nan")
+        acceleration_km_s2 = float("nan")
+        fit_coefficients: list[float] = []
+        fit_t_center = float("nan")
+        if trace_kind == "quadratic":
+            t_values = np.array([point[0] for point in clean_points], dtype=float)
+            d_values = np.array([point[1] for point in clean_points], dtype=float)
+            unique_t = np.unique(np.round(t_values, decimals=6))
+            if unique_t.size < 3:
+                raise ValueError("Quadratic velocity traces need at least three distinct time positions.")
+            fit_t_center = float(np.mean(t_values))
+            fit_coefficients = [float(value) for value in np.polyfit(t_values - fit_t_center, d_values, 2)]
+            acceleration_px_frame2 = float(2.0 * fit_coefficients[0])
+            acceleration_km_s2 = (
+                float("nan")
+                if not np.isfinite(px_frame2_to_km_s2)
+                else acceleration_px_frame2 * px_frame2_to_km_s2
+            )
+        geometry_factor = float(geometry_correction.get("geometry_factor", float("nan")))
+        speed_corrected_km_s = (
+            float("nan")
+            if not np.isfinite(speed_km_s) or not np.isfinite(geometry_factor)
+            else float(speed_km_s) * geometry_factor
+        )
+        segment_rows: list[dict[str, Any]] = []
+        for segment_index, (
+            (t_a, d_a),
+            (t_b, d_b),
+            segment_speed_px_frame,
+            segment_speed_km_s,
+        ) in enumerate(
+            zip(
+                clean_points[:-1],
+                clean_points[1:],
+                segment_px_frame,
+                segment_km_s,
+            ),
+            start=1,
+        ):
+            segment_delta_frames = float(t_b) - float(t_a)
+            segment_delta_dist_px = float(d_b) - float(d_a)
+            segment_corrected_km_s = (
+                float("nan")
+                if (
+                    not bool(geometry_correction.get("geometry_correction_enabled", False))
+                    or not np.isfinite(segment_speed_km_s)
+                    or not np.isfinite(geometry_factor)
+                )
+                else float(segment_speed_km_s) * geometry_factor
+            )
+            segment_rows.append(
+                {
+                    "segment_index": int(segment_index),
+                    "t0": float(t_a),
+                    "d0": float(d_a),
+                    "t1": float(t_b),
+                    "d1": float(d_b),
+                    "delta_frames": float(segment_delta_frames),
+                    "delta_dist_px": float(segment_delta_dist_px),
+                    "speed_px_frame": float(segment_speed_px_frame),
+                    "speed_km_s": float(segment_speed_km_s),
+                    "speed_corrected_km_s": float(segment_corrected_km_s),
+                }
+            )
+        _trace_velocity(
+            f"build_record end panel={panel_id} trace_id={trace_id} "
+            f"elapsed_ms={(time.monotonic() - debug_t0) * 1000.0:.1f} "
+            f"speed_km_s={self._format_velocity_trace_value(speed_km_s, 6)}"
+        )
         return {
             "trace_id": int(trace_id),
             "label": f"V{int(trace_id):02d}",
+            "trace_kind": trace_kind,
+            "point_count": int(len(clean_points)),
+            "points": [
+                {"t": float(t_value), "d": float(d_value)}
+                for t_value, d_value in clean_points
+            ],
+            "segments": segment_rows,
             "t0": float(start_t),
             "d0": float(start_d),
             "t1": float(end_t),
@@ -20727,29 +22172,212 @@ class TDMosaicApp:
             "speed_arcsec_s": float(speed_arcsec_s),
             "speed_km_s": float(speed_km_s),
             "speed_km_s_abs": float(abs(speed_km_s)) if np.isfinite(speed_km_s) else float("nan"),
+            "segment_speed_px_frame_min": float(np.min(segment_px_frame)),
+            "segment_speed_px_frame_max": float(np.max(segment_px_frame)),
+            "segment_speed_km_s_min": (
+                float(np.min(finite_segment_km_s)) if finite_segment_km_s else float("nan")
+            ),
+            "segment_speed_km_s_max": (
+                float(np.max(finite_segment_km_s)) if finite_segment_km_s else float("nan")
+            ),
+            "segment_speed_km_s_abs_mean": (
+                float(np.mean(np.abs(finite_segment_km_s)))
+                if finite_segment_km_s
+                else float("nan")
+            ),
+            "fit_degree": 2 if trace_kind == "quadratic" else 1,
+            "fit_t_center": float(fit_t_center),
+            "fit_coefficients_px": fit_coefficients,
+            "acceleration_px_frame2": float(acceleration_px_frame2),
+            "acceleration_km_s2": float(acceleration_km_s2),
             "cad_s": float(cad_s),
             "res_arcsec_px": float(res_arcsec_px),
             "km_per_arcsec": float(km_per_arcsec),
+            "km_per_pixel": float(km_per_pixel),
+            "km_s_per_px_frame": float(px_frame_to_km_s),
+            "km_s2_per_px_frame2": float(px_frame2_to_km_s2),
+            **geometry_correction,
+            "speed_corrected_km_s": float(speed_corrected_km_s),
+            "speed_corrected_km_s_abs": (
+                float(abs(speed_corrected_km_s))
+                if np.isfinite(speed_corrected_km_s)
+                else float("nan")
+            ),
         }
 
+    def _finish_td_window_velocity_trace(self, panel_id: int) -> None:
+        debug_t0 = time.monotonic()
+        _trace_velocity(f"finish start panel={panel_id}")
+        existing = self.td_windows.get(panel_id)
+        panel = self._td_window_panel(panel_id)
+        if existing is None or panel is None:
+            _trace_velocity(f"finish abort panel={panel_id} reason=no_window_or_panel")
+            return
+        if not bool(existing.get("velocity_trace_draw_mode")):
+            self._set_status(f"Start a velocity trace first in {panel.name}.")
+            _trace_velocity(f"finish abort panel={panel_id} reason=draw_mode_off")
+            return
+        points = [
+            (float(t_value), float(d_value))
+            for t_value, d_value in (existing.get("velocity_trace_pending_points") or [])
+        ]
+        trace_kind = self._velocity_trace_mode_key(existing)
+        min_points = 3 if trace_kind == "quadratic" else 2
+        if len(points) < min_points:
+            self._set_status(
+                f"{panel.name}: add {min_points - len(points)} more TD point(s) before finishing."
+            )
+            _trace_velocity(
+                f"finish abort panel={panel_id} reason=not_enough_points "
+                f"points={len(points)} min={min_points}"
+            )
+            return
+        try:
+            trace = self._build_velocity_trace_record_from_points(
+                panel_id,
+                int(existing.get("velocity_next_trace_id", 1)),
+                points,
+                trace_kind,
+            )
+        except ValueError as exc:
+            self._set_status(str(exc))
+            _trace_velocity(f"finish value_error panel={panel_id} error={exc}")
+            return
+        _trace_velocity(
+            f"finish after_build panel={panel_id} "
+            f"elapsed_ms={(time.monotonic() - debug_t0) * 1000.0:.1f}"
+        )
+        traces = [
+            dict(item)
+            for item in (existing.get("velocity_traces") or [])
+            if isinstance(item, dict)
+        ]
+        traces.append(trace)
+        existing["velocity_traces"] = traces
+        existing["velocity_next_trace_id"] = int(trace["trace_id"]) + 1
+        existing["velocity_selected_trace_id"] = int(trace["trace_id"])
+        existing["velocity_trace_draw_mode"] = False
+        existing["velocity_trace_pending"] = None
+        existing["velocity_trace_pending_points"] = []
+        existing["velocity_trace_hover"] = None
+        existing["velocity_trace_last_motion_t"] = 0.0
+        button_var = existing.get("velocity_trace_button_var")
+        if button_var is not None:
+            button_var.set("Draw velocity trace")
+        self._record_session_change()
+        _trace_velocity(
+            f"finish after_state panel={panel_id} traces={len(traces)} "
+            f"elapsed_ms={(time.monotonic() - debug_t0) * 1000.0:.1f}"
+        )
+        self._refresh_td_window_velocity_trace_table(panel_id)
+        _trace_velocity(
+            f"finish after_table panel={panel_id} "
+            f"elapsed_ms={(time.monotonic() - debug_t0) * 1000.0:.1f}"
+        )
+        self._refresh_td_window(panel_id, refresh_velocity_table=False)
+        _trace_velocity(
+            f"finish after_redraw panel={panel_id} "
+            f"elapsed_ms={(time.monotonic() - debug_t0) * 1000.0:.1f}"
+        )
+        self._print_velocity_trace_record(panel, trace)
+        accel = float(trace.get("acceleration_km_s2", float("nan")))
+        accel_text = f", accel={accel:.3f} km/s^2" if np.isfinite(accel) else ""
+        scale_text = ""
+        km_per_pixel = float(trace.get("km_per_pixel", float("nan")))
+        if np.isfinite(km_per_pixel):
+            scale_text = f", km/px={km_per_pixel:.3f}"
+        corrected_text = ""
+        if bool(trace.get("geometry_correction_enabled", False)):
+            corrected_speed = float(trace.get("speed_corrected_km_s", float("nan")))
+            if np.isfinite(corrected_speed):
+                corrected_text = f", corrected={corrected_speed:.3f} km/s"
+        self._set_status(
+            f"{panel.name}: saved {trace.get('trace_kind', 'velocity')} trace "
+            f"{int(trace['trace_id'])} ({float(trace['speed_km_s']):.3f} km/s"
+            f"{scale_text}{corrected_text}{accel_text})."
+        )
+        _trace_velocity(
+            f"finish end panel={panel_id} trace_id={int(trace['trace_id'])} "
+            f"elapsed_ms={(time.monotonic() - debug_t0) * 1000.0:.1f}"
+        )
+
+    def _undo_td_window_velocity_trace_point(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        panel = self._td_window_panel(panel_id)
+        if existing is None or panel is None:
+            return
+        points = list(existing.get("velocity_trace_pending_points") or [])
+        if not points:
+            self._set_status(f"{panel.name}: no pending velocity points to undo.")
+            return
+        points.pop()
+        existing["velocity_trace_pending_points"] = points
+        existing["velocity_trace_pending"] = points[0] if points else None
+        existing["velocity_trace_hover"] = points[-1] if points else None
+        self._refresh_td_window_velocity_trace_table(panel_id)
+        self._refresh_td_window(panel_id, refresh_velocity_table=False)
+        self._set_status(f"{panel.name}: velocity trace now has {len(points)} pending point(s).")
+
+    def _on_td_window_velocity_trace_mode_change(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        panel = self._td_window_panel(panel_id)
+        if existing is None or panel is None:
+            return
+        existing["velocity_trace_pending"] = None
+        existing["velocity_trace_pending_points"] = []
+        existing["velocity_trace_hover"] = None
+        self._refresh_td_window_velocity_trace_table(panel_id)
+        self._refresh_td_window(panel_id, refresh_velocity_table=False)
+        self._set_status(
+            f"{panel.name}: velocity mode set to {self._velocity_trace_mode_label(self._velocity_trace_mode_key(existing))}."
+        )
+
     def _refresh_td_window_velocity_trace_table(self, panel_id: int) -> None:
+        debug_t0 = time.monotonic()
         existing = self.td_windows.get(panel_id)
         if existing is None:
             return
         tree = existing.get("velocity_trace_tree")
         summary_var = existing.get("velocity_trace_summary_var")
+        physics_var = existing.get("velocity_trace_physics_var")
         if tree is None or summary_var is None:
             return
+        _trace_velocity(f"table_refresh start panel={panel_id}")
+        existing["velocity_trace_table_updating"] = True
+        scale = self._velocity_physical_scale_from_window(existing)
+        self._refresh_td_window_physical_scale_summary(panel_id)
+        if physics_var is not None:
+            physics_var.set(self._velocity_physics_summary_text(scale))
+        self._update_td_window_velocity_geometry_controls(panel_id)
         children = tree.get_children()
         if children:
             tree.delete(*children)
         traces = [
             dict(item) for item in (existing.get("velocity_traces") or []) if isinstance(item, dict)
         ]
+        self._set_export_widget_enabled(
+            existing.get("velocity_trace_save_button"),
+            bool(traces),
+        )
         selected_id = existing.get("velocity_selected_trace_id")
         visible_ids: list[int] = []
         for trace in traces:
             trace_id = int(trace.get("trace_id", -1))
+            accel = float(trace.get("acceleration_km_s2", float("nan")))
+            corrected_speed = float(trace.get("speed_corrected_km_s", float("nan")))
+            geometry_factor = float(trace.get("geometry_factor", float("nan")))
+            geometry_enabled = bool(trace.get("geometry_correction_enabled", False))
+            km_per_pixel = float(trace.get("km_per_pixel", float("nan")))
+            if not np.isfinite(km_per_pixel):
+                res_arcsec_px = float(trace.get("res_arcsec_px", float("nan")))
+                km_per_arcsec = float(trace.get("km_per_arcsec", float("nan")))
+                if (
+                    np.isfinite(res_arcsec_px)
+                    and np.isfinite(km_per_arcsec)
+                    and res_arcsec_px > 0.0
+                    and km_per_arcsec > 0.0
+                ):
+                    km_per_pixel = res_arcsec_px * km_per_arcsec
             visible_ids.append(trace_id)
             tree.insert(
                 "",
@@ -20758,12 +22386,26 @@ class TDMosaicApp:
                 values=(
                     str(trace_id),
                     str(trace.get("label") or f"V{trace_id:02d}"),
+                    self._velocity_trace_mode_label(str(trace.get("trace_kind") or "straight")),
+                    str(int(trace.get("point_count", 2) or 2)),
                     f"{float(trace.get('t0', float('nan'))):.2f}",
                     f"{float(trace.get('t1', float('nan'))):.2f}",
                     f"{float(trace.get('d0', float('nan'))):.2f}",
                     f"{float(trace.get('d1', float('nan'))):.2f}",
                     f"{float(trace.get('speed_px_frame', float('nan'))):.3f}",
                     f"{float(trace.get('speed_km_s', float('nan'))):.3f}",
+                    (
+                        ""
+                        if not geometry_enabled or not np.isfinite(corrected_speed)
+                        else f"{corrected_speed:.3f}"
+                    ),
+                    (
+                        ""
+                        if not geometry_enabled or not np.isfinite(geometry_factor)
+                        else f"{geometry_factor:.3f}"
+                    ),
+                    "" if not np.isfinite(km_per_pixel) else f"{km_per_pixel:.3f}",
+                    "" if not np.isfinite(accel) else f"{accel:.3f}",
                 ),
             )
         if selected_id not in visible_ids:
@@ -20772,14 +22414,23 @@ class TDMosaicApp:
         if selected_id is not None:
             iid = f"velocity-{int(selected_id)}"
             if iid in tree.get_children():
-                tree.selection_set(iid)
+                if set(tree.selection()) != {iid}:
+                    tree.selection_set(iid)
                 tree.focus(iid)
+        existing["velocity_trace_table_updating"] = False
         draw_mode = bool(existing.get("velocity_trace_draw_mode"))
-        pending = existing.get("velocity_trace_pending")
+        pending_points = list(existing.get("velocity_trace_pending_points") or [])
+        mode_key = self._velocity_trace_mode_key(existing)
+        min_points = 3 if mode_key == "quadratic" else 2
         summary_var.set(
             f"Velocity traces: {len(traces)} | draw mode={'on' if draw_mode else 'off'}"
-            + (" | select two TD points" if draw_mode and pending is None else "")
-            + (" | choose the second TD point" if draw_mode and pending is not None else "")
+            + (f" | {self._velocity_trace_mode_label(mode_key)}" if draw_mode else "")
+            + (f" | points {len(pending_points)}/{min_points}" if draw_mode else "")
+        )
+        _trace_velocity(
+            f"table_refresh end panel={panel_id} traces={len(traces)} "
+            f"pending={len(pending_points)} selected={selected_id} "
+            f"elapsed_ms={(time.monotonic() - debug_t0) * 1000.0:.1f}"
         )
 
     def _toggle_td_window_velocity_trace_mode(self, panel_id: int) -> None:
@@ -20790,15 +22441,21 @@ class TDMosaicApp:
         enabled = not bool(existing.get("velocity_trace_draw_mode", False))
         existing["velocity_trace_draw_mode"] = enabled
         existing["velocity_trace_pending"] = None
+        existing["velocity_trace_pending_points"] = []
         existing["velocity_trace_hover"] = None
+        existing["velocity_trace_last_motion_t"] = 0.0
         button_var = existing.get("velocity_trace_button_var")
         if button_var is not None:
             button_var.set("Cancel draw" if enabled else "Draw velocity trace")
+        _trace_velocity(
+            f"toggle_draw panel={panel_id} enabled={enabled} "
+            f"mode={self._velocity_trace_mode_key(existing)}"
+        )
         self._refresh_td_window_velocity_trace_table(panel_id)
-        self._refresh_td_window(panel_id)
+        self._refresh_td_window(panel_id, refresh_velocity_table=False)
         self._set_status(
             (
-                f"{panel.name}: click two TD points to define a velocity trace."
+                f"{panel.name}: click TD points for a {self._velocity_trace_mode_label(self._velocity_trace_mode_key(existing))} velocity trace."
                 if enabled
                 else f"{panel.name}: velocity trace draw mode cancelled."
             )
@@ -20830,7 +22487,7 @@ class TDMosaicApp:
         )
         self._record_session_change()
         self._refresh_td_window_velocity_trace_table(panel_id)
-        self._refresh_td_window(panel_id)
+        self._refresh_td_window(panel_id, refresh_velocity_table=False)
         self._set_status(f"Deleted velocity trace {int(selected_id)} from {panel.name}.")
 
     def _clear_td_window_velocity_traces(self, panel_id: int) -> None:
@@ -20842,18 +22499,23 @@ class TDMosaicApp:
         existing["velocity_selected_trace_id"] = None
         existing["velocity_trace_draw_mode"] = False
         existing["velocity_trace_pending"] = None
+        existing["velocity_trace_pending_points"] = []
         existing["velocity_trace_hover"] = None
+        existing["velocity_trace_last_motion_t"] = 0.0
         button_var = existing.get("velocity_trace_button_var")
         if button_var is not None:
             button_var.set("Draw velocity trace")
         self._record_session_change()
         self._refresh_td_window_velocity_trace_table(panel_id)
-        self._refresh_td_window(panel_id)
+        self._refresh_td_window(panel_id, refresh_velocity_table=False)
         self._set_status(f"Cleared manual velocity traces for {panel.name}.")
 
     def _on_td_window_velocity_trace_select(self, panel_id: int, _event: Any = None) -> None:
         existing = self.td_windows.get(panel_id)
         if existing is None:
+            return
+        if bool(existing.get("velocity_trace_table_updating", False)):
+            _trace_velocity(f"tree_select ignored while table_updating panel={panel_id}")
             return
         tree = existing.get("velocity_trace_tree")
         if tree is None:
@@ -20866,7 +22528,195 @@ class TDMosaicApp:
                 existing["velocity_selected_trace_id"] = int(str(selection[0]).split("-", 1)[1])
             except Exception:
                 existing["velocity_selected_trace_id"] = None
-        self._refresh_td_window(panel_id)
+        _trace_velocity(
+            f"tree_select panel={panel_id} selected={existing.get('velocity_selected_trace_id')}"
+        )
+        self._refresh_td_window(panel_id, refresh_velocity_table=False)
+
+    def _td_window_selected_velocity_trace(self, panel_id: int) -> dict[str, Any] | None:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            return None
+        selected_id = existing.get("velocity_selected_trace_id")
+        if selected_id is None:
+            tree = existing.get("velocity_trace_tree")
+            if tree is not None:
+                selection = tree.selection()
+                if selection:
+                    try:
+                        selected_id = int(str(selection[0]).split("-", 1)[1])
+                    except Exception:
+                        selected_id = None
+        if selected_id is None:
+            return None
+        for trace in existing.get("velocity_traces") or []:
+            if isinstance(trace, dict) and int(trace.get("trace_id", -1)) == int(selected_id):
+                return trace
+        return None
+
+    def _velocity_trace_segment_rows(self, trace: dict[str, Any]) -> list[dict[str, Any]]:
+        points = self._velocity_trace_points_from_payload(trace)
+        if len(points) < 2:
+            return []
+        km_s_per_px_frame = self._safe_float_text(
+            trace.get("km_s_per_px_frame", ""), float("nan")
+        )
+        if not np.isfinite(km_s_per_px_frame):
+            cad_s = self._safe_float_text(trace.get("cad_s", ""), float("nan"))
+            km_per_pixel = self._safe_float_text(
+                trace.get("km_per_pixel", ""), float("nan")
+            )
+            km_s_per_px_frame = (
+                float("nan")
+                if cad_s <= 0.0 or not np.isfinite(km_per_pixel)
+                else km_per_pixel / cad_s
+            )
+        geometry_enabled = self._safe_bool_value(
+            trace.get("geometry_correction_enabled", False), False
+        )
+        geometry_factor = self._safe_float_text(
+            trace.get("geometry_factor", ""), float("nan")
+        )
+        rows: list[dict[str, Any]] = []
+        for segment_index, ((t_a, d_a), (t_b, d_b)) in enumerate(
+            zip(points[:-1], points[1:]),
+            start=1,
+        ):
+            delta_frames = float(t_b) - float(t_a)
+            if abs(delta_frames) <= 1e-6:
+                continue
+            delta_dist_px = float(d_b) - float(d_a)
+            speed_px_frame = delta_dist_px / delta_frames
+            speed_km_s = (
+                float("nan")
+                if not np.isfinite(km_s_per_px_frame)
+                else speed_px_frame * km_s_per_px_frame
+            )
+            speed_corrected_km_s = (
+                float("nan")
+                if not geometry_enabled
+                or not np.isfinite(speed_km_s)
+                or not np.isfinite(geometry_factor)
+                else speed_km_s * geometry_factor
+            )
+            rows.append(
+                {
+                    "segment_index": int(segment_index),
+                    "t0": float(t_a),
+                    "d0": float(d_a),
+                    "t1": float(t_b),
+                    "d1": float(d_b),
+                    "delta_frames": float(delta_frames),
+                    "delta_dist_px": float(delta_dist_px),
+                    "speed_px_frame": float(speed_px_frame),
+                    "speed_km_s": float(speed_km_s),
+                    "speed_corrected_km_s": float(speed_corrected_km_s),
+                }
+            )
+        return rows
+
+    def _show_td_window_velocity_trace_details(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        panel = self._td_window_panel(panel_id)
+        if existing is None or panel is None:
+            return
+        trace = self._td_window_selected_velocity_trace(panel_id)
+        if trace is None:
+            self._set_status(f"Select a velocity trace first in {panel.name}.")
+            return
+        trace_id = int(trace.get("trace_id", -1))
+        label = str(trace.get("label") or f"V{trace_id:02d}")
+        kind = str(trace.get("trace_kind") or "straight")
+        segment_rows = self._velocity_trace_segment_rows(trace)
+        lines = [
+            f"{panel.name} | {label} | {self._velocity_trace_mode_label(kind)}",
+            f"points: {int(trace.get('point_count', len(self._velocity_trace_points_from_payload(trace))) or 0)}",
+            "",
+            "Global measurement",
+            f"  t: {self._format_velocity_trace_value(trace.get('t0'), 6)} -> {self._format_velocity_trace_value(trace.get('t1'), 6)} frame",
+            f"  d: {self._format_velocity_trace_value(trace.get('d0'), 6)} -> {self._format_velocity_trace_value(trace.get('d1'), 6)} px",
+            f"  speed: {float(trace.get('speed_km_s', float('nan'))):.3f} km/s",
+            f"  speed: {float(trace.get('speed_px_frame', float('nan'))):.3f} px/frame",
+            "",
+            "Physical scale saved with this trace",
+            f"  cad: {self._format_velocity_trace_value(trace.get('cad_s'), 6)} s/frame",
+            f"  res: {self._format_velocity_trace_value(trace.get('res_arcsec_px'), 6)} arcsec/px",
+            f"  km/arcsec: {self._format_velocity_trace_value(trace.get('km_per_arcsec'), 6)}",
+            f"  km/px: {self._format_velocity_trace_value(trace.get('km_per_pixel'), 6)}",
+        ]
+        if kind == "quadratic":
+            accel = float(trace.get("acceleration_km_s2", float("nan")))
+            lines.extend(
+                [
+                    "",
+                    "Quadratic fit",
+                    "  uses all clicked points, not only three",
+                    f"  acceleration: {accel:.3f} km/s^2" if np.isfinite(accel) else "  acceleration: nan",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "Acceleration",
+                    "  not estimated for Straight/Polyline traces",
+                ]
+            )
+        if bool(trace.get("geometry_correction_enabled", False)):
+            corrected_speed = float(trace.get("speed_corrected_km_s", float("nan")))
+            lines.extend(
+                [
+                    "",
+                    "Geometry correction",
+                    f"  model: {trace.get('geometry_model_label') or trace.get('geometry_model') or 'projected'}",
+                    f"  factor: {self._format_velocity_trace_value(trace.get('geometry_factor'), 6)}",
+                    (
+                        f"  corrected speed: {corrected_speed:.3f} km/s"
+                        if np.isfinite(corrected_speed)
+                        else "  corrected speed: nan"
+                    ),
+                ]
+            )
+        lines.extend(["", "Segment velocities"])
+        if not segment_rows:
+            lines.append("  no valid segments")
+        else:
+            for row in segment_rows:
+                corrected = float(row.get("speed_corrected_km_s", float("nan")))
+                corrected_text = (
+                    f" | corrected={corrected:.3f} km/s"
+                    if bool(trace.get("geometry_correction_enabled", False))
+                    and np.isfinite(corrected)
+                    else ""
+                )
+                lines.append(
+                    "  "
+                    f"{int(row['segment_index']):02d}: "
+                    f"t {row['t0']:.2f}->{row['t1']:.2f}, "
+                    f"d {row['d0']:.2f}->{row['d1']:.2f}, "
+                    f"dt={row['delta_frames']:.2f} frame, "
+                    f"dd={row['delta_dist_px']:.2f} px, "
+                    f"v={row['speed_km_s']:.3f} km/s, "
+                    f"v={row['speed_px_frame']:.3f} px/frame"
+                    f"{corrected_text}"
+                )
+
+        parent = existing.get("top", self.root)
+        top = self.tk.Toplevel(parent)
+        top.title(f"Velocity Details - {panel.name} {label}")
+        top.geometry("820x520")
+        top.rowconfigure(0, weight=1)
+        top.columnconfigure(0, weight=1)
+        text = self.tk.Text(top, wrap="none")
+        text.grid(row=0, column=0, sticky="nsew")
+        y_scroll = self.ttk.Scrollbar(top, orient="vertical", command=text.yview)
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll = self.ttk.Scrollbar(top, orient="horizontal", command=text.xview)
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        text.insert("1.0", "\n".join(lines))
+        text.configure(state="disabled")
+        self._set_status(f"Opened velocity details for {panel.name} {label}.")
 
     def _draw_td_window_velocity_traces(self, ax: Any, panel_id: int) -> None:
         existing = self.td_windows.get(panel_id)
@@ -20880,28 +22730,58 @@ class TDMosaicApp:
             color = "gold" if trace_id == selected_id else "deepskyblue"
             linewidth = 2.5 if trace_id == selected_id else 1.8
             alpha = 0.95 if trace_id == selected_id else 0.8
-            t0 = float(trace.get("t0", float("nan")))
-            t1 = float(trace.get("t1", float("nan")))
-            d0 = float(trace.get("d0", float("nan")))
-            d1 = float(trace.get("d1", float("nan")))
-            if not all(np.isfinite(value) for value in (t0, t1, d0, d1)):
+            points = self._velocity_trace_points_from_payload(trace)
+            if len(points) < 2:
                 continue
+            t_values = [point[0] for point in points]
+            d_values = [point[1] for point in points]
+            plot_t = t_values
+            plot_d = d_values
+            if str(trace.get("trace_kind") or "straight") == "quadratic":
+                coefficients = trace.get("fit_coefficients_px") or []
+                if len(coefficients) == 3:
+                    try:
+                        fit_t_center = float(trace.get("fit_t_center", 0.0))
+                        t_min = float(min(t_values))
+                        t_max = float(max(t_values))
+                        sample_t = np.linspace(t_min, t_max, 80)
+                        sample_d = np.polyval(
+                            np.array(coefficients, dtype=float), sample_t - fit_t_center
+                        )
+                        plot_t = [float(value) for value in sample_t]
+                        plot_d = [float(value) for value in sample_d]
+                    except Exception:
+                        plot_t = t_values
+                        plot_d = d_values
             if self.td_swap_axes_var.get():
-                ax.plot([t0, t1], [d0, d1], color=color, linewidth=linewidth, alpha=alpha)
-                ax.text(t1, d1, str(trace.get("label") or f"V{trace_id:02d}"), color=color, fontsize=8)
+                ax.plot(plot_t, plot_d, color=color, linewidth=linewidth, alpha=alpha)
+                ax.scatter(t_values, d_values, color=color, s=12, alpha=alpha, zorder=4)
+                ax.text(t_values[-1], d_values[-1], str(trace.get("label") or f"V{trace_id:02d}"), color=color, fontsize=8)
             else:
-                ax.plot([d0, d1], [t0, t1], color=color, linewidth=linewidth, alpha=alpha)
-                ax.text(d1, t1, str(trace.get("label") or f"V{trace_id:02d}"), color=color, fontsize=8)
+                ax.plot(plot_d, plot_t, color=color, linewidth=linewidth, alpha=alpha)
+                ax.scatter(d_values, t_values, color=color, s=12, alpha=alpha, zorder=4)
+                ax.text(d_values[-1], t_values[-1], str(trace.get("label") or f"V{trace_id:02d}"), color=color, fontsize=8)
 
-        pending = existing.get("velocity_trace_pending")
+        pending_points = [
+            (float(t_value), float(d_value))
+            for t_value, d_value in (existing.get("velocity_trace_pending_points") or [])
+        ]
         hover = existing.get("velocity_trace_hover")
-        if pending is not None and hover is not None:
-            start_t, start_d = pending
-            end_t, end_d = hover
+        if pending_points:
+            preview_points = list(pending_points)
+            if hover is not None:
+                hover_t, hover_d = float(hover[0]), float(hover[1])
+                last_t, last_d = preview_points[-1]
+                if abs(hover_t - last_t) > 1e-6 or abs(hover_d - last_d) > 1e-6:
+                    preview_points.append((hover_t, hover_d))
+            t_values = [point[0] for point in preview_points]
+            d_values = [point[1] for point in preview_points]
             if self.td_swap_axes_var.get():
-                ax.plot([start_t, end_t], [start_d, end_d], color="yellow", linewidth=1.4, linestyle="--", alpha=0.95)
+                ax.plot(t_values, d_values, color="yellow", linewidth=1.4, linestyle="--", alpha=0.95)
+                ax.scatter(t_values, d_values, color="yellow", s=14, alpha=0.95, zorder=4)
             else:
-                ax.plot([start_d, end_d], [start_t, end_t], color="yellow", linewidth=1.4, linestyle="--", alpha=0.95)
+                ax.plot(d_values, t_values, color="yellow", linewidth=1.4, linestyle="--", alpha=0.95)
+                ax.scatter(d_values, t_values, color="yellow", s=14, alpha=0.95, zorder=4)
 
     def _clear_td_window_wavelet_filter(
         self, panel_id: int, stale: bool = False, refresh: bool = False
@@ -24375,7 +26255,8 @@ class TDMosaicApp:
                 roi_ax.set_ylim(d0, d1)
             roi_ax.set_xlabel("time index")
             roi_ax.set_ylabel("distance [pixel]")
-            self._draw_td_window_crest_overlay(roi_ax, panel_id, meta)
+            if str(existing.get("active_tool_tab") or "td") != "velocity":
+                self._draw_td_window_crest_overlay(roi_ax, panel_id, meta)
         else:
             roi_ax.imshow(
                 td,
@@ -24397,7 +26278,8 @@ class TDMosaicApp:
                 roi_ax.set_ylim(t0, t1)
             roi_ax.set_xlabel("distance [pixel]")
             roi_ax.set_ylabel("time index")
-            self._draw_td_window_crest_overlay(roi_ax, panel_id, meta)
+            if str(existing.get("active_tool_tab") or "td") != "velocity":
+                self._draw_td_window_crest_overlay(roi_ax, panel_id, meta)
 
         roi_ax.set_title("ROI TD", fontsize=10)
         roi_ax.tick_params(labelsize=8)
@@ -24410,57 +26292,54 @@ class TDMosaicApp:
         panel = self._td_window_panel(panel_id)
         coords = self._td_window_plot_to_td_coords(panel_id, event)
         if existing is not None and panel is not None and bool(existing.get("velocity_trace_draw_mode")):
+            debug_t0 = time.monotonic()
+            _trace_velocity(
+                f"press start panel={panel_id} coords={coords} "
+                f"button={getattr(event, 'button', None)} dblclick={bool(getattr(event, 'dblclick', False))}"
+            )
             if coords is None:
+                _trace_velocity(f"press ignored panel={panel_id} reason=no_coords")
                 return
             clicked_t, clicked_d = coords
-            pending = existing.get("velocity_trace_pending")
-            if pending is None:
-                existing["velocity_trace_pending"] = (float(clicked_t), float(clicked_d))
-                existing["velocity_trace_hover"] = (float(clicked_t), float(clicked_d))
-                self._refresh_td_window_velocity_trace_table(panel_id)
-                self._refresh_td_window(panel_id)
-                self._set_status(
-                    f"{panel.name}: choose the second TD point for the velocity trace."
-                )
-                return
-            start_t, start_d = pending
-            try:
-                trace = self._build_velocity_trace_record(
-                    panel_id,
-                    int(existing.get("velocity_next_trace_id", 1)),
-                    float(start_t),
-                    float(start_d),
-                    float(clicked_t),
-                    float(clicked_d),
-                )
-            except ValueError as exc:
-                existing["velocity_trace_pending"] = None
-                existing["velocity_trace_hover"] = None
-                self._refresh_td_window_velocity_trace_table(panel_id)
-                self._refresh_td_window(panel_id)
-                self._set_status(str(exc))
-                return
-            traces = [
-                dict(item)
-                for item in (existing.get("velocity_traces") or [])
-                if isinstance(item, dict)
+            points = [
+                (float(t_value), float(d_value))
+                for t_value, d_value in (existing.get("velocity_trace_pending_points") or [])
             ]
-            traces.append(trace)
-            existing["velocity_traces"] = traces
-            existing["velocity_next_trace_id"] = int(trace["trace_id"]) + 1
-            existing["velocity_selected_trace_id"] = int(trace["trace_id"])
-            existing["velocity_trace_draw_mode"] = False
-            existing["velocity_trace_pending"] = None
-            existing["velocity_trace_hover"] = None
-            button_var = existing.get("velocity_trace_button_var")
-            if button_var is not None:
-                button_var.set("Draw velocity trace")
-            self._record_session_change()
+            points.append((float(clicked_t), float(clicked_d)))
+            existing["velocity_trace_pending_points"] = points
+            existing["velocity_trace_pending"] = points[0]
+            existing["velocity_trace_hover"] = points[-1]
             self._refresh_td_window_velocity_trace_table(panel_id)
-            self._refresh_td_window(panel_id)
+            _trace_velocity(
+                f"press after_table panel={panel_id} points={len(points)} "
+                f"elapsed_ms={(time.monotonic() - debug_t0) * 1000.0:.1f}"
+            )
+            self._refresh_td_window(panel_id, refresh_velocity_table=False)
+            _trace_velocity(
+                f"press after_redraw panel={panel_id} points={len(points)} "
+                f"elapsed_ms={(time.monotonic() - debug_t0) * 1000.0:.1f}"
+            )
+            trace_kind = self._velocity_trace_mode_key(existing)
+            min_points = 3 if trace_kind == "quadratic" else 2
+            if trace_kind == "straight" and len(points) >= 2:
+                _trace_velocity(
+                    f"press auto_finish straight panel={panel_id} points={len(points)}"
+                )
+                self._finish_td_window_velocity_trace(panel_id)
+                return
+            if bool(getattr(event, "dblclick", False)) and len(points) >= min_points:
+                _trace_velocity(
+                    f"press dblclick_finish panel={panel_id} kind={trace_kind} points={len(points)}"
+                )
+                self._finish_td_window_velocity_trace(panel_id)
+                return
             self._set_status(
-                f"{panel.name}: saved velocity trace {int(trace['trace_id'])} "
-                f"({float(trace['speed_km_s']):.3f} km/s)."
+                f"{panel.name}: velocity trace point {len(points)} added; "
+                f"{'finish now or add more points' if len(points) >= min_points else 'add more points'}."
+            )
+            _trace_velocity(
+                f"press end panel={panel_id} points={len(points)} "
+                f"elapsed_ms={(time.monotonic() - debug_t0) * 1000.0:.1f}"
             )
             return
         if (
@@ -24506,8 +26385,14 @@ class TDMosaicApp:
             coords = self._td_window_plot_to_td_coords(panel_id, event)
             if coords is None:
                 return
+            now = time.monotonic()
+            if now - float(existing.get("velocity_trace_last_motion_t", 0.0)) < 0.035:
+                return
+            existing["velocity_trace_last_motion_t"] = now
             existing["velocity_trace_hover"] = (float(coords[0]), float(coords[1]))
-            self._refresh_td_window(panel_id)
+            if DEBUG_VELOCITY_TRACE_MOTION:
+                _trace_velocity(f"motion redraw panel={panel_id} coords={coords}")
+            self._refresh_td_window(panel_id, refresh_velocity_table=False)
             return
         if (
             existing is None
@@ -24665,11 +26550,45 @@ class TDMosaicApp:
             f"Adjusted {cut.name} length by {delta_length:+.1f} px from detached TD window.",
         )
 
+    def _select_td_window_tool_tab(self, panel_id: int, tool_tab: str) -> None:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            return
+        notebook = existing.get("tool_notebook")
+        tabs = existing.get("tool_tabs") or {}
+        selected_key = str(tool_tab or "td")
+        if selected_key not in tabs:
+            selected_key = "td"
+        existing["active_tool_tab"] = selected_key
+        target = tabs.get(selected_key)
+        if notebook is None or target is None:
+            return
+        try:
+            notebook.select(target)
+        except Exception:
+            pass
+
+    def _on_td_window_tool_tab_changed(self, panel_id: int) -> None:
+        existing = self.td_windows.get(panel_id)
+        if existing is None:
+            return
+        notebook = existing.get("tool_notebook")
+        tabs = existing.get("tool_tabs") or {}
+        if notebook is None:
+            return
+        selected = str(notebook.select())
+        for name, tab in tabs.items():
+            if str(tab) == selected:
+                existing["active_tool_tab"] = str(name)
+                break
+        self._refresh_td_window(panel_id)
+
     def _open_td_window(
         self,
         panel_id: int | None = None,
         *,
         source_stack_id: int | None = None,
+        tool_tab: str = "td",
     ) -> None:
         panel_id = self.active_panel_id if panel_id is None else panel_id
         if panel_id < 1 or panel_id > len(self.panels):
@@ -24685,6 +26604,7 @@ class TDMosaicApp:
             if top.winfo_exists():
                 top.deiconify()
                 top.lift()
+                self._select_td_window_tool_tab(panel_id, tool_tab)
                 self._refresh_td_window(panel_id)
                 return
             del self.td_windows[panel_id]
@@ -24751,6 +26671,7 @@ class TDMosaicApp:
         )
         wavelet_summary_var = self.tk.StringVar(value="No wavelet filter results.")
         wavelet_physics_var = self.tk.StringVar(value="")
+        physical_scale_var = self.tk.StringVar(value="")
         wavelet_p_min_var = self.tk.StringVar(
             value=f"{float(wavelet_params['p_min']):.2f}"
         )
@@ -24871,6 +26792,34 @@ class TDMosaicApp:
         cut_y1_var = self.tk.StringVar(value="")
         cut_x2_var = self.tk.StringVar(value="")
         cut_y2_var = self.tk.StringVar(value="")
+        velocity_geometry_state = self._normalize_velocity_geometry_settings(
+            panel_state.get("velocity_geometry")
+        )
+        velocity_geometry_enabled_var = self.tk.BooleanVar(
+            value=bool(velocity_geometry_state.get("enabled", False))
+        )
+        velocity_geometry_model_var = self.tk.StringVar(
+            value=VELOCITY_GEOMETRY_LABELS.get(
+                str(velocity_geometry_state.get("model", "projected")),
+                VELOCITY_GEOMETRY_LABELS["projected"],
+            )
+        )
+        velocity_geometry_mu_var = self.tk.StringVar(
+            value=str(velocity_geometry_state.get("mu", "1.0"))
+        )
+        velocity_geometry_theta_var = self.tk.StringVar(
+            value=str(velocity_geometry_state.get("theta_deg", ""))
+        )
+        velocity_geometry_alpha_var = self.tk.StringVar(
+            value=str(velocity_geometry_state.get("alpha_deg", "0.0"))
+        )
+        velocity_geometry_phi_var = self.tk.StringVar(
+            value=str(velocity_geometry_state.get("phi_deg", "0.0"))
+        )
+        velocity_geometry_inclination_var = self.tk.StringVar(
+            value=str(velocity_geometry_state.get("inclination_deg", "0.0"))
+        )
+        velocity_geometry_summary_var = self.tk.StringVar(value="")
 
         self.ttk.Label(header_frame, textvariable=panel_info_var).grid(
             row=0, column=0, sticky="w"
@@ -24903,8 +26852,65 @@ class TDMosaicApp:
         edit_container.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 6))
         edit_scroll_body.columnconfigure(0, weight=1)
 
+        physical_scale_frame = self.ttk.LabelFrame(
+            edit_scroll_body, text="Physical Scale", padding=8
+        )
+        physical_scale_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for idx in range(8):
+            physical_scale_frame.columnconfigure(idx, weight=1 if idx in {1, 3, 5} else 0)
+        self.ttk.Label(physical_scale_frame, text="cad [s]").grid(
+            row=0, column=0, sticky="w"
+        )
+        scale_cad_entry = self.ttk.Entry(
+            physical_scale_frame, textvariable=crest_cad_var, width=8
+        )
+        scale_cad_entry.grid(row=0, column=1, sticky="ew", padx=(6, 8))
+        self.ttk.Label(physical_scale_frame, text="res [arcsec/px]").grid(
+            row=0, column=2, sticky="w"
+        )
+        scale_res_entry = self.ttk.Entry(
+            physical_scale_frame, textvariable=crest_res_var, width=8
+        )
+        scale_res_entry.grid(row=0, column=3, sticky="ew", padx=(6, 8))
+        self.ttk.Label(physical_scale_frame, text="km/arcsec").grid(
+            row=0, column=4, sticky="w"
+        )
+        scale_km_arcsec_entry = self.ttk.Entry(
+            physical_scale_frame,
+            textvariable=wavelet_km_per_arcsec_var,
+            width=8,
+        )
+        scale_km_arcsec_entry.grid(row=0, column=5, sticky="ew", padx=(6, 8))
+        self.ttk.Button(
+            physical_scale_frame,
+            text="Apply scale",
+            command=lambda pid=panel_id: self._apply_td_window_physical_scale(pid),
+        ).grid(row=0, column=6, columnspan=2, sticky="ew")
+        self.ttk.Label(
+            physical_scale_frame,
+            textvariable=physical_scale_var,
+            justify="left",
+            wraplength=720,
+        ).grid(row=1, column=0, columnspan=8, sticky="w", pady=(6, 0))
+
+        edit_notebook = self.ttk.Notebook(edit_scroll_body)
+        edit_notebook.grid(row=1, column=0, sticky="ew")
+
+        td_tools_tab = self.ttk.Frame(edit_notebook, padding=4)
+        velocity_tools_tab = self.ttk.Frame(edit_notebook, padding=4)
+        wave_tools_tab = self.ttk.Frame(edit_notebook, padding=4)
+        for tab in (td_tools_tab, velocity_tools_tab, wave_tools_tab):
+            tab.columnconfigure(0, weight=1)
+        edit_notebook.add(td_tools_tab, text="TD / Cut")
+        edit_notebook.add(velocity_tools_tab, text="Slope Velocity")
+        edit_notebook.add(wave_tools_tab, text="Waves")
+        edit_notebook.bind(
+            "<<NotebookTabChanged>>",
+            lambda _event, pid=panel_id: self._on_td_window_tool_tab_changed(pid),
+        )
+
         edit_frame = self.ttk.LabelFrame(
-            edit_scroll_body, text="Detached TD Controls", padding=8
+            td_tools_tab, text="TD Inspection / Cut Controls", padding=8
         )
         edit_frame.grid(row=0, column=0, sticky="ew")
         for idx in range(8):
@@ -25060,9 +27066,9 @@ class TDMosaicApp:
             angle_buttons.columnconfigure(idx, weight=1)
 
         analysis_frame = self.ttk.LabelFrame(
-            edit_frame, text="Crest Tracking (NUWT)", padding=8
+            wave_tools_tab, text="Crest Tracking (NUWT)", padding=8
         )
-        analysis_frame.grid(row=11, column=0, columnspan=8, sticky="ew", pady=(12, 0))
+        analysis_frame.grid(row=0, column=0, sticky="ew")
         for idx in (1, 3, 5, 7):
             analysis_frame.columnconfigure(idx, weight=1)
 
@@ -25070,32 +27076,18 @@ class TDMosaicApp:
             analysis_frame, textvariable=crest_summary_var
         ).grid(row=0, column=0, columnspan=8, sticky="w")
 
-        self.ttk.Label(analysis_frame, text="cad [s]").grid(
-            row=1, column=0, sticky="w", pady=(8, 0)
-        )
-        crest_cad_entry = self.ttk.Entry(
-            analysis_frame, textvariable=crest_cad_var, width=8
-        )
-        crest_cad_entry.grid(row=1, column=1, sticky="ew", padx=(6, 8), pady=(8, 0))
-        self.ttk.Label(analysis_frame, text="res [arcsec/px]").grid(
-            row=1, column=2, sticky="w", pady=(8, 0)
-        )
-        crest_res_entry = self.ttk.Entry(
-            analysis_frame, textvariable=crest_res_var, width=8
-        )
-        crest_res_entry.grid(row=1, column=3, sticky="ew", padx=(6, 8), pady=(8, 0))
         self.ttk.Label(analysis_frame, text="grad").grid(
-            row=1, column=4, sticky="w", pady=(8, 0)
+            row=1, column=0, sticky="w", pady=(8, 0)
         )
         crest_grad_entry = self.ttk.Entry(
             analysis_frame, textvariable=crest_grad_var, width=8
         )
-        crest_grad_entry.grid(row=1, column=5, sticky="ew", padx=(6, 8), pady=(8, 0))
+        crest_grad_entry.grid(row=1, column=1, sticky="ew", padx=(6, 8), pady=(8, 0))
         self.ttk.Checkbutton(
             analysis_frame,
             text="invert",
             variable=crest_invert_var,
-        ).grid(row=1, column=6, columnspan=2, sticky="w", pady=(8, 0))
+        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=(8, 0))
 
         self.ttk.Label(analysis_frame, text="min thread").grid(
             row=2, column=0, sticky="w", pady=(8, 0)
@@ -25133,7 +27125,7 @@ class TDMosaicApp:
         self.ttk.Label(
             analysis_frame,
             text="NUWT puro: aquí solo se tocan los parámetros reales de tracking. "
-            "Los filtros finos de limpieza/aislamiento están abajo en Wavelet Filter.",
+            "La escala física compartida está arriba; los filtros finos de limpieza/aislamiento están abajo en Wavelet Filter.",
             wraplength=520,
             justify="left",
         ).grid(row=3, column=0, columnspan=8, sticky="w", pady=(8, 0))
@@ -25152,9 +27144,9 @@ class TDMosaicApp:
         ).grid(row=4, column=4, columnspan=4, sticky="ew", pady=(10, 0), padx=(4, 0))
 
         wavelet_frame = self.ttk.LabelFrame(
-            edit_frame, text="Wavelet Filter", padding=8
+            wave_tools_tab, text="Wavelet Filter", padding=8
         )
-        wavelet_frame.grid(row=12, column=0, columnspan=8, sticky="ew", pady=(12, 0))
+        wavelet_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         for idx in (1, 3, 5, 7):
             wavelet_frame.columnconfigure(idx, weight=1)
 
@@ -25285,9 +27277,9 @@ class TDMosaicApp:
         ).grid(row=5, column=5, columnspan=3, sticky="w", pady=(8, 0), padx=(4, 0))
 
         events_frame = self.ttk.LabelFrame(
-            edit_frame, text="Wavelet Events", padding=8
+            wave_tools_tab, text="Wavelet Events", padding=8
         )
-        events_frame.grid(row=13, column=0, columnspan=8, sticky="ew", pady=(12, 0))
+        events_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         for idx in range(8):
             events_frame.columnconfigure(idx, weight=1)
 
@@ -25484,63 +27476,210 @@ class TDMosaicApp:
 
         velocity_trace_button_var = self.tk.StringVar(value="Draw velocity trace")
         velocity_trace_summary_var = self.tk.StringVar(value="Velocity traces: 0")
+        velocity_trace_physics_var = self.tk.StringVar(value="")
+        velocity_trace_mode_var = self.tk.StringVar(value="Straight")
         velocity_frame = self.ttk.LabelFrame(
-            edit_frame, text="Velocity Traces", padding=8
+            velocity_tools_tab, text="Slope Velocity Traces", padding=8
         )
-        velocity_frame.grid(row=14, column=0, columnspan=8, sticky="ew", pady=(12, 0))
-        velocity_frame.columnconfigure(0, weight=1)
-        velocity_frame.columnconfigure(1, weight=1)
-        velocity_frame.columnconfigure(2, weight=1)
-        velocity_frame.columnconfigure(3, weight=1)
+        velocity_frame.grid(row=0, column=0, sticky="ew")
+        for idx in range(6):
+            velocity_frame.columnconfigure(idx, weight=1)
         self.ttk.Label(
             velocity_frame,
             textvariable=velocity_trace_summary_var,
             justify="left",
             wraplength=520,
-        ).grid(row=0, column=0, columnspan=4, sticky="w")
+        ).grid(row=0, column=0, columnspan=6, sticky="w")
+        self.ttk.Label(
+            velocity_frame,
+            textvariable=velocity_trace_physics_var,
+            justify="left",
+            wraplength=720,
+        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        self.ttk.Label(velocity_frame, text="Mode").grid(
+            row=2, column=0, sticky="w", pady=(8, 0)
+        )
+        velocity_trace_mode_box = self.ttk.Combobox(
+            velocity_frame,
+            textvariable=velocity_trace_mode_var,
+            values=("Straight", "Polyline", "Quadratic Fit"),
+            state="readonly",
+            width=15,
+        )
+        velocity_trace_mode_box.grid(row=2, column=1, sticky="ew", padx=4, pady=(8, 0))
+        velocity_trace_mode_box.bind(
+            "<<ComboboxSelected>>",
+            lambda _event, pid=panel_id: self._on_td_window_velocity_trace_mode_change(pid),
+        )
         self.ttk.Button(
             velocity_frame,
             textvariable=velocity_trace_button_var,
             command=lambda pid=panel_id: self._toggle_td_window_velocity_trace_mode(pid),
-        ).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(8, 0))
+        ).grid(row=2, column=2, sticky="ew", padx=4, pady=(8, 0))
+        self.ttk.Button(
+            velocity_frame,
+            text="Finish trace",
+            command=lambda pid=panel_id: self._finish_td_window_velocity_trace(pid),
+        ).grid(row=2, column=3, sticky="ew", padx=4, pady=(8, 0))
+        self.ttk.Button(
+            velocity_frame,
+            text="Undo point",
+            command=lambda pid=panel_id: self._undo_td_window_velocity_trace_point(pid),
+        ).grid(row=2, column=4, sticky="ew", padx=4, pady=(8, 0))
         self.ttk.Button(
             velocity_frame,
             text="Delete selected",
             command=lambda pid=panel_id: self._delete_td_window_selected_velocity_trace(pid),
-        ).grid(row=1, column=1, sticky="ew", padx=4, pady=(8, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", padx=(0, 4), pady=(8, 0))
         self.ttk.Button(
             velocity_frame,
             text="Clear all",
             command=lambda pid=panel_id: self._clear_td_window_velocity_traces(pid),
-        ).grid(row=1, column=2, sticky="ew", padx=4, pady=(8, 0))
+        ).grid(row=3, column=2, sticky="ew", padx=4, pady=(8, 0))
+        velocity_trace_save_button = self.ttk.Button(
+            velocity_frame,
+            text="Save table",
+            command=lambda pid=panel_id: self._export_td_window_velocity_traces(pid),
+        )
+        velocity_trace_save_button.grid(row=3, column=3, sticky="ew", padx=4, pady=(8, 0))
+        self.ttk.Button(
+            velocity_frame,
+            text="?",
+            width=3,
+            command=lambda: self._show_save_export_help("velocity_save"),
+        ).grid(row=3, column=4, sticky="ew", padx=4, pady=(8, 0))
         self.ttk.Label(
             velocity_frame,
-            text="Uses cad, arcsec/px and km/arcsec to return physical speeds.",
-            wraplength=320,
+            text="Uses cadence, arcsec/px and km/arcsec. Double-click a saved row for segment speeds.",
+            wraplength=260,
             justify="left",
-        ).grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(8, 0))
-        velocity_columns = ("id", "label", "t0", "t1", "d0", "d1", "pxfr", "kms")
+        ).grid(row=3, column=5, sticky="w", padx=(8, 0), pady=(8, 0))
+        velocity_geometry_header = self.ttk.Frame(velocity_frame)
+        velocity_geometry_header.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+        velocity_geometry_header.columnconfigure(1, weight=1)
+        self.ttk.Checkbutton(
+            velocity_geometry_header,
+            text="Geometry correction",
+            variable=velocity_geometry_enabled_var,
+            command=lambda pid=panel_id: self._on_td_window_velocity_geometry_change(pid),
+        ).grid(row=0, column=0, sticky="w")
+        self.ttk.Label(
+            velocity_geometry_header,
+            textvariable=velocity_geometry_summary_var,
+            justify="left",
+            wraplength=540,
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        velocity_geometry_params_frame = self.ttk.LabelFrame(
+            velocity_frame, text="Geometry", padding=6
+        )
+        velocity_geometry_params_frame.grid(row=5, column=0, columnspan=6, sticky="ew", pady=(6, 0))
+        for idx in range(7):
+            velocity_geometry_params_frame.columnconfigure(idx, weight=1)
+        self.ttk.Label(velocity_geometry_params_frame, text="Scenario").grid(
+            row=0, column=0, sticky="w"
+        )
+        velocity_geometry_model_box = self.ttk.Combobox(
+            velocity_geometry_params_frame,
+            textvariable=velocity_geometry_model_var,
+            values=[label for _key, label in VELOCITY_GEOMETRY_MODELS],
+            state="readonly",
+            width=22,
+        )
+        velocity_geometry_model_box.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(6, 8))
+        velocity_geometry_model_box.bind(
+            "<<ComboboxSelected>>",
+            lambda event, pid=panel_id: self._on_td_window_velocity_geometry_change(pid, event),
+        )
+        self.ttk.Label(velocity_geometry_params_frame, text="mu").grid(
+            row=0, column=3, sticky="w"
+        )
+        velocity_geometry_mu_entry = self.ttk.Entry(
+            velocity_geometry_params_frame,
+            textvariable=velocity_geometry_mu_var,
+            width=8,
+        )
+        velocity_geometry_mu_entry.grid(row=0, column=4, sticky="ew", padx=(6, 8))
+        self.ttk.Label(velocity_geometry_params_frame, text="theta deg").grid(
+            row=0, column=5, sticky="w"
+        )
+        velocity_geometry_theta_entry = self.ttk.Entry(
+            velocity_geometry_params_frame,
+            textvariable=velocity_geometry_theta_var,
+            width=8,
+        )
+        velocity_geometry_theta_entry.grid(row=0, column=6, sticky="ew", padx=(6, 0))
+
+        self.ttk.Label(velocity_geometry_params_frame, text="alpha deg").grid(
+            row=1, column=0, sticky="w", pady=(6, 0)
+        )
+        velocity_geometry_alpha_entry = self.ttk.Entry(
+            velocity_geometry_params_frame,
+            textvariable=velocity_geometry_alpha_var,
+            width=8,
+        )
+        velocity_geometry_alpha_entry.grid(row=1, column=1, sticky="ew", padx=(6, 8), pady=(6, 0))
+        self.ttk.Label(velocity_geometry_params_frame, text="phi deg").grid(
+            row=1, column=2, sticky="w", pady=(6, 0)
+        )
+        velocity_geometry_phi_entry = self.ttk.Entry(
+            velocity_geometry_params_frame,
+            textvariable=velocity_geometry_phi_var,
+            width=8,
+        )
+        velocity_geometry_phi_entry.grid(row=1, column=3, sticky="ew", padx=(6, 8), pady=(6, 0))
+        self.ttk.Label(velocity_geometry_params_frame, text="incl deg").grid(
+            row=1, column=4, sticky="w", pady=(6, 0)
+        )
+        velocity_geometry_inclination_entry = self.ttk.Entry(
+            velocity_geometry_params_frame,
+            textvariable=velocity_geometry_inclination_var,
+            width=8,
+        )
+        velocity_geometry_inclination_entry.grid(row=1, column=5, columnspan=2, sticky="ew", padx=(6, 0), pady=(6, 0))
+        velocity_columns = (
+            "id",
+            "label",
+            "kind",
+            "pts",
+            "t0",
+            "t1",
+            "d0",
+            "d1",
+            "pxfr",
+            "kms",
+            "corr",
+            "factor",
+            "km_px",
+            "accel",
+        )
         velocity_trace_tree = self.ttk.Treeview(
             velocity_frame,
             columns=velocity_columns,
             show="headings",
             height=6,
         )
-        velocity_trace_tree.grid(row=2, column=0, columnspan=4, sticky="nsew", pady=(8, 0))
+        velocity_trace_tree.grid(row=6, column=0, columnspan=6, sticky="nsew", pady=(8, 0))
         velocity_scrollbar = self.ttk.Scrollbar(
             velocity_frame, orient="vertical", command=velocity_trace_tree.yview
         )
-        velocity_scrollbar.grid(row=2, column=4, sticky="ns", pady=(8, 0))
+        velocity_scrollbar.grid(row=6, column=6, sticky="ns", pady=(8, 0))
         velocity_trace_tree.configure(yscrollcommand=velocity_scrollbar.set)
         for column, label, width in (
             ("id", "ID", 52),
             ("label", "Label", 70),
+            ("kind", "Kind", 104),
+            ("pts", "Pts", 48),
             ("t0", "t0", 74),
             ("t1", "t1", 74),
             ("d0", "d0", 74),
             ("d1", "d1", 74),
             ("pxfr", "px/frame", 96),
             ("kms", "km/s", 96),
+            ("corr", "corr km/s", 96),
+            ("factor", "factor", 70),
+            ("km_px", "km/px", 88),
+            ("accel", "quad a [km/s2]", 112),
         ):
             velocity_trace_tree.heading(column, text=label)
             velocity_trace_tree.column(column, width=width, stretch=True)
@@ -25610,8 +27749,6 @@ class TDMosaicApp:
                 lambda _event, pid=panel_id: self._apply_td_window_cut_coords(pid),
             )
         for widget in (
-            crest_cad_entry,
-            crest_res_entry,
             crest_grad_entry,
             crest_min_tlen_entry,
             crest_max_dist_jump_entry,
@@ -25620,6 +27757,19 @@ class TDMosaicApp:
             widget.bind(
                 "<Return>",
                 lambda _event, pid=panel_id: self._run_td_window_crest_tracking(pid),
+            )
+        for widget in (
+            scale_cad_entry,
+            scale_res_entry,
+            scale_km_arcsec_entry,
+        ):
+            widget.bind(
+                "<Return>",
+                lambda _event, pid=panel_id: self._apply_td_window_physical_scale(pid),
+            )
+            widget.bind(
+                "<FocusOut>",
+                lambda _event, pid=panel_id: self._refresh_td_window_physical_scale_summary(pid),
             )
         for widget in (
             wavelet_p_min_entry,
@@ -25660,13 +27810,39 @@ class TDMosaicApp:
             "<Return>",
             lambda _event, pid=panel_id: self._split_td_window_selected_wavelet_event(pid),
         )
+        for widget in (
+            velocity_geometry_mu_entry,
+            velocity_geometry_theta_entry,
+            velocity_geometry_alpha_entry,
+            velocity_geometry_phi_entry,
+            velocity_geometry_inclination_entry,
+        ):
+            widget.bind(
+                "<Return>",
+                lambda event, pid=panel_id: self._on_td_window_velocity_geometry_change(pid, event),
+            )
+            widget.bind(
+                "<FocusOut>",
+                lambda event, pid=panel_id: self._on_td_window_velocity_geometry_change(pid, event),
+            )
         velocity_trace_tree.bind(
             "<<TreeviewSelect>>",
             lambda _event, pid=panel_id: self._on_td_window_velocity_trace_select(pid),
         )
+        velocity_trace_tree.bind(
+            "<Double-1>",
+            lambda _event, pid=panel_id: self._show_td_window_velocity_trace_details(pid),
+        )
 
         self.td_windows[panel_id] = {
             "top": top,
+            "tool_notebook": edit_notebook,
+            "tool_tabs": {
+                "td": td_tools_tab,
+                "velocity": velocity_tools_tab,
+                "waves": wave_tools_tab,
+            },
+            "active_tool_tab": "td",
             "plot_panes": None,
             "figure": fig,
             "ax": ax,
@@ -25705,10 +27881,26 @@ class TDMosaicApp:
             "velocity_selected_trace_id": panel_state.get("velocity_selected_trace_id"),
             "velocity_trace_draw_mode": False,
             "velocity_trace_pending": None,
+            "velocity_trace_pending_points": [],
             "velocity_trace_hover": None,
+            "velocity_trace_last_motion_t": 0.0,
+            "velocity_trace_table_updating": False,
             "velocity_trace_tree": velocity_trace_tree,
+            "velocity_trace_save_button": velocity_trace_save_button,
             "velocity_trace_summary_var": velocity_trace_summary_var,
+            "velocity_trace_physics_var": velocity_trace_physics_var,
+            "physical_scale_var": physical_scale_var,
             "velocity_trace_button_var": velocity_trace_button_var,
+            "velocity_trace_mode_var": velocity_trace_mode_var,
+            "velocity_geometry_enabled_var": velocity_geometry_enabled_var,
+            "velocity_geometry_model_var": velocity_geometry_model_var,
+            "velocity_geometry_mu_var": velocity_geometry_mu_var,
+            "velocity_geometry_theta_var": velocity_geometry_theta_var,
+            "velocity_geometry_alpha_var": velocity_geometry_alpha_var,
+            "velocity_geometry_phi_var": velocity_geometry_phi_var,
+            "velocity_geometry_inclination_var": velocity_geometry_inclination_var,
+            "velocity_geometry_summary_var": velocity_geometry_summary_var,
+            "velocity_geometry_params_frame": velocity_geometry_params_frame,
             "roi_dragging": False,
             "roi_drag_offset_t": 0.0,
             "roi_drag_offset_d": 0.0,
@@ -25809,6 +28001,7 @@ class TDMosaicApp:
             self._wavelet_event_confidence_details(event)
 
         top.protocol("WM_DELETE_WINDOW", lambda pid=panel_id: self._close_td_window(pid))
+        self._select_td_window_tool_tab(panel_id, tool_tab)
         self._sync_td_window_controls(panel_id)
         self._refresh_td_window(panel_id)
         self._refresh_td_window_wavelet_views(panel_id, redraw_td=False)
@@ -25837,11 +28030,27 @@ class TDMosaicApp:
     def _close_active_td_window(self) -> None:
         self._close_td_window(self.active_panel_id)
 
-    def _refresh_td_window(self, panel_id: int) -> None:
+    def _refresh_td_window(
+        self,
+        panel_id: int,
+        *,
+        refresh_velocity_table: bool = True,
+    ) -> None:
         _trace_stack_wavelet(f"refresh_td_window start panel={panel_id}")
         existing = self.td_windows.get(panel_id)
         if existing is None:
             return
+        velocity_debug = (
+            DEBUG_VELOCITY_TRACE
+            and str(existing.get("active_tool_tab") or "td") == "velocity"
+        )
+        debug_t0 = time.monotonic()
+        if velocity_debug:
+            _trace_velocity(
+                f"refresh_window start panel={panel_id} "
+                f"refresh_table={bool(refresh_velocity_table)} "
+                f"draw_mode={bool(existing.get('velocity_trace_draw_mode'))}"
+            )
 
         top = existing["top"]
         if not top.winfo_exists():
@@ -25863,14 +28072,21 @@ class TDMosaicApp:
             title_fontsize=11.0,
         )
         td, meta = self._panel_td(self.panels[panel_id - 1])
-        self._draw_td_window_crest_overlay(ax, panel_id, meta)
+        if str(existing.get("active_tool_tab") or "td") != "velocity":
+            self._draw_td_window_crest_overlay(ax, panel_id, meta)
         self._draw_td_window_velocity_traces(ax, panel_id)
         self._draw_td_window_roi(panel_id, td, meta)
-        self._refresh_td_window_velocity_trace_table(panel_id)
+        if refresh_velocity_table:
+            self._refresh_td_window_velocity_trace_table(panel_id)
         existing["canvas"].draw_idle()
         roi_canvas = existing.get("roi_canvas")
         if roi_canvas is not None:
             roi_canvas.draw_idle()
+        if velocity_debug:
+            _trace_velocity(
+                f"refresh_window end panel={panel_id} "
+                f"elapsed_ms={(time.monotonic() - debug_t0) * 1000.0:.1f}"
+            )
         _trace_stack_wavelet(f"refresh_td_window end panel={panel_id}")
 
     def _refresh_td_windows(self) -> None:
